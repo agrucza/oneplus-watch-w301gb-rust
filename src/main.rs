@@ -3,15 +3,15 @@
 //! Loaded by the stock bootloader (0x0800_0000), which jumps to the vector
 //! table at 0x0801_E000.
 //!
-//! There is no debug probe: images arrive through the stock firmware's
-//! Bluetooth OTA. Until this app can receive an OTA itself, every image is a
-//! round trip:
+//! There is no debug probe: images arrive over Bluetooth, through the stock
+//! firmware's updater or this app's own (`ota_server`). Every boot starts
+//! the same way:
 //!
 //!   1. first thing after boot, book the "return ticket" (ota_flag): the next
 //!      reset makes the bootloader re-install the stock app from eMMC;
 //!   2. start the watchdog, so a hang also ends in that reset;
-//!   3. run the experiment, reporting progress in the ticket's report byte,
-//!      then reset.
+//!   3. bring up storage and Bluetooth and serve firmware updates until one
+//!      is installed or the PC asks for the stock firmware back.
 
 #![no_std]
 #![no_main]
@@ -40,13 +40,10 @@ use embassy_stm32::time::Hertz;
 use core::fmt::Write;
 use log::Log;
 use embassy_stm32::{Config, Peripherals};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 
 /// Image the bootloader restores when we leave.
 const RETURN_TO: ota_flag::Source = ota_flag::Source::PacketA;
-/// Hard limit for one run: after this the watchdog is no longer fed and the
-/// watch goes back to the stock firmware.
-const RUN_SECS: u64 = 600;
 /// Watchdog period; a hang returns to the stock app after this long.
 const WATCHDOG_SECS: u32 = 20;
 
@@ -100,14 +97,16 @@ fn report(stage: u8, detail: u8) -> Result<bool, flash::Error> {
     ota_flag::request_install(RETURN_TO, byte).or_else(|_| ota_flag::request_install(RETURN_TO, byte))
 }
 
+/// Feeds the watchdog for as long as the executor is alive. If the app hangs
+/// in a busy loop, this task no longer runs and the watchdog resets the
+/// watch - which, with the return ticket booked, brings the stock firmware
+/// back.
 #[embassy_executor::task]
 async fn watchdog_feeder() {
-    let end = Instant::now() + Duration::from_secs(RUN_SECS);
-    while Instant::now() < end {
+    loop {
         watchdog::feed();
         Timer::after_secs(2).await;
     }
-    SCB::sys_reset();
 }
 
 /// Bring up storage and the log, then listen to the Bluetooth chip.
@@ -171,11 +170,12 @@ async fn experiment(p: Peripherals) {
         let _ = log.flush(log_partition);
         return;
     };
-    // Serve updates until shortly before the run limit.
-    let deadline = Instant::now() + Duration::from_secs(RUN_SECS - 30);
+    // Serve updates until one is installed or the PC asks for the stock
+    // firmware. If Bluetooth could not be started there is no way to reach
+    // us, so fall through and reset (back to the stock firmware).
     if let Some(mut link) = bluetooth_start(cypress, &mut log).await {
         let _ = log.flush(log_partition);
-        ota_server::run(&mut link, &mut log, image_partition, log_partition, deadline).await;
+        ota_server::run(&mut link, &mut log, image_partition, log_partition).await;
     }
 
     match log.flush(log_partition) {

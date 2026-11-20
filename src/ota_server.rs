@@ -3,7 +3,10 @@
 //! The PC-side tool (`opw_bt.py`, and `tools/ota.sh` on top of it) works
 //! unchanged against this app and against the stock app:
 //!
-//!   "00AT^BLUETOOTH"                 -> "OK\r\n"   (handshake after connecting)
+//!   "00AT^BLUETOOTH"                 -> "W301RUST OK\r\n"  (handshake after
+//!                                       connecting; the stock app answers
+//!                                       "OK\r\n", so the PC can tell which
+//!                                       firmware it is talking to)
 //!   "300\r"                          -> "300"     (start of a file push)
 //!   "33<ext>,<path>,<size>\r"        -> "330"     (open the receive channel)
 //!   chunks of up to 47996 bytes, each followed by its CRC32 (little-endian)
@@ -23,7 +26,7 @@
 use core::fmt::Write;
 
 use cortex_m::peripheral::SCB;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 
 use crate::cypress::{self, Link};
 use crate::log::Log;
@@ -50,18 +53,18 @@ enum State {
     Receiving { total: usize, received: usize },
 }
 
-/// Serve the update protocol until `deadline`, an install, or a return
-/// request. `image_partition` is volume 1, `log_partition` volume 3.
-pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log_partition: Partition, deadline: Instant) {
+/// Serve the update protocol until an install or a return request resets
+/// the watch. `image_partition` is volume 1, `log_partition` volume 3.
+pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log_partition: Partition) -> ! {
     let Some(chunk) = cortex_m::singleton!(: [u8; CHUNK_DATA + 4] = [0; CHUNK_DATA + 4]) else {
-        return;
+        SCB::sys_reset(); // cannot happen: `run` is entered once
     };
     let mut chunk_len = 0usize;
     let mut state = State::Commands;
     let mut package: Option<Package> = None;
     let mut ready_image: Option<usize> = None; // length of a complete, verified image
 
-    while Instant::now() < deadline {
+    loop {
         let Some(packet) = link.receive(Duration::from_millis(500)).await else {
             continue;
         };
@@ -101,7 +104,7 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
                 let text = core::str::from_utf8(data).unwrap_or("");
                 let _ = writeln!(log.stamp(), "bluetooth rx: {:?}", text);
                 if text.contains("AT^BLUETOOTH") {
-                    answer = b"OK\r\n";
+                    answer = b"W301RUST OK\r\n";
                 } else if text == "300\r" {
                     answer = b"300";
                 } else if let Some(args) = text.strip_prefix("33").and_then(|t| t.strip_suffix('\r')) {
@@ -204,5 +207,4 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
             SCB::sys_reset();
         }
     }
-    let _ = writeln!(log.stamp(), "ota server: time is up");
 }

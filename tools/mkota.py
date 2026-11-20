@@ -11,7 +11,12 @@ known-good package (TEMPLATE). The header contains further fields whose meaning
 is unknown, so the image is padded to the template's payload size instead of
 changing the size field.
 
-usage: mkota.py TEMPLATE_PACKAGE APP_BIN OUT_PACKAGE
+With --compact the image is not padded (only rounded up to 8 bytes) and the
+size field is set to match. The Rust app's updater accepts that; it is much
+faster to send and to flash. The stock updater has only been tried with the
+padded form.
+
+usage: mkota.py [--compact] TEMPLATE_PACKAGE APP_BIN OUT_PACKAGE
 """
 import struct
 import sys
@@ -23,10 +28,12 @@ KEEP_TAIL = 8  # stock app ends in an 8-byte trailer; kept in case something che
 
 
 def main():
-    if len(sys.argv) != 4:
+    args = [a for a in sys.argv[1:] if a != "--compact"]
+    compact = "--compact" in sys.argv[1:]
+    if len(args) != 3:
         sys.exit(__doc__)
-    tpl = open(sys.argv[1], "rb").read()
-    app = open(sys.argv[2], "rb").read()
+    tpl = open(args[0], "rb").read()
+    app = open(args[1], "rb").read()
 
     if tpl[:4] != b"~ZZZ":
         sys.exit("template: not an uncompressed ~ZZZ package")
@@ -45,10 +52,15 @@ def main():
     if not (0x20000000 < sp <= 0x200A0000) or not (reset & 1) or not (0x0801E000 < reset < 0x08200000):
         sys.exit(f"app: implausible vector table (sp={sp:#x}, reset={reset:#x})")
 
-    new = app + b"\xff" * (size - KEEP_TAIL - len(app)) + payload[-KEEP_TAIL:]
-    out = tpl[:HDR] + new + struct.pack("<I", zlib.crc32(new))
-    open(sys.argv[3], "wb").write(out)
-    print(f"{sys.argv[3]}: {len(out)} bytes, app {len(app)} bytes, sp={sp:#x} reset={reset:#x}, "
+    header = bytearray(tpl[:HDR])
+    if compact:
+        new = app + b"\xff" * (-len(app) % 8)
+        struct.pack_into("<I", header, SIZE_OFF, len(new))
+    else:
+        new = app + b"\xff" * (size - KEEP_TAIL - len(app)) + payload[-KEEP_TAIL:]
+    out = bytes(header) + new + struct.pack("<I", zlib.crc32(new))
+    open(args[2], "wb").write(out)
+    print(f"{args[2]}: {len(out)} bytes, app {len(app)} bytes, sp={sp:#x} reset={reset:#x}, "
           f"crc32={zlib.crc32(new):08x}")
 
 
