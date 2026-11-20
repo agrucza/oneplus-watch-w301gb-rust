@@ -1,0 +1,14 @@
+[build]
+target = "thumbv7em-none-eabihf"   # Cortex-M4F
+
+[target.thumbv7em-none-eabihf]
+# `cargo run` = flash over SWD + stream defmt logs via RTT.
+runner = "probe-rs run --chip STM32L4R9ZIYxP"
+rustflags = [
+  "-C", "link-arg=-Tlink.x",    # cortex-m-rt linker script (pulls in memory.x)
+  "-C", "link-arg=-Tdefmt.x",   # defmt string table
+  "-C", "link-arg=--nmagic",    # don't page-align sections
+]
+
+[env]
+DEFMT_LOG = "debug"
