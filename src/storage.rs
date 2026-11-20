@@ -317,3 +317,115 @@ impl FileWriter {
         closed.map_err(|_| ())
     }
 }
+
+/// Find `name` in an open directory, by long name or by short 8.3 name,
+/// without regard to case. Returns the entry's short name (which is what
+/// the filesystem crate opens things by) and whether it is a directory.
+fn lookup(
+    manager: &VolumeManager<Emmc, NoClock>,
+    dir: RawDirectory,
+    name: &str,
+) -> Result<Option<(ShortFileName, bool)>, ()> {
+    let mut storage = [0u8; 128];
+    let mut lfn = LfnBuffer::new(&mut storage);
+    let mut found = None;
+    manager
+        .iterate_dir_lfn(dir, &mut lfn, |entry, long| {
+            let short = &entry.name;
+            let (base, ext) = (short.base_name(), short.extension());
+            let short_matches = match name.rsplit_once('.') {
+                Some((b, e)) if !ext.is_empty() => {
+                    b.as_bytes().eq_ignore_ascii_case(base) && e.as_bytes().eq_ignore_ascii_case(ext)
+                }
+                _ => ext.is_empty() && name.as_bytes().eq_ignore_ascii_case(base),
+            };
+            if short_matches || long.is_some_and(|l| l.eq_ignore_ascii_case(name)) {
+                found = Some((short.clone(), entry.attributes.is_directory()));
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .map_err(|_| ())?;
+    Ok(found)
+}
+
+/// A file opened for reading from the start, kept open across many `read`
+/// calls (used for sending a file to the PC piece by piece).
+pub struct FileReader {
+    manager: VolumeManager<Emmc, NoClock>,
+    volume: RawVolume,
+    file: RawFile,
+    len: u32,
+}
+
+impl FileReader {
+    /// Open `path` (components separated by `/`, long or short names) on
+    /// `partition`.
+    /// On failure returns the step: 2 volume, 3 root, 4 not found, 5 open.
+    pub fn open(partition: Partition, path: &str) -> Result<Self, u8> {
+        let manager = VolumeManager::new(Emmc { partition, writable: false }, NoClock);
+        let volume = manager.open_raw_volume(VolumeIdx(0)).map_err(|_| 2)?;
+        let mut dir = manager.open_root_dir(volume).map_err(|_| 3)?;
+        let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
+        while let Some(part) = parts.next() {
+            let (short, is_dir) = lookup(&manager, dir, part).map_err(|_| 3)?.ok_or(4)?;
+            if parts.peek().is_some() {
+                if !is_dir {
+                    return Err(4);
+                }
+                let next = manager.open_dir(dir, &short).map_err(|_| 4)?;
+                let _ = manager.close_dir(dir);
+                dir = next;
+            } else {
+                if is_dir {
+                    return Err(4);
+                }
+                let file = manager.open_file_in_dir(dir, &short, Mode::ReadOnly).map_err(|_| 5)?;
+                let len = manager.file_length(file).map_err(|_| 5)?;
+                let _ = manager.close_dir(dir);
+                return Ok(Self { manager, volume, file, len });
+            }
+        }
+        Err(4) // empty path
+    }
+
+    /// Length of the file in bytes.
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Read the next bytes; returns how many were read (0 at the end).
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+        let mut done = 0;
+        while done < buf.len() {
+            if self.manager.file_eof(self.file).map_err(|_| ())? {
+                break;
+            }
+            let n = self.manager.read(self.file, &mut buf[done..]).map_err(|_| ())?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Ok(done)
+    }
+
+    pub fn close(self) {
+        let _ = self.manager.close_file(self.file);
+        let _ = self.manager.close_volume(self.volume);
+    }
+}
+
+/// True if the file at `path` on `partition` starts with exactly the bytes
+/// in `expected` (at most 512 are compared).
+pub fn file_starts_with(partition: Partition, path: &str, expected: &[u8]) -> bool {
+    let Ok(mut reader) = FileReader::open(partition, path) else {
+        return false;
+    };
+    let mut buf = [0u8; 512];
+    let n = expected.len().min(buf.len());
+    let same = matches!(reader.read(&mut buf[..n]), Ok(got) if got == n) && buf[..n] == expected[..n];
+    reader.close();
+    same
+}

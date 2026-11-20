@@ -6,6 +6,7 @@
 #   tools/ota.sh send       build + package + push + trigger install
 #   tools/ota.sh trigger    only trigger the install of an already pushed package
 #   tools/ota.sh stock      tell the running Rust app to return to the stock firmware
+#   tools/ota.sh log        fetch 3:log/rust.log into target/rust.log and show its end
 #
 # `send` finds out which firmware is running. To the Rust app it sends a
 # compact package over a single connection (a few seconds). To the stock app
@@ -66,6 +67,12 @@ send)
     elif [ "$rc" != 0 ]; then
         exit "$rc"
     fi
+    ;;
+log) # fetch the Rust app's log (works with either firmware) and show its end
+    bt pull 3:log/rust.log target/rust.log
+    tail -n 40 target/rust.log
+    echo
+    echo "[ota.sh] last 40 lines shown; full log: $PWD/target/rust.log"
     ;;
 stock) # Rust app is running: ask it to hand back to the stock firmware
     bt cmd "AT^W301STOCK"

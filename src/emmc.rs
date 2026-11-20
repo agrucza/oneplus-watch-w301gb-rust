@@ -53,7 +53,7 @@ const ALL_FLAGS: u32 = 0x1FE0_0FFF;
 const CMDTRANS: u32 = 1 << 6;
 const CPSMEN: u32 = 1 << 12;
 
-const KERNEL_HZ: u32 = 48_000_000;
+const KERNEL_HZ: u32 = crate::clocks::SDMMC_KERNEL_HZ;
 
 /// Set by `init`: cards up to 2 GB take byte addresses, larger ones sectors.
 static BYTE_ADDRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

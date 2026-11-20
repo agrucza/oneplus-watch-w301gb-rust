@@ -20,19 +20,35 @@
 //! `1:ota/stm32/stm32_app.bin`, the file the bootloader installs when the
 //! flag record says so (`ota_flag::Source::Ota`).
 //!
+//! Files can also be fetched from the watch, as with the stock firmware:
+//!
+//!   "061<volume>:<path>\r"           -> frames of 0x40, length (u32 big-endian),
+//!                                       data; the PC answers each with "062\r"
+//!   after the last frame             -> "AT^FILE_EXPORT_OVER"
+//!
+//! Staying in Rust: every boot first books the return to the stock firmware
+//! (see `main`). Once a PC has completed the handshake - proof that this
+//! image can be reached and replaced - the booking is changed to "install
+//! the image file again", so a reset of any kind comes back to this app.
+//! The file is `1:ota/stm32/stm32_app.bin`, which is what the bootloader
+//! flashed us from. As soon as a new package starts to overwrite that file,
+//! the booking goes back to the stock firmware until the new image is
+//! complete and verified.
+//!
 //! One extra command: "00AT^W301STOCK" -> "OK\r\n", then reset. With the
 //! return ticket booked at boot, that brings the stock firmware back.
 
 use core::fmt::Write;
 
 use cortex_m::peripheral::SCB;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
+use crate::apollo::Apollo;
 use crate::cypress::{self, Link};
 use crate::log::Log;
 use crate::ota_flag;
 use crate::package::{crc32_update, Package, PACKAGE_HEADER};
-use crate::storage::{FileWriter, Partition};
+use crate::storage::{self, FileReader, FileWriter, Partition};
 
 // Serial-port (SPP) packets of the Cypress chip, group 0x04.
 /// Event: a peer connected. Payload: address (6, reversed), handle (u16), 1 byte.
@@ -46,7 +62,13 @@ const EVT_SPP_TX_COMPLETE: u16 = 0x0405;
 /// Command: send data. Payload: handle (u16), data (stock: 0x080A7720).
 const CMD_SPP_DATA: u16 = 0x0403;
 
+/// How long a freshly booted image waits for a PC before giving up.
+const FIRST_CONTACT_LIMIT: Duration = Duration::from_secs(30 * 60);
 const CHUNK_DATA: usize = 47996;
+/// Data bytes per frame when sending a file (the stock firmware uses the same).
+const EXPORT_FRAME: usize = 0xA000;
+/// Largest data part of one serial-port packet (stock limit at 0x080A7748).
+const SPP_MAX_DATA: usize = 960;
 const PACKAGE_PATH: &str = "1:B280STM32_ota.bin";
 enum State {
     Commands,
@@ -55,7 +77,13 @@ enum State {
 
 /// Serve the update protocol until an install or a return request resets
 /// the watch. `image_partition` is volume 1, `log_partition` volume 3.
-pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log_partition: Partition) -> ! {
+pub async fn run(
+    link: &mut Link,
+    log: &mut Log,
+    mut apollo: Option<Apollo>,
+    image_partition: Partition,
+    log_partition: Partition,
+) -> ! {
     let Some(chunk) = cortex_m::singleton!(: [u8; CHUNK_DATA + 4] = [0; CHUNK_DATA + 4]) else {
         SCB::sys_reset(); // cannot happen: `run` is entered once
     };
@@ -63,9 +91,41 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
     let mut state = State::Commands;
     let mut package: Option<Package> = None;
     let mut ready_image: Option<usize> = None; // length of a complete, verified image
+    let mut rx_errors_logged = 0u32;
+    // Does the image file still hold the image we are running, and is the
+    // bootloader booked to reinstall it after a reset?
+    let mut image_file_is_ours = true;
+    let mut staying = false;
+    let mut handshaken = false;
+    let first_contact_deadline = Instant::now() + FIRST_CONTACT_LIMIT;
 
+    let mut last_save = Instant::now();
     loop {
-        let Some(packet) = link.receive(Duration::from_millis(500)).await else {
+        // The Apollo's handshake cannot wait long, so look after it between
+        // Bluetooth packets - but not while a package is streaming in.
+        if let (Some(apollo), State::Commands) = (apollo.as_mut(), &state) {
+            apollo.service(log).await;
+        }
+        let Some(packet) = link.receive(Duration::from_millis(20)).await else {
+            if link.rx_errors != rx_errors_logged {
+                rx_errors_logged = link.rx_errors;
+                let _ = writeln!(log.stamp(), "cypress: {} UART receive errors so far", rx_errors_logged);
+            }
+            // An image nobody has reached half an hour after boot is of no
+            // use and cannot be replaced: give up. No handshake means the
+            // booking is still the stock firmware, so this reset goes there.
+            if !handshaken && Instant::now() > first_contact_deadline {
+                let _ = writeln!(log.stamp(), "ota: no PC within 30 minutes of boot, returning to stock");
+                let _ = log.flush(log_partition);
+                SCB::sys_reset();
+            }
+            // Nothing is arriving: a good moment to save what was logged, so
+            // that it survives if the app dies. Not during a transfer, where
+            // the sender is waiting for us.
+            if log.pending() && matches!(state, State::Commands) && last_save.elapsed() > Duration::from_secs(2) {
+                let _ = log.flush(log_partition);
+                last_save = Instant::now();
+            }
             continue;
         };
         let opcode = packet.opcode;
@@ -98,6 +158,7 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
         let mut answer: &[u8] = b"";
         let mut install = false;
         let mut to_stock = false;
+        let mut export: Option<([u8; 128], usize)> = None; // "<volume>:<path>" to send to the PC
 
         match state {
             State::Commands => {
@@ -105,6 +166,20 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
                 let _ = writeln!(log.stamp(), "bluetooth rx: {:?}", text);
                 if text.contains("AT^BLUETOOTH") {
                     answer = b"W301RUST OK\r\n";
+                    handshaken = true;
+                    if !staying && image_file_is_ours {
+                        // Our own first 512 bytes, as flashed.
+                        let own = unsafe { core::slice::from_raw_parts(0x0801_E000 as *const u8, 512) };
+                        if storage::file_starts_with(image_partition, "ota/stm32/stm32_app.bin", own)
+                            && ota_flag::request_install(ota_flag::Source::Ota, 0x8B).is_ok()
+                        {
+                            staying = true;
+                            let _ = writeln!(log.stamp(), "ota: a reset now comes back to this image");
+                        } else {
+                            image_file_is_ours = false;
+                            let _ = writeln!(log.stamp(), "ota: image file is not this image; a reset returns to stock");
+                        }
+                    }
                 } else if text == "300\r" {
                     answer = b"300";
                 } else if let Some(args) = text.strip_prefix("33").and_then(|t| t.strip_suffix('\r')) {
@@ -113,8 +188,23 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
                     let (_ext, path, size) = (parts.next(), parts.next(), parts.next());
                     let size = size.and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                     answer = b"ERROR\r\n";
-                    if path == Some(PACKAGE_PATH) && size > PACKAGE_HEADER + 4 {
+                    let acceptable = path == Some(PACKAGE_PATH) && size > PACKAGE_HEADER + 4;
+                    let mut rebooked = true;
+                    if acceptable {
                         ready_image = None;
+                        // The image file is about to be overwritten: until the
+                        // new one is verified, a reset must go to the stock app.
+                        image_file_is_ours = false;
+                        if staying {
+                            staying = false;
+                            rebooked = ota_flag::request_install(ota_flag::Source::PacketA, 0x8C).is_ok();
+                            if !rebooked {
+                                // Leave the file alone while the bootloader would still install it.
+                                let _ = writeln!(log.stamp(), "ota: could not rebook the stock firmware");
+                            }
+                        }
+                    }
+                    if acceptable && rebooked {
                         match FileWriter::rewrite(image_partition, &["OTA", "STM32"], "stm32_app.bin") {
                             Ok(writer) => {
                                 package = Some(Package::new(writer));
@@ -127,9 +217,16 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
                                 let _ = writeln!(log.stamp(), "ota: cannot open the image file (step {})", step);
                             }
                         }
-                    } else {
+                    } else if !acceptable {
                         let _ = writeln!(log.stamp(), "ota: only {} can be pushed", PACKAGE_PATH);
                     }
+                } else if let Some(what) = text.strip_prefix("061").and_then(|t| t.strip_suffix('\r')) {
+                    let mut name = [0u8; 128];
+                    let n = what.len().min(name.len());
+                    name[..n].copy_from_slice(&what.as_bytes()[..n]);
+                    export = Some((name, n));
+                } else if text.contains("FILE_EXPORT_OVER") {
+                    // the PC's closing word after a file export; no answer
                 } else if text.contains("FI^SETUNCOMPFLAG") {
                     answer = b"OK\r\n";
                 } else if text.contains("FI^OTAUPDATE") {
@@ -188,6 +285,21 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
             }
         }
 
+        if let Some((name, n)) = export {
+            let what = core::str::from_utf8(&name[..n]).unwrap_or("");
+            // Write out what is still in RAM first, so a pulled log is complete.
+            let _ = log.flush(log_partition);
+            let sent = export_file(link, handle, what, chunk).await;
+            match sent {
+                Ok(bytes) => {
+                    let _ = writeln!(log.stamp(), "export: sent {} ({} bytes)", what, bytes);
+                }
+                Err(reason) => {
+                    let _ = writeln!(log.stamp(), "export of {} failed: {}", what, reason);
+                }
+            }
+        }
+
         if install || to_stock {
             Timer::after_millis(300).await; // let the answer reach the PC
             if install {
@@ -203,8 +315,123 @@ pub async fn run(link: &mut Link, log: &mut Log, image_partition: Partition, log
             } else {
                 let _ = writeln!(log.stamp(), "bluetooth: return to the stock firmware requested");
                 let _ = log.flush(log_partition);
+                if ota_flag::request_install(ota_flag::Source::PacketA, 0x8C).is_err() {
+                    let _ = writeln!(log.stamp(), "bluetooth: could not book the stock firmware; staying");
+                    let _ = log.flush(log_partition);
+                    continue;
+                }
             }
             SCB::sys_reset();
         }
+    }
+}
+
+/// Send one serial-port packet and wait until the chip has passed it on.
+/// Returns true if the PC's frame confirmation ("062") arrived meanwhile:
+/// the PC can answer before the chip reports the last packet as sent, and
+/// that answer must not get lost.
+async fn spp_send(link: &mut Link, handle: [u8; 2], data: &[u8]) -> Result<bool, &'static str> {
+    let mut out = [0u8; 2 + SPP_MAX_DATA];
+    out[..2].copy_from_slice(&handle);
+    out[2..2 + data.len()].copy_from_slice(data);
+    if !link.send(CMD_SPP_DATA, &out[..2 + data.len()]).await {
+        return Err("the chip does not take data");
+    }
+    let mut confirmed = false;
+    for _ in 0..6 {
+        match link.receive(Duration::from_millis(500)).await {
+            Some(p) if p.opcode == EVT_SPP_TX_COMPLETE => return Ok(confirmed),
+            Some(p) if p.opcode == EVT_SPP_DISCONNECTED => return Err("the PC disconnected"),
+            Some(p) if is_frame_confirmation(&p) => confirmed = true,
+            _ => {}
+        }
+    }
+    Err("no confirmation from the chip")
+}
+
+fn is_frame_confirmation(p: &cypress::Packet<'_>) -> bool {
+    p.opcode == EVT_SPP_RX_DATA && p.payload.len() > 2 && p.payload[2..].starts_with(b"062")
+}
+
+/// Send the file named by `what` ("<volume>:<path>") to the PC in the stock
+/// export format. `buf` is scratch space. Returns the number of bytes sent.
+/// A missing file is answered like an empty one, with just the closing word.
+async fn export_file(
+    link: &mut Link,
+    handle: [u8; 2],
+    what: &str,
+    buf: &mut [u8; CHUNK_DATA + 4],
+) -> Result<usize, &'static str> {
+    let mut reader = None;
+    let mut problem = None;
+    match what.split_once(':') {
+        Some((volume, path)) => match volume.parse::<usize>() {
+            Ok(v) if v < 4 => match storage::inspect(v) {
+                Ok(partition) => match FileReader::open(partition, path) {
+                    Ok(r) => reader = Some(r),
+                    Err(_) => problem = Some("file not found"),
+                },
+                Err(_) => problem = Some("volume not readable"),
+            },
+            _ => problem = Some("no such volume"),
+        },
+        None => problem = Some("name must be <volume>:<path>"),
+    }
+
+    let mut total = 0usize;
+    let mut result = Ok(());
+    if let Some(reader) = reader.as_mut() {
+        let mut left = reader.len() as usize;
+        while left > 0 && result.is_ok() {
+            let n = left.min(EXPORT_FRAME);
+            // Frame: 0x40, length (u32 big-endian), data.
+            buf[0] = 0x40;
+            buf[1..5].copy_from_slice(&(n as u32).to_be_bytes());
+            match reader.read(&mut buf[5..5 + n]) {
+                Ok(got) if got == n => {}
+                _ => {
+                    result = Err("reading the file failed");
+                    break;
+                }
+            }
+            let mut confirmed = false;
+            for piece in buf[..5 + n].chunks(SPP_MAX_DATA) {
+                match spp_send(link, handle, piece).await {
+                    Ok(early) => confirmed |= early,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+            total += n;
+            left -= n;
+            // The PC confirms every frame with "062\r".
+            for _ in 0..40 {
+                if confirmed {
+                    break;
+                }
+                match link.receive(Duration::from_millis(500)).await {
+                    Some(p) if is_frame_confirmation(&p) => confirmed = true,
+                    Some(p) if p.opcode == EVT_SPP_DISCONNECTED => break,
+                    _ => {}
+                }
+            }
+            if !confirmed {
+                result = Err("the PC did not confirm a frame");
+            }
+        }
+    }
+    if let Some(reader) = reader {
+        reader.close();
+    }
+    result?;
+    let _ = spp_send(link, handle, b"AT^FILE_EXPORT_OVER").await?;
+    match problem {
+        Some(reason) => Err(reason),
+        None => Ok(total),
     }
 }

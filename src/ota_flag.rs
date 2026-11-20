@@ -55,8 +55,9 @@ pub enum Source {
     Ota = 3,
 }
 
-/// crc8, poly 0x31, init 0, MSB first (bootloader `0x08009A84`).
-fn crc8(data: &[u8]) -> u8 {
+/// crc8, poly 0x31, init 0, MSB first (bootloader `0x08009A84`; the Apollo
+/// link uses the same one).
+pub fn crc8(data: &[u8]) -> u8 {
     let mut crc = 0u8;
     for &b in data {
         crc ^= b;

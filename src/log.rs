@@ -25,6 +25,11 @@ impl Log {
         Some(Self { buf, len: 0, dropped: false })
     }
 
+    /// True if there is text that `flush` has not written out yet.
+    pub fn pending(&self) -> bool {
+        self.len > 0
+    }
+
     /// Start a line with the time since boot.
     pub fn stamp(&mut self) -> &mut Self {
         use fmt::Write;

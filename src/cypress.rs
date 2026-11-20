@@ -92,6 +92,8 @@ pub struct Link {
     /// Length of the packet handed out by the last `receive`; removed from
     /// the buffer on the next call.
     consumed: usize,
+    /// UART receive errors seen so far (framing, noise, overrun).
+    pub rx_errors: u32,
     _pins: (Output<'static>, Output<'static>, Output<'static>, Input<'static>),
 }
 
@@ -123,6 +125,7 @@ impl Link {
             buf,
             len: 0,
             consumed: 0,
+            rx_errors: 0,
             _pins: (wake, reset, power, irq),
         })
     }
@@ -172,8 +175,17 @@ impl Link {
             }
             let wait = (end - now).min(Duration::from_millis(100));
             let free = self.len..self.buf.len();
-            if let Ok(Ok(n)) = with_timeout(wait, self.rx.read(&mut self.buf[free])).await {
-                self.len += n;
+            match with_timeout(wait, self.rx.read(&mut self.buf[free])).await {
+                Ok(Ok(n)) => self.len += n,
+                Ok(Err(_)) => {
+                    // The receiver restarts on the next read. Give the rest of
+                    // the system a turn first: an error that is still present
+                    // makes `read` fail again at once, and a loop of such
+                    // failures would never let the watchdog task run.
+                    self.rx_errors = self.rx_errors.wrapping_add(1);
+                    Timer::after_millis(5).await;
+                }
+                Err(_) => {} // nothing arrived in time
             }
         }
     }
