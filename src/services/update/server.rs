@@ -18,7 +18,7 @@
 //! (see `tools/mkota.py`): a 0xB4-byte header, the app image, and the
 //! image's CRC32. The image is written straight to
 //! `1:ota/stm32/stm32_app.bin`, the file the bootloader installs when the
-//! flag record says so (`ota_flag::Source::Ota`).
+//! flag record says so (`ticket::Source::Ota`).
 //!
 //! Files can also be fetched from the watch, as with the stock firmware:
 //!
@@ -27,7 +27,7 @@
 //!   after the last frame             -> "AT^FILE_EXPORT_OVER"
 //!
 //! Staying in Rust: every boot first books the return to the stock firmware
-//! (see `main`). Once a PC has completed the handshake - proof that this
+//! (see `boot::ticket`). Once a PC has completed the handshake - proof that this
 //! image can be reached and replaced - the booking is changed to "install
 //! the image file again", so a reset of any kind comes back to this app.
 //! The file is `1:ota/stm32/stm32_app.bin`, which is what the bootloader
@@ -43,13 +43,11 @@ use core::fmt::Write;
 use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, Instant, Timer};
 
-use crate::apollo::Apollo;
-use crate::buttons::Buttons;
-use crate::cypress::{self, Link};
-use crate::log::Log;
-use crate::ota_flag;
-use crate::package::{crc32_update, Package, PACKAGE_HEADER};
-use crate::storage::{self, FileReader, FileWriter, Partition};
+use crate::drivers::cypress::{self, Link};
+use crate::services::log::Log;
+use crate::boot::ticket;
+use crate::services::update::package::{crc32_update, Package, PACKAGE_HEADER};
+use crate::services::storage::{self, FileReader, FileWriter, Partition};
 
 // Serial-port (SPP) packets of the Cypress chip, group 0x04.
 /// Event: a peer connected. Payload: address (6, reversed), handle (u16), 1 byte.
@@ -71,65 +69,82 @@ const EXPORT_FRAME: usize = 0xA000;
 /// Largest data part of one serial-port packet (stock limit at 0x080A7748).
 const SPP_MAX_DATA: usize = 960;
 const PACKAGE_PATH: &str = "1:B280STM32_ota.bin";
+#[derive(Clone, Copy)]
 enum State {
     Commands,
     Receiving { total: usize, received: usize },
 }
 
-/// Serve the update protocol until an install or a return request resets
-/// the watch. `image_partition` is volume 1, `log_partition` volume 3.
-pub async fn run(
-    link: &mut Link,
-    log: &mut Log,
-    mut apollo: Option<Apollo>,
-    mut buttons: Buttons,
-    image_partition: Partition,
-    log_partition: Partition,
-) -> ! {
-    let Some(chunk) = cortex_m::singleton!(: [u8; CHUNK_DATA + 4] = [0; CHUNK_DATA + 4]) else {
-        SCB::sys_reset(); // cannot happen: `run` is entered once
-    };
-    let mut chunk_len = 0usize;
-    let mut state = State::Commands;
-    let mut package: Option<Package> = None;
-    let mut ready_image: Option<usize> = None; // length of a complete, verified image
-    let mut rx_errors_logged = 0u32;
+/// What one `Server::step` did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// Nothing arrived within the waiting time.
+    Idle,
+    /// A packet from the Bluetooth chip was dealt with.
+    Handled,
+}
+
+/// The update protocol's state between packets.
+pub struct Server {
+    chunk: &'static mut [u8; CHUNK_DATA + 4],
+    chunk_len: usize,
+    state: State,
+    package: Option<Package>,
+    /// Length of a complete, verified image.
+    ready_image: Option<usize>,
+    rx_errors_logged: u32,
     // Does the image file still hold the image we are running, and is the
     // bootloader booked to reinstall it after a reset?
-    let mut image_file_is_ours = true;
-    let mut staying = false;
-    let mut handshaken = false;
-    let first_contact_deadline = Instant::now() + FIRST_CONTACT_LIMIT;
+    image_file_is_ours: bool,
+    staying: bool,
+    handshaken: bool,
+    first_contact_deadline: Instant,
+    /// Volume 1: the package and the image file.
+    image_partition: Partition,
+}
 
-    let mut last_save = Instant::now();
-    loop {
-        // The Apollo's handshake cannot wait long, so look after it between
-        // Bluetooth packets - but not while a package is streaming in.
-        if let (Some(apollo), State::Commands) = (apollo.as_mut(), &state) {
-            apollo.service(log).await;
-        }
-        buttons.poll(log);
+impl Server {
+    /// `None` on the second call.
+    pub fn new(image_partition: Partition) -> Option<Self> {
+        let chunk = cortex_m::singleton!(: [u8; CHUNK_DATA + 4] = [0; CHUNK_DATA + 4])?;
+        Some(Self {
+            chunk,
+            chunk_len: 0,
+            state: State::Commands,
+            package: None,
+            ready_image: None,
+            rx_errors_logged: 0,
+            image_file_is_ours: true,
+            staying: false,
+            handshaken: false,
+            first_contact_deadline: Instant::now() + FIRST_CONTACT_LIMIT,
+            image_partition,
+        })
+    }
+
+    /// True while a package is streaming in: the sender waits for every
+    /// answer, so nothing slow should run in between.
+    pub fn transferring(&self) -> bool {
+        matches!(self.state, State::Receiving { .. })
+    }
+
+    /// Wait up to 20 ms for a packet from the Bluetooth chip and deal with
+    /// it. An install or a return request ends in a reset from in here.
+    pub async fn step(&mut self, link: &mut Link, log: &mut Log) -> Activity {
         let Some(packet) = link.receive(Duration::from_millis(20)).await else {
-            if link.rx_errors != rx_errors_logged {
-                rx_errors_logged = link.rx_errors;
-                let _ = writeln!(log.stamp(), "cypress: {} UART receive errors so far", rx_errors_logged);
+            if link.rx_errors != self.rx_errors_logged {
+                self.rx_errors_logged = link.rx_errors;
+                let _ = writeln!(log.stamp(), "cypress: {} UART receive errors so far", self.rx_errors_logged);
             }
             // An image nobody has reached half an hour after boot is of no
             // use and cannot be replaced: give up. No handshake means the
             // booking is still the stock firmware, so this reset goes there.
-            if !handshaken && Instant::now() > first_contact_deadline {
+            if !self.handshaken && Instant::now() > self.first_contact_deadline {
                 let _ = writeln!(log.stamp(), "ota: no PC within 30 minutes of boot, returning to stock");
-                let _ = log.flush(log_partition);
+                let _ = log.flush();
                 SCB::sys_reset();
             }
-            // Nothing is arriving: a good moment to save what was logged, so
-            // that it survives if the app dies. Not during a transfer, where
-            // the sender is waiting for us.
-            if log.pending() && matches!(state, State::Commands) && last_save.elapsed() > Duration::from_secs(2) {
-                let _ = log.flush(log_partition);
-                last_save = Instant::now();
-            }
-            continue;
+            return Activity::Idle;
         };
         let opcode = packet.opcode;
         if opcode != EVT_SPP_RX_DATA || packet.payload.len() < 2 {
@@ -139,47 +154,47 @@ pub async fn run(
                 }
                 EVT_SPP_DISCONNECTED => {
                     let _ = writeln!(log.stamp(), "bluetooth: peer disconnected");
-                    if let State::Receiving { total, received } = state {
+                    if let State::Receiving { total, received } = self.state {
                         let _ = writeln!(log.stamp(), "ota: transfer aborted at {} of {} bytes", received, total);
-                        if let Some(p) = package.take() {
+                        if let Some(p) = self.package.take() {
                             let _ = p.finish(total);
                         }
-                        state = State::Commands;
-                        chunk_len = 0;
+                        self.state = State::Commands;
+                        self.chunk_len = 0;
                     }
-                    let _ = log.flush(log_partition);
+                    let _ = log.flush();
                 }
                 EVT_SPP_TX_COMPLETE => {} // one per answer we send; not worth a log line
                 _ => cypress::log_packet(log, &packet),
             }
-            continue;
+            return Activity::Handled;
         }
         let handle = [packet.payload[0], packet.payload[1]];
         let data = &packet.payload[2..];
-
+    
         // What to answer, decided while `packet` (borrowed from the link) is alive.
         let mut answer: &[u8] = b"";
         let mut install = false;
         let mut to_stock = false;
         let mut export: Option<([u8; 128], usize)> = None; // "<volume>:<path>" to send to the PC
-
-        match state {
+    
+        match self.state {
             State::Commands => {
                 let text = core::str::from_utf8(data).unwrap_or("");
                 let _ = writeln!(log.stamp(), "bluetooth rx: {:?}", text);
                 if text.contains("AT^BLUETOOTH") {
                     answer = b"W301RUST OK\r\n";
-                    handshaken = true;
-                    if !staying && image_file_is_ours {
+                    self.handshaken = true;
+                    if !self.staying && self.image_file_is_ours {
                         // Our own first 512 bytes, as flashed.
                         let own = unsafe { core::slice::from_raw_parts(0x0801_E000 as *const u8, 512) };
-                        if storage::file_starts_with(image_partition, "ota/stm32/stm32_app.bin", own)
-                            && ota_flag::request_install(ota_flag::Source::Ota, 0x8B).is_ok()
+                        if storage::file_starts_with(self.image_partition, "ota/stm32/stm32_app.bin", own)
+                            && ticket::request_install(ticket::Source::Ota, 0x8B).is_ok()
                         {
-                            staying = true;
+                            self.staying = true;
                             let _ = writeln!(log.stamp(), "ota: a reset now comes back to this image");
                         } else {
-                            image_file_is_ours = false;
+                            self.image_file_is_ours = false;
                             let _ = writeln!(log.stamp(), "ota: image file is not this image; a reset returns to stock");
                         }
                     }
@@ -194,13 +209,13 @@ pub async fn run(
                     let acceptable = path == Some(PACKAGE_PATH) && size > PACKAGE_HEADER + 4;
                     let mut rebooked = true;
                     if acceptable {
-                        ready_image = None;
+                        self.ready_image = None;
                         // The image file is about to be overwritten: until the
                         // new one is verified, a reset must go to the stock app.
-                        image_file_is_ours = false;
-                        if staying {
-                            staying = false;
-                            rebooked = ota_flag::request_install(ota_flag::Source::PacketA, 0x8C).is_ok();
+                        self.image_file_is_ours = false;
+                        if self.staying {
+                            self.staying = false;
+                            rebooked = ticket::request_install(ticket::Source::PacketA, 0x8C).is_ok();
                             if !rebooked {
                                 // Leave the file alone while the bootloader would still install it.
                                 let _ = writeln!(log.stamp(), "ota: could not rebook the stock firmware");
@@ -208,11 +223,11 @@ pub async fn run(
                         }
                     }
                     if acceptable && rebooked {
-                        match FileWriter::rewrite(image_partition, &["OTA", "STM32"], "stm32_app.bin") {
+                        match FileWriter::rewrite(self.image_partition, &["OTA", "STM32"], "stm32_app.bin") {
                             Ok(writer) => {
-                                package = Some(Package::new(writer));
-                                state = State::Receiving { total: size, received: 0 };
-                                chunk_len = 0;
+                                self.package = Some(Package::new(writer));
+                                self.state = State::Receiving { total: size, received: 0 };
+                                self.chunk_len = 0;
                                 answer = b"330";
                                 let _ = writeln!(log.stamp(), "ota: receiving package, {} bytes", size);
                             }
@@ -233,7 +248,7 @@ pub async fn run(
                 } else if text.contains("FI^SETUNCOMPFLAG") {
                     answer = b"OK\r\n";
                 } else if text.contains("FI^OTAUPDATE") {
-                    install = ready_image.is_some();
+                    install = self.ready_image.is_some();
                     answer = if install { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if text.contains("AT^W301STOCK") {
                     to_stock = true;
@@ -245,25 +260,25 @@ pub async fn run(
             State::Receiving { total, received } => {
                 // Chunks are sent one at a time; the sender waits for 310/311.
                 let expect = (total - received).min(CHUNK_DATA) + 4;
-                let n = data.len().min(expect - chunk_len);
-                chunk[chunk_len..chunk_len + n].copy_from_slice(&data[..n]);
-                chunk_len += n;
-                if chunk_len == expect {
-                    let (body, crc) = chunk[..expect].split_at(expect - 4);
-                    chunk_len = 0;
+                let n = data.len().min(expect - self.chunk_len);
+                self.chunk[self.chunk_len..self.chunk_len + n].copy_from_slice(&data[..n]);
+                self.chunk_len += n;
+                if self.chunk_len == expect {
+                    let (body, crc) = self.chunk[..expect].split_at(expect - 4);
+                    self.chunk_len = 0;
                     if !crc32_update(0xFFFF_FFFF, body) != u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]]) {
                         answer = b"311";
                     } else {
-                        if let Some(p) = package.as_mut() {
+                        if let Some(p) = self.package.as_mut() {
                             p.feed(body, total);
                         }
                         let received = received + body.len();
                         answer = b"310";
                         if received == total {
-                            state = State::Commands;
-                            match package.take().map(|p| p.finish(total)) {
+                            self.state = State::Commands;
+                            match self.package.take().map(|p| p.finish(total)) {
                                 Some(Ok(len)) => {
-                                    ready_image = Some(len);
+                                    self.ready_image = Some(len);
                                     let _ = writeln!(log.stamp(), "ota: package complete, image of {} bytes verified", len);
                                 }
                                 Some(Err(reason)) => {
@@ -272,13 +287,13 @@ pub async fn run(
                                 None => {}
                             }
                         } else {
-                            state = State::Receiving { total, received };
+                            self.state = State::Receiving { total, received };
                         }
                     }
                 }
             }
         }
-
+    
         if !answer.is_empty() {
             let mut out = [0u8; 16];
             out[..2].copy_from_slice(&handle);
@@ -287,12 +302,12 @@ pub async fn run(
                 let _ = writeln!(log.stamp(), "bluetooth: answer could not be sent");
             }
         }
-
+    
         if let Some((name, n)) = export {
             let what = core::str::from_utf8(&name[..n]).unwrap_or("");
             // Write out what is still in RAM first, so a pulled log is complete.
-            let _ = log.flush(log_partition);
-            let sent = export_file(link, handle, what, chunk).await;
+            let _ = log.flush();
+            let sent = export_file(link, handle, what, self.chunk).await;
             match sent {
                 Ok(bytes) => {
                     let _ = writeln!(log.stamp(), "export: sent {} ({} bytes)", what, bytes);
@@ -302,30 +317,31 @@ pub async fn run(
                 }
             }
         }
-
+    
         if install || to_stock {
             Timer::after_millis(300).await; // let the answer reach the PC
             if install {
                 let _ = writeln!(log.stamp(), "ota: installing the received image, rebooting");
-                let _ = log.flush(log_partition);
+                let _ = log.flush();
                 // The bootloader installs 1:ota/stm32/stm32_app.bin on the next reset.
-                let booked = ota_flag::request_install(ota_flag::Source::Ota, 0x8A);
+                let booked = ticket::request_install(ticket::Source::Ota, 0x8A);
                 if booked.is_err() {
                     // The earlier ticket (back to the stock app) is still in place.
                     let _ = writeln!(log.stamp(), "ota: could not book the install");
-                    let _ = log.flush(log_partition);
+                    let _ = log.flush();
                 }
             } else {
                 let _ = writeln!(log.stamp(), "bluetooth: return to the stock firmware requested");
-                let _ = log.flush(log_partition);
-                if ota_flag::request_install(ota_flag::Source::PacketA, 0x8C).is_err() {
+                let _ = log.flush();
+                if ticket::request_install(ticket::Source::PacketA, 0x8C).is_err() {
                     let _ = writeln!(log.stamp(), "bluetooth: could not book the stock firmware; staying");
-                    let _ = log.flush(log_partition);
-                    continue;
+                    let _ = log.flush();
+                    return Activity::Handled;
                 }
             }
             SCB::sys_reset();
         }
+        Activity::Handled
     }
 }
 

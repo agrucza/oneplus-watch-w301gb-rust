@@ -17,7 +17,7 @@ use embedded_sdmmc::{
     TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
 
-use crate::emmc;
+use crate::hal::sdmmc;
 
 /// Block-device error: an eMMC driver error, or a refused write.
 #[derive(Debug, Clone, Copy)]
@@ -42,11 +42,11 @@ impl core::error::Error for DeviceError {}
 
 fn read_raw(sector: u32, out: &mut [u8; 512]) -> Result<(), DeviceError> {
     let mut aligned = [0u32; 128]; // the controller's DMA needs a word-aligned buffer
-    emmc::read_sector(sector, &mut aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
+    sdmmc::read_sector(sector, &mut aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
     for (bytes, word) in out.chunks_exact_mut(4).zip(aligned.iter()) {
         bytes.copy_from_slice(&word.to_le_bytes());
     }
-    crate::watchdog::feed();
+    crate::boot::watchdog::feed();
     Ok(())
 }
 
@@ -106,7 +106,7 @@ pub fn inspect(index: usize) -> Result<Partition, DeviceError> {
 /// type byte it knows. FatFs never looks at that byte, so the stock card may
 /// carry anything there. This device therefore answers sector 0 with a
 /// one-entry table of its own (correct type, real position); every other
-/// sector is the card's. `emmc::init()` must have succeeded.
+/// sector is the card's. `sdmmc::init()` must have succeeded.
 pub struct Emmc {
     partition: Partition,
     writable: bool,
@@ -149,8 +149,8 @@ impl BlockDevice for Emmc {
             for (word, bytes) in aligned.iter_mut().zip(block.contents.chunks_exact(4)) {
                 *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
-            emmc::write_sector(sector, &aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
-            crate::watchdog::feed();
+            sdmmc::write_sector(sector, &aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
+            crate::boot::watchdog::feed();
         }
         Ok(())
     }

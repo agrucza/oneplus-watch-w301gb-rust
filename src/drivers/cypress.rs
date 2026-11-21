@@ -30,7 +30,7 @@ use embassy_stm32::usart::{self, RingBufferedUartRx, StopBits, Uart, UartTx};
 use embassy_stm32::{bind_interrupts, dma, peripherals, Peri};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 
-use crate::log::Log;
+use crate::services::log::Log;
 
 bind_interrupts!(struct Irqs {
     USART3 => usart::InterruptHandler<peripherals::USART3>;

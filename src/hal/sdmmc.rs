@@ -10,14 +10,14 @@
 //!
 //! Wiring (bootloader `HAL_MMC_MspInit`, 0x08007F66): CLK PC12, CMD PD2,
 //! D0..D3 PC8..PC11, all alternate function 12, pull-up, very high speed.
-//! Kernel clock: CLK48 = MSI 48 MHz (set up in `main`).
+//! Kernel clock: CLK48 = MSI 48 MHz (set up in `clocks`).
 
 use core::ptr::{read_volatile, write_volatile};
 
 use embassy_time::{Duration, Instant};
 
-const RCC_AHB2RSTR: *mut u32 = 0x4002_102C as *mut u32;
-const RCC_AHB2ENR: *mut u32 = 0x4002_104C as *mut u32;
+use crate::hal::reg::{RCC_AHB2ENR, RCC_AHB2RSTR, modify};
+
 const GPIOC: usize = 0x4800_0800;
 const GPIOD: usize = 0x4800_0C00;
 const SDMMC1: usize = 0x5006_2400;
@@ -53,7 +53,7 @@ const ALL_FLAGS: u32 = 0x1FE0_0FFF;
 const CMDTRANS: u32 = 1 << 6;
 const CPSMEN: u32 = 1 << 12;
 
-const KERNEL_HZ: u32 = crate::clocks::SDMMC_KERNEL_HZ;
+const KERNEL_HZ: u32 = crate::hal::clocks::SDMMC_KERNEL_HZ;
 
 /// Set by `init`: cards up to 2 GB take byte addresses, larger ones sectors.
 static BYTE_ADDRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -108,10 +108,6 @@ enum CmdError {
     Timeout,
     Crc,
     Stuck,
-}
-
-unsafe fn modify(reg: *mut u32, clear: u32, set: u32) {
-    write_volatile(reg, (read_volatile(reg) & !clear) | set);
 }
 
 fn spin_for(d: Duration) {

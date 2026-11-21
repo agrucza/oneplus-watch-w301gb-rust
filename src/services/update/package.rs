@@ -2,7 +2,7 @@
 //! a 0xB4-byte header, the app image, and the image's CRC32. The image goes
 //! straight into a file through a `FileWriter`.
 
-use crate::storage::FileWriter;
+use crate::services::storage::FileWriter;
 
 pub const PACKAGE_HEADER: usize = 0xB4;
 const PACKAGE_SIZE_FIELD: usize = 0x76;

@@ -14,7 +14,7 @@ use embassy_stm32::gpio::{Input, Pull};
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::Instant;
 
-use crate::log::Log;
+use crate::services::log::Log;
 
 pub struct Buttons {
     upper: Input<'static>,

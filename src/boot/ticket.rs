@@ -22,7 +22,7 @@
 //! flash and clears the flag. Setting it is all that is needed to get the
 //! previous firmware back - no Bluetooth, eMMC or filesystem code required.
 
-use crate::flash;
+use crate::boot::flash;
 
 const PAGE_ADDR: u32 = 0x0801_9000;
 const PAGE_NUMBER: u8 = 0x19;
@@ -155,4 +155,22 @@ pub fn request_install(source: Source, report: u8) -> Result<bool, flash::Error>
     } else {
         Err(flash::Error(0))
     }
+}
+
+/// Image the bootloader restores when we leave.
+pub const RETURN_TO: Source = Source::PacketA;
+
+// Report byte (travels in the bootloader log as `err=`): 0x80 | stage << 4 | detail.
+// The ticket is rewritten before every risky step, so after a hang (watchdog
+// reset) the log still shows the last stage that was reached.
+pub const STAGE_BOOTED: u8 = 0; // nothing else done yet
+pub const STAGE_POWER: u8 = 1; // power pins set, about to talk to the card
+pub const STAGE_INIT_FAILED: u8 = 2; // detail = sdmmc::Error value
+pub const STAGE_LOG: u8 = 7; // detail 0 = log works, app running (or hung); 1..=7 = log failed at step; 15 = finished, log written
+
+/// Book the return to the stock firmware, with a report of how far this
+/// boot has come.
+pub fn report(stage: u8, detail: u8) -> Result<bool, flash::Error> {
+    let byte = 0x80 | (stage & 0x7) << 4 | (detail & 0xF);
+    request_install(RETURN_TO, byte).or_else(|_| request_install(RETURN_TO, byte))
 }

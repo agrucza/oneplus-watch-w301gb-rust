@@ -42,9 +42,10 @@ use embassy_stm32::gpio::{Input, Level, Output, OutputOpenDrain, Pull, Speed};
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::{Duration, Instant, Timer};
 
-use crate::apollo_messages::{self as messages, Fields, Readings, Value};
-use crate::log::Log;
-use crate::ota_flag::crc8;
+use crate::hal::reg::{RCC_AHB1ENR, RCC_APB2ENR, modify};
+use crate::drivers::apollo::messages::{self as messages, Fields, Readings, Value};
+use crate::services::log::Log;
+use crate::boot::ticket::crc8;
 
 const BLOCK: usize = 256;
 /// Sub-message numbers go up to 142 in the stock descriptor.
@@ -56,8 +57,6 @@ const FLAG_WANTS_ACK: u8 = 0x02;
 /// The stock app's own heartbeat period.
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30 * 60);
 
-const RCC_AHB1ENR: *mut u32 = 0x4002_1048 as *mut u32;
-const RCC_APB2ENR: *mut u32 = 0x4002_1060 as *mut u32;
 const GPIOA: usize = 0x4800_0000;
 
 const SPI1: usize = 0x4001_3000;
@@ -88,10 +87,6 @@ const CCR: usize = 0x0;
 const CNDTR: usize = 0x4;
 const CPAR: usize = 0x8;
 const CMAR: usize = 0xC;
-
-unsafe fn modify(reg: *mut u32, clear: u32, set: u32) {
-    write_volatile(reg, (read_volatile(reg) & !clear) | set);
-}
 
 /// Pins of the Apollo link.
 pub struct Resources {
