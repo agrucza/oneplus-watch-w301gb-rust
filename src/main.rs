@@ -27,6 +27,7 @@ mod log;
 mod ota_flag;
 mod ota_server;
 mod package;
+mod psram;
 #[allow(dead_code)] // read helpers are kept for the upcoming OTA code
 mod storage;
 mod watchdog;
@@ -190,25 +191,38 @@ async fn experiment(p: Peripherals) {
         .await;
         let _ = writeln!(log.stamp(), "apollo: {}", if apollo.is_some() { "released from reset" } else { "not started" });
 
-        // Display: test picture. Last, so that a problem here cannot keep
-        // Bluetooth from coming up.
-        let display = display::Display::start(
-            display::Resources {
-                supply_pg5: p.PG5,
-                supply_pf12: p.PF12,
-                power: p.PF5,
-                reset: p.PA11,
-                _te: p.PF11,
-                _ltdc: p.LTDC,
-                _dsi: p.DSIHOST,
-            },
-            &mut log,
-        )
-        .await;
-        if let Some(mut display) = display {
-            display.test_picture();
-            display.refresh(&mut log).await;
-            core::mem::forget(display); // keep the panel powered
+        // External memory, then the display with its framebuffer in it.
+        // Last, so that a problem here cannot keep Bluetooth from coming up.
+        // Should the memory bus hang, the watchdog resets us - and since no
+        // PC has connected to this boot yet, that reset returns to the stock
+        // firmware instead of looping.
+        let _ = log.flush(log_partition);
+        psram::init().await;
+        if psram::quick_check(&mut log) {
+            let _ = writeln!(log.stamp(), "psram: ready");
+            // The 2 MB at FRAMEBUFFER belong to the display alone.
+            let frame = unsafe { &mut *(psram::FRAMEBUFFER as *mut [u16; display::WIDTH * display::HEIGHT]) };
+            let display = display::Display::start(
+                display::Resources {
+                    supply_pg5: p.PG5,
+                    supply_pf12: p.PF12,
+                    power: p.PF5,
+                    reset: p.PA11,
+                    _te: p.PF11,
+                    _ltdc: p.LTDC,
+                    _dsi: p.DSIHOST,
+                },
+                frame,
+                &mut log,
+            )
+            .await;
+            if let Some(mut display) = display {
+                display.test_picture();
+                display.refresh(&mut log).await;
+                core::mem::forget(display); // keep the panel powered
+            }
+        } else {
+            let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
         let _ = log.flush(log_partition);
         ota_server::run(&mut link, &mut log, apollo, image_partition, log_partition).await;

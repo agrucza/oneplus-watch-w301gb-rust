@@ -18,8 +18,8 @@
 //!   pin PF11 (alternate function 11), rising edge
 //! * panel commands, low-power mode: see `PANEL_ON`
 //!
-//! The stock app keeps its framebuffer in external PSRAM. This first version
-//! uses internal RAM (412 KB), as the bootloader does.
+//! The framebuffer is handed in by the caller. Like the stock app, we keep it
+//! in the external PSRAM (see `psram`); the LTDC reads it from there itself.
 
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
@@ -140,11 +140,10 @@ async fn run_step(step: &Step) -> bool {
 }
 
 impl Display {
-    /// Power the panel, set up LTDC and DSI, switch the panel on. Every stage
-    /// is logged; `None` if one of them does not complete.
-    pub async fn start(r: Resources, log: &mut Log) -> Option<Self> {
-        let frame = cortex_m::singleton!(: [u16; WIDTH * HEIGHT] = [0; WIDTH * HEIGHT])?;
-
+    /// Power the panel, set up LTDC and DSI with `frame` as the picture
+    /// source, switch the panel on. Every stage is logged; `None` if one of
+    /// them does not complete.
+    pub async fn start(r: Resources, frame: &'static mut [u16; WIDTH * HEIGHT], log: &mut Log) -> Option<Self> {
         // --- power-up, as in the stock app ---------------------------------
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
@@ -265,7 +264,8 @@ impl Display {
     }
 
     /// Fill the framebuffer with a test picture: red, green and blue bands
-    /// from top to bottom, with a white stripe down the left edge.
+    /// from top to bottom, a white stripe down the left edge, and a black
+    /// square in the middle.
     pub fn test_picture(&mut self) {
         for y in 0..HEIGHT {
             let band = match y * 3 / HEIGHT {
@@ -276,6 +276,10 @@ impl Display {
             let row = &mut self.frame[y * WIDTH..(y + 1) * WIDTH];
             row.fill(band);
             row[..40].fill(0xFFFF);
+        }
+        // A black square in the middle.
+        for y in HEIGHT / 2 - 50..HEIGHT / 2 + 50 {
+            self.frame[y * WIDTH + WIDTH / 2 - 50..y * WIDTH + WIDTH / 2 + 50].fill(0);
         }
     }
 }
