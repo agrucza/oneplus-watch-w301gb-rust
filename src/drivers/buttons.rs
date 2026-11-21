@@ -38,18 +38,29 @@ impl Buttons {
         self.pressed
     }
 
-    /// Sample the button; changes go to the log.
-    pub fn poll(&mut self, log: &mut Log) {
+    /// Sample the button; a change is logged and returned.
+    pub fn poll(&mut self, log: &mut Log) -> Option<ButtonEvent> {
         let low = self.upper.is_low();
+        let mut event = None;
         if low == self.last_sample && low != self.pressed {
             self.pressed = low;
             if low {
                 let _ = writeln!(log.stamp(), "button upper: pressed");
+                event = Some(ButtonEvent::Pressed);
             } else {
-                let _ = writeln!(log.stamp(), "button upper: released after {} ms", self.since.elapsed().as_millis());
+                let held_ms = self.since.elapsed().as_millis();
+                let _ = writeln!(log.stamp(), "button upper: released after {} ms", held_ms);
+                event = Some(ButtonEvent::Released { held_ms });
             }
             self.since = Instant::now();
         }
         self.last_sample = low;
+        event
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonEvent {
+    Pressed,
+    Released { held_ms: u64 },
 }

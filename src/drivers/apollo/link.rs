@@ -126,6 +126,8 @@ pub struct Apollo {
     pub readings: Readings,
     /// The lower button's latest event (it is wired to the Apollo).
     pub last_key: Option<messages::KeyEvent>,
+    /// Lower-button events not yet fetched with `take_key`.
+    key_pending: Option<messages::KeyEvent>,
 }
 
 impl Apollo {
@@ -173,6 +175,7 @@ impl Apollo {
             next_summary: Instant::now() + Duration::from_secs(60),
             readings: Readings::default(),
             last_key: None,
+            key_pending: None,
         })
     }
 
@@ -345,6 +348,11 @@ impl Apollo {
     }
 
     /// One line with the latest sensor values.
+    /// The lower button's most significant event since the last call.
+    pub fn take_key(&mut self) -> Option<messages::KeyEvent> {
+        self.key_pending.take()
+    }
+
     fn log_readings(&self, log: &mut Log) {
         let r = &self.readings;
         let _ = write!(log.stamp(), "sensors:");
@@ -402,6 +410,10 @@ impl Apollo {
                 if kind == messages::KEY {
                     let (event, at) = messages::key_event(payload);
                     self.last_key = Some(event);
+                    // A click or long press outranks the press and release around it.
+                    if !matches!(self.key_pending, Some(messages::KeyEvent::Clicked | messages::KeyEvent::LongPressed)) {
+                        self.key_pending = Some(event);
+                    }
                     let _ = writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at);
                 }
             }

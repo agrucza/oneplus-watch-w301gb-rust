@@ -138,22 +138,25 @@ impl Panel {
         Some(Self { frame, _pins: [pg5, pf12, power, reset] })
     }
 
-    /// Send the framebuffer to the panel. Returns false if the transfer did
-    /// not finish within 200 ms (for example no tearing-effect pulse).
-    pub async fn refresh(&mut self, log: &mut Log) -> bool {
-        let s = dsi::refresh().await;
-        let _ = writeln!(
-            log.stamp(),
-            "display: refresh {}; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
-            if s.done { "done" } else { "NOT finished in 200 ms" },
-            s.wisr,
-            s.isr0,
-            s.isr1,
-            s.psr
-        );
-        s.done
+    /// Send the framebuffer to the panel. `done` is false if the transfer
+    /// did not finish within 200 ms (for example no tearing-effect pulse).
+    pub async fn refresh(&mut self) -> dsi::RefreshStatus {
+        dsi::refresh().await
     }
 
+    /// Set the brightness, 0 (darkest) to 255. False if the command was
+    /// not taken.
+    pub async fn set_brightness(&mut self, level: u8) -> bool {
+        dsi::dcs_1(0x51, level).await
+    }
+
+    /// Blank or show the picture (DCS "display off" / "display on"). The
+    /// panel stays powered and keeps its frame memory.
+    pub async fn set_visible(&mut self, visible: bool) -> bool {
+        dsi::dcs(if visible { 0x29 } else { 0x28 }).await
+    }
+
+    #[allow(dead_code)] // kept for checking the panel after changes to its set-up
     /// Fill the framebuffer with a test picture: red, green and blue bands
     /// from top to bottom, a white stripe down the left edge, and a black
     /// square in the middle.

@@ -101,6 +101,8 @@ pub struct Server {
     first_contact_deadline: Instant,
     /// Volume 1: the package and the image file.
     image_partition: Partition,
+    /// A peer is connected to the serial port.
+    pub connected: bool,
 }
 
 impl Server {
@@ -119,6 +121,7 @@ impl Server {
             handshaken: false,
             first_contact_deadline: Instant::now() + FIRST_CONTACT_LIMIT,
             image_partition,
+            connected: false,
         })
     }
 
@@ -150,9 +153,11 @@ impl Server {
         if opcode != EVT_SPP_RX_DATA || packet.payload.len() < 2 {
             match opcode {
                 EVT_SPP_CONNECTED => {
+                    self.connected = true;
                     let _ = writeln!(log.stamp(), "bluetooth: peer connected");
                 }
                 EVT_SPP_DISCONNECTED => {
+                    self.connected = false;
                     let _ = writeln!(log.stamp(), "bluetooth: peer disconnected");
                     if let State::Receiving { total, received } = self.state {
                         let _ = writeln!(log.stamp(), "ota: transfer aborted at {} of {} bytes", received, total);
