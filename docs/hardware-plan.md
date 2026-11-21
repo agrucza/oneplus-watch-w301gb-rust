@@ -1,6 +1,6 @@
 # W301 hardware bring-up plan
 
-Written 2026-11-21 from the firmware files in the watch dump
+Written 2026-11-21, updated as chips come up, from the firmware files in the watch dump
 (`~/opwatch/work/dump/mirror`), the stock bootloader and app disassembly, and
 what the Rust firmware has measured on the watch so far.
 
@@ -24,14 +24,14 @@ runs its own stack. Each chip below hangs off one of them.
 | 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works (1-bit, 12 MHz) |
 | 2 | Cypress CYW20721 Bluetooth | USART3 3 Mbaud (PC4, PC5, PB13, PB14), PB2, PC6, PB9, PC7 | `cypress/appdriver.bin`, `minidriver.bin` | works for existing pairings |
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works, few messages understood |
-| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | test picture works |
+| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
 | 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | nothing |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
-| 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing |
-| 10 | Ambient light sensor STK31800 | I2C2, address 0x45 | none | nothing |
-| 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both read and logged |
+| 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
+| 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: approximate lux |
+| 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
 | 13 | Real-time clock, backup domain | internal, LSE crystal | none | left running, not used |
 | 14 | Log UART | LPUART1 (PG7, PG8) | none | not used |
@@ -62,10 +62,10 @@ their callers, and every GPIO setup call in the app), unless marked.
 
 | Bus | Pins | Device | Address (7-bit) |
 |---|---|---|---|
-| I2C2 | PF0, PF1 | light sensor STK31800 | 0x45 |
+| I2C2 | PF1 clock, PF0 data | light sensor STK31800 (**measured**) | 0x45 |
 | I2C2 | | second light-sensor driver, for a part with a Lite-On style register map (alternative fitting, **guess**) | 0x53 |
-| I2C2 | | NFC controller SN100T | 0x28 |
-| I2C2 | | device with 16-bit registers, most likely the speaker amplifier (**guess**, see 3.6) | 0x36 |
+| I2C2 | | NFC controller SN100T; silent in a bus scan (**measured**), so unpowered or in reset until enabled | 0x28 |
+| I2C2 | | device with 16-bit registers, most likely the speaker amplifier (**guess**, see 3.6); also silent in a bus scan (**measured**) | 0x36 |
 | I2C3 | PB4, PC0 | touch controller | 0x24 |
 | I2C4 | PF14, PF15 (pull-ups) | the Apollo, for its firmware update only | 0x20 |
 | SPI1 | PA5, PA6, PA7 | Apollo message link (STM32 is the slave) | |
@@ -130,31 +130,42 @@ Remaining:
 
 ### 3.3 Display, remaining work (item 4) - M
 
-Works: panel on, one frame from the PSRAM.
+**Works (measured):** panel on with the stock app's values, framebuffer in
+the PSRAM, drawing with `embedded-graphics`, a status screen redrawn and
+sent once a second, brightness (command `0x51`) and blanking (display off /
+on commands) from the buttons.
 
-Steps:
-1. Drawing layer: `embedded-graphics` on the framebuffer, text and shapes.
-2. Brightness (command `0x51`) and display off / on with the stock
-   sequences (`0x08039464`, `0x080397E2`).
-3. Partial refresh: the stock app updates regions; needed for smooth
-   drawing without tearing.
-4. Double buffering in the PSRAM (the stock app reserves 2 MB at
+Remaining:
+1. Full power-down and power-up with the stock sequences (`0x08039464`,
+   `0x080397E2`); blanking keeps the panel powered. Belongs with low power.
+2. Partial refresh: the stock app updates regions; needed for smooth
+   drawing.
+3. Double buffering in the PSRAM (the stock app reserves 2 MB at
    `0x60C00000`; one frame is 412 KB).
+4. Larger fonts and a real watch face.
 5. Always-on mode (`lcd_alwayson` in the stock strings): later.
 
-### 3.4 Ambient light sensor (item 10) - S
+### 3.4 Ambient light sensor (item 10) - done, refinements left
 
-Known: STK31800 on I2C2 at address 0x45 (**stock code**, driver at
-`0x080777E0`: it reads register 0x3E, the product ID, and writes 0x80, the
-reset). A `TaskLightSensor` drives automatic brightness. The app also
-carries a driver for a second part at 0x53; only one of the two is fitted.
+**Measured:** STK31800 on I2C2 at address 0x45, product ID 0x82. Register 2
+holds the light channel's gain (bits 5:4: x1, x4, x16, x64) and measurement
+time (bits 3:0); register 0x4E the second channel's gain (bits 5:4, plus a
+large step in bit 2). With the light channel at x64 and the second at x4,
+and the stock lux formula (`0x08077948`), an indoor desk reads about 270
+lux, steady within a few lux.
 
-Steps:
-1. Bring up I2C2; read the product ID at both addresses, log which answers.
-2. Read lux; log it.
-3. Tie brightness to it.
+The stock driver's table of 14 register settings is in the app's compressed
+initial data and was not recovered; the gains above were found by
+experiment. The second channel's gain is inferred from the ratio bands of
+the stock formula, and the stock calibration offsets are not applied.
 
-A good first I2C device: simple chip, and it tells us which bus is which.
+The stock app also carries a driver for a second part at 0x53; this watch
+has the STK.
+
+Remaining:
+1. Automatic brightness: the screen follows the room light.
+2. Recover the stock settings table (the app's data initialisation would
+   have to be unpacked) if exact lux ever matters.
 
 ### 3.5 Apollo, remaining work (item 3 and items 15-24) - L
 
@@ -221,8 +232,11 @@ stock app, a firmware image and two RF configuration files.
 On I2C2 at address 0x28 (**stock code**, transfers with a 5 s timeout at
 `0x08060768`).
 
+The controller does not answer in a scan of the bus (**measured**), so it
+needs power or an enable first.
+
 Steps:
-1. Find the enable and interrupt pins.
+1. Find the power, enable and interrupt pins.
 2. Reset the controller and read its version (NCI core reset / init).
 3. Stop there unless NFC is wanted: card emulation with the secure element
    is a large protocol stack.
@@ -295,27 +309,30 @@ Would give a live log without Bluetooth.
 
 ## 5. Suggested order
 
-1. **Buttons** (3.2): small, and gives a physical control.
-2. **Drawing layer and brightness** (3.3 steps 1-2): the watch can show its
-   own state.
-3. **Light sensor** (3.4): first I2C device; also proves I2C2, which NFC
-   and the amplifier share.
-4. **Touch** (3.1): interaction.
-5. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
+Done so far: buttons (3.2), drawing layer and brightness (3.3), light
+sensor (3.4).
+
+1. **Automatic brightness** (3.4): small; finishes what the light sensor
+   is for.
+2. **Touch** (3.1): interaction.
+3. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
    step 1): removes the two hard-coded values.
-6. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
-7. **Low power** (section 4): after that the watch can be worn.
-8. **Audio** (3.6).
-9. **GPS, pairing, BLE, NFC** as wanted.
+4. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
+5. **Low power** (section 4): after that the watch can be worn.
+6. **Audio** (3.6).
+7. **GPS, pairing, BLE, NFC** as wanted.
 
 ## 6. Open questions
 
 - The touch controller's reset and interrupt pins (PF2 / PG2 are candidates).
+- Why the lower button's first press after a display command once came
+  without a "clicked" message from the Apollo.
 - What PA0 signals (not a button; the stock app takes a falling-edge
   interrupt from it).
 - What SPI2, ADC1 (PB0) and the outputs PA4, PB3, PB1 are used for.
-- Whether the device at 0x36 on I2C2 is the speaker amplifier.
-- The NFC controller's enable and interrupt pins.
+- Whether the device at 0x36 on I2C2 is the speaker amplifier, and which
+  pins power or enable it and the NFC controller (neither answers on the
+  bus as things are).
 - The panel's driver IC (the commands fit several 454 x 454 AMOLED drivers).
 - Whether OCTOSPI2 is really used: one reference exists in the stock app,
   but no clock selection for it and no flash chip strings.

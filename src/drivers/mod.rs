@@ -3,5 +3,6 @@
 pub mod apollo;
 pub mod buttons;
 pub mod cypress;
+pub mod light;
 pub mod panel;
 pub mod psram;

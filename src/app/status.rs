@@ -14,6 +14,7 @@ use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 use profont::{PROFONT_18_POINT, PROFONT_24_POINT};
 
 use crate::drivers::apollo::messages::Readings;
+use crate::drivers::light;
 use crate::drivers::panel::{Frame, WIDTH};
 use crate::services::canvas::Canvas;
 
@@ -24,6 +25,8 @@ const DIM: Rgb565 = Rgb565::new(15, 31, 15); // mid grey
 pub struct Status<'a> {
     pub uptime_s: u64,
     pub readings: Option<&'a Readings>,
+    /// Raw light sensor values.
+    pub light: Option<light::Raw>,
     pub bluetooth_connected: bool,
     /// Brightness step, 1-based, and the number of steps.
     pub brightness: (usize, usize),
@@ -141,6 +144,17 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
     put(336, false, Rgb565::YELLOW, 22, &mut line);
 
     let mut line = Line::new();
-    let _ = write!(line, "light {}/{}", s.brightness.0, s.brightness.1);
-    put(372, false, DIM, 12, &mut line);
+    match s.light {
+        Some(raw) => {
+            let _ = write!(line, "{} lux", light::LightSensor::lux(raw));
+        }
+        None => {
+            let _ = write!(line, "light --");
+        }
+    }
+    put(368, false, Rgb565::WHITE, 20, &mut line);
+
+    let mut line = Line::new();
+    let _ = write!(line, "level {}/{}", s.brightness.0, s.brightness.1);
+    put(396, false, DIM, 10, &mut line);
 }

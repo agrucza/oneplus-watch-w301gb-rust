@@ -11,7 +11,7 @@ use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
-use crate::drivers::{apollo, buttons, panel, psram};
+use crate::drivers::{apollo, buttons, light, panel, psram};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
@@ -81,9 +81,15 @@ pub async fn run(board: Board) {
             let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
         let _ = log.flush();
+        // Sensor bus and light sensor. Nothing depends on them.
+        let mut bus = board.sensor_bus.open();
+        light::scan(&mut bus, &mut log);
+        let light = light::LightSensor::start(&mut bus, &mut log).await;
+        let _ = log.flush();
+        let sensors = Sensors { bus, light, last_raw: None, read_for: None, logged: 0 };
         let buttons = buttons::Buttons::start(board.upper_button);
         if let Some(server) = Server::new(image_partition) {
-            main_loop(link, server, apollo, buttons, screen).await;
+            main_loop(link, server, apollo, buttons, screen, sensors).await;
         }
     }
 
@@ -142,7 +148,13 @@ impl Screen {
 
     /// Redraw and send the picture if a second has passed or something
     /// changed. Takes about 40 ms when it does.
-    async fn update(&mut self, readings: Option<&Readings>, bluetooth_connected: bool, log: &mut Log) {
+    async fn update(
+        &mut self,
+        readings: Option<&Readings>,
+        light: Option<light::Raw>,
+        bluetooth_connected: bool,
+        log: &mut Log,
+    ) {
         let uptime_s = Instant::now().as_secs();
         if !self.visible || self.drawn_for == Some(uptime_s) {
             return;
@@ -153,6 +165,7 @@ impl Screen {
             &status::Status {
                 uptime_s,
                 readings,
+                light,
                 bluetooth_connected,
                 brightness: (self.brightness + 1, BRIGHTNESS.len()),
                 last_button: self.last_button,
@@ -177,6 +190,49 @@ impl Screen {
     }
 }
 
+/// The sensor bus and what is on it.
+struct Sensors {
+    bus: light::Bus,
+    light: Option<light::LightSensor>,
+    last_raw: Option<light::Raw>,
+    /// Uptime second the light sensor was last read in.
+    read_for: Option<u64>,
+    logged: u32,
+}
+
+impl Sensors {
+    /// Read the light sensor once a second. The first values and then one
+    /// reading every ten seconds go to the log.
+    fn poll(&mut self, log: &mut Log) {
+        let now = Instant::now().as_secs();
+        let Some(light) = self.light.as_mut() else {
+            return;
+        };
+        if self.read_for == Some(now) {
+            return;
+        }
+        self.read_for = Some(now);
+        self.last_raw = light.read(&mut self.bus);
+        if self.logged < 5 || now % 10 == 0 {
+            self.logged += 1;
+            match self.last_raw {
+                Some(raw) => {
+                    let _ = writeln!(
+                        log.stamp(),
+                        "light sensor: {} lux (raw {} / {})",
+                        light::LightSensor::lux(raw),
+                        raw.light,
+                        raw.second
+                    );
+                }
+                None => {
+                    let _ = writeln!(log.stamp(), "light sensor: no answer");
+                }
+            }
+        }
+    }
+}
+
 /// Everything that happens once the hardware is up. Each pass takes at most
 /// about 20 ms unless a packet is being dealt with or the screen is sent.
 /// Ends only in a reset: an installed update, a return to the stock
@@ -187,6 +243,7 @@ async fn main_loop(
     mut apollo: Option<apollo::Apollo>,
     mut buttons: buttons::Buttons,
     mut screen: Option<Screen>,
+    mut sensors: Sensors,
 ) -> ! {
     let mut log = Log::get();
     let mut last_save = Instant::now();
@@ -197,6 +254,10 @@ async fn main_loop(
             if let Some(apollo) = apollo.as_mut() {
                 apollo.service(&mut log).await;
             }
+        }
+
+        if !server.transferring() {
+            sensors.poll(&mut log);
         }
 
         // Buttons: the upper one is ours, the lower one comes through the Apollo.
@@ -210,7 +271,7 @@ async fn main_loop(
                 screen.click(false, &mut log).await;
             }
             if !server.transferring() {
-                screen.update(apollo.as_ref().map(|a| &a.readings), server.connected, &mut log).await;
+                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_raw, server.connected, &mut log).await;
             }
         }
 

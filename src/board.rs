@@ -12,6 +12,7 @@
 //! | Apollo | SPI1 slave: PA5 clock, PA6, PA7; PG1 request, PA15 ready, PF10 have-data, PG12 reset, PF7; DMA1 channels 3, 6 | `drivers::apollo` |
 //! | Display | LTDC, DSI host; PF11 tearing effect; PG5, PF12 supplies, PF5 power, PA11 reset | `drivers::panel`, `hal::dsi` |
 //! | PSRAM | FMC bank 1: port D except PD2, PB7, PE0, PE1, PE3-PE15, PG9; PE2 CRE | `drivers::psram`, `hal::fmc` |
+//! | Sensor bus | I2C2: PF1 clock, PF0 data (external pull-ups); light sensor 0x45, NFC 0x28, a device at 0x36 | `SensorBus`, `drivers::light` |
 //! | Upper button | PC13 | `drivers::buttons` |
 //! | Crystals | PH0, PH1 (24 MHz); PC14, PC15 (32.768 kHz) | `hal::clocks` |
 //!
@@ -20,9 +21,11 @@
 
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::{peripherals, Peri, Peripherals};
-use embassy_time::Timer;
+use embassy_stm32::i2c::{self, I2c};
+use embassy_stm32::time::Hertz;
+use embassy_time::{Duration, Timer};
 
-use crate::drivers::{apollo, cypress, panel};
+use crate::drivers::{apollo, cypress, light, panel};
 
 pub struct Board {
     pub power: PowerPins,
@@ -30,6 +33,7 @@ pub struct Board {
     pub apollo: apollo::Resources,
     pub display: panel::Resources,
     pub upper_button: Peri<'static, peripherals::PC13>,
+    pub sensor_bus: SensorBus,
 }
 
 /// The enables the bootloader's `bsp_gpio_power_init` sets. Which of them
@@ -79,7 +83,26 @@ impl Board {
                 _dsi: p.DSIHOST,
             },
             upper_button: p.PC13,
+            sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
         }
+    }
+}
+
+/// I2C2, shared by the light sensor, the NFC controller and one more device.
+pub struct SensorBus {
+    i2c: Peri<'static, peripherals::I2C2>,
+    scl: Peri<'static, peripherals::PF1>,
+    sda: Peri<'static, peripherals::PF0>,
+}
+
+impl SensorBus {
+    /// Open the bus at 100 kHz. A transfer gives up after 10 ms, so a
+    /// stuck bus cannot hold the main loop for long.
+    pub fn open(self) -> light::Bus {
+        let mut config = i2c::Config::default();
+        config.frequency = Hertz(100_000);
+        config.timeout = Duration::from_millis(10);
+        I2c::new_blocking(self.i2c, self.scl, self.sda, config)
     }
 }
 
