@@ -44,6 +44,7 @@ use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::apollo::Apollo;
+use crate::buttons::Buttons;
 use crate::cypress::{self, Link};
 use crate::log::Log;
 use crate::ota_flag;
@@ -81,6 +82,7 @@ pub async fn run(
     link: &mut Link,
     log: &mut Log,
     mut apollo: Option<Apollo>,
+    mut buttons: Buttons,
     image_partition: Partition,
     log_partition: Partition,
 ) -> ! {
@@ -106,6 +108,7 @@ pub async fn run(
         if let (Some(apollo), State::Commands) = (apollo.as_mut(), &state) {
             apollo.service(log).await;
         }
+        buttons.poll(log);
         let Some(packet) = link.receive(Duration::from_millis(20)).await else {
             if link.rx_errors != rx_errors_logged {
                 rx_errors_logged = link.rx_errors;

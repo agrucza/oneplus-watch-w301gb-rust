@@ -18,6 +18,7 @@
 
 mod apollo;
 mod apollo_messages;
+mod buttons;
 mod clocks;
 mod cypress;
 mod display;
@@ -225,7 +226,8 @@ async fn experiment(p: Peripherals) {
             let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
         let _ = log.flush(log_partition);
-        ota_server::run(&mut link, &mut log, apollo, image_partition, log_partition).await;
+        let buttons = buttons::Buttons::start(p.PC13);
+        ota_server::run(&mut link, &mut log, apollo, buttons, image_partition, log_partition).await;
     }
 
     match log.flush(log_partition) {

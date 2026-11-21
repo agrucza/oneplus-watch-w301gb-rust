@@ -16,6 +16,7 @@
 //! |    45 | wear detection ("CAP", isWear)  | 1 time ms, 2 state                            |
 //! |    47 | battery ("Bat Receive")         | 1 time ms, 2 usb, 3 percent, 5 millivolts     |
 //! |    50 | temperatures ("NTC msg")        | 1 time ms, 2..4 degrees Celsius               |
+//! |    51 | lower button                    | 2 event (see `KeyEvent`), 3 Apollo uptime ms  |
 //! |    52 | sensor chip names               | 21..29 strings                                |
 //! |    54 | sensor status (unconfirmed)     | 1 time ms, 3, 4, 8 numbers                    |
 //! |    59 | Apollo's own reset info         | 1 shutdown type, 2 reset reason               |
@@ -30,6 +31,7 @@ pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
 pub const BATTERY: u32 = 47;
 pub const TEMPERATURES: u32 = 50;
+pub const KEY: u32 = 51;
 pub const RESET_INFO: u32 = 59;
 
 /// One protobuf field value.
@@ -146,4 +148,44 @@ impl Readings {
             _ => {}
         }
     }
+}
+
+/// What the lower side button did. It is wired to the Apollo, which reports
+/// it in messages of kind `KEY` (measured on the watch): a short press gives
+/// `Pressed`, `Released` about 200 ms later and `Clicked` about 300 ms after
+/// that; holding gives `Pressed`, `LongPressed` after 1.5 s, and `Released`
+/// when let go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyEvent {
+    Released,
+    Pressed,
+    Clicked,
+    LongPressed,
+    /// A value not seen so far.
+    Other(u32),
+}
+
+impl KeyEvent {
+    pub fn name(self) -> &'static str {
+        match self {
+            KeyEvent::Released => "released",
+            KeyEvent::Pressed => "pressed",
+            KeyEvent::Clicked => "clicked",
+            KeyEvent::LongPressed => "long press",
+            KeyEvent::Other(_) => "unknown event",
+        }
+    }
+}
+
+/// Decode a `KEY` sub-message: the event and the Apollo's uptime in ms.
+pub fn key_event(payload: &[u8]) -> (KeyEvent, u32) {
+    let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+    let event = match field(2) {
+        0 => KeyEvent::Released,
+        1 => KeyEvent::Pressed,
+        2 => KeyEvent::Clicked,
+        4 => KeyEvent::LongPressed,
+        other => KeyEvent::Other(other),
+    };
+    (event, field(3))
 }

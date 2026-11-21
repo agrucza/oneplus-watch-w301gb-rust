@@ -129,6 +129,8 @@ pub struct Apollo {
     next_summary: Instant,
     /// Latest sensor values taken from the messages.
     pub readings: Readings,
+    /// The lower button's latest event (it is wired to the Apollo).
+    pub last_key: Option<messages::KeyEvent>,
 }
 
 impl Apollo {
@@ -175,6 +177,7 @@ impl Apollo {
             seen: [false; KINDS],
             next_summary: Instant::now() + Duration::from_secs(60),
             readings: Readings::default(),
+            last_key: None,
         })
     }
 
@@ -401,6 +404,11 @@ impl Apollo {
             };
             if let Some(kind) = kind {
                 self.readings.update(kind, payload);
+                if kind == messages::KEY {
+                    let (event, at) = messages::key_event(payload);
+                    self.last_key = Some(event);
+                    let _ = writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at);
+                }
             }
             if kind == Some(HEARTBEAT) {
                 self.heartbeat_wanted = true;
