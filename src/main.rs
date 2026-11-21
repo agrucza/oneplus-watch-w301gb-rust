@@ -17,8 +17,10 @@
 #![no_main]
 
 mod apollo;
+mod apollo_messages;
 mod clocks;
 mod cypress;
+mod display;
 mod emmc;
 mod flash;
 mod log;
@@ -113,18 +115,16 @@ async fn experiment(p: Peripherals) {
     // ports B, C and D before jumping to us, so at least PC3 is off again.
     embassy_stm32::pac::PWR.cr2().modify(|w| w.set_iosv(true)); // port G supply valid
     let pc3 = Output::new(p.PC3, Level::High, Speed::VeryHigh);
-    let pg5 = Output::new(p.PG5, Level::High, Speed::VeryHigh);
     let pf3 = Output::new(p.PF3, Level::High, Speed::VeryHigh);
     let pa1 = Output::new(p.PA1, Level::High, Speed::VeryHigh);
     let mut pg4 = Output::new(p.PG4, Level::High, Speed::VeryHigh);
     pg4.set_low(); // 100 ms low pulse: looks like a reset line
     Timer::after_millis(100).await;
     pg4.set_high();
-    let pf12 = Output::new(p.PF12, Level::Low, Speed::VeryHigh);
-    let pf5 = Output::new(p.PF5, Level::Low, Speed::VeryHigh);
-    let pa11 = Output::new(p.PA11, Level::Low, Speed::VeryHigh);
     let pa12 = Output::new(p.PA12, Level::High, Speed::VeryHigh);
-    core::mem::forget((pc3, pg5, pf3, pa1, pg4, pf12, pf5, pa11, pa12)); // stay driven
+    core::mem::forget((pc3, pf3, pa1, pg4, pa12)); // stay driven
+    // PG5, PF12, PF5 and PA11 from that list are the display's supplies,
+    // power and reset; `display` drives them.
 
     Timer::after_millis(50).await;
     let _ = report(STAGE_POWER, 0);
@@ -189,6 +189,28 @@ async fn experiment(p: Peripherals) {
         })
         .await;
         let _ = writeln!(log.stamp(), "apollo: {}", if apollo.is_some() { "released from reset" } else { "not started" });
+
+        // Display: test picture. Last, so that a problem here cannot keep
+        // Bluetooth from coming up.
+        let display = display::Display::start(
+            display::Resources {
+                supply_pg5: p.PG5,
+                supply_pf12: p.PF12,
+                power: p.PF5,
+                reset: p.PA11,
+                _te: p.PF11,
+                _ltdc: p.LTDC,
+                _dsi: p.DSIHOST,
+            },
+            &mut log,
+        )
+        .await;
+        if let Some(mut display) = display {
+            display.test_picture();
+            display.refresh(&mut log).await;
+            core::mem::forget(display); // keep the panel powered
+        }
+        let _ = log.flush(log_partition);
         ota_server::run(&mut link, &mut log, apollo, image_partition, log_partition).await;
     }
 

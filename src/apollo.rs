@@ -42,14 +42,15 @@ use embassy_stm32::gpio::{Input, Level, Output, OutputOpenDrain, Pull, Speed};
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::{Duration, Instant, Timer};
 
+use crate::apollo_messages::{self as messages, Fields, Readings, Value};
 use crate::log::Log;
 use crate::ota_flag::crc8;
 
 const BLOCK: usize = 256;
 /// Sub-message numbers go up to 142 in the stock descriptor.
 const KINDS: usize = 160;
-const HEARTBEAT: u32 = 20;
-const ACK: u32 = 3;
+const HEARTBEAT: u32 = messages::HEARTBEAT;
+const ACK: u32 = messages::ACK;
 /// Frame flag: the sender wants an acknowledgement.
 const FLAG_WANTS_ACK: u8 = 0x02;
 /// The stock app's own heartbeat period.
@@ -126,6 +127,8 @@ pub struct Apollo {
     counts: [u16; KINDS],
     seen: [bool; KINDS],
     next_summary: Instant,
+    /// Latest sensor values taken from the messages.
+    pub readings: Readings,
 }
 
 impl Apollo {
@@ -171,6 +174,7 @@ impl Apollo {
             counts: [0; KINDS],
             seen: [false; KINDS],
             next_summary: Instant::now() + Duration::from_secs(60),
+            readings: Readings::default(),
         })
     }
 
@@ -338,7 +342,27 @@ impl Apollo {
                 }
                 let _ = writeln!(log);
             }
+            self.log_readings(log);
         }
+    }
+
+    /// One line with the latest sensor values.
+    fn log_readings(&self, log: &mut Log) {
+        let r = &self.readings;
+        let _ = write!(log.stamp(), "sensors:");
+        if let Some((percent, mv, usb)) = r.battery {
+            let _ = write!(log, " battery {}% {:.0} mV{}", percent, mv, if usb { " (USB power)" } else { "" });
+        }
+        if let Some([a, b, c]) = r.temperatures {
+            let _ = write!(log, ", temperatures {:.1} {:.1} {:.1} C", a, b, c);
+        }
+        if let Some((pascal, metres)) = r.barometer {
+            let _ = write!(log, ", pressure {:.1} hPa (altitude {:.0} m)", pascal / 100.0, metres);
+        }
+        if let Some(worn) = r.worn {
+            let _ = write!(log, ", {}", if worn { "worn" } else { "not worn" });
+        }
+        let _ = writeln!(log);
     }
 
     /// Go through the frames of the block just received: count them, note a
@@ -369,7 +393,15 @@ impl Apollo {
                     rest = &tail[used..];
                 }
             }
-            let kind = varint(rest).map(|(key, _)| key >> 3);
+            // The one sub-message: its field number is the kind.
+            let (kind, payload) = match Fields(rest).next() {
+                Some((kind, Value::Bytes(payload))) => (Some(kind), payload),
+                Some((kind, _)) => (Some(kind), &rest[..0]),
+                None => (None, &rest[..0]),
+            };
+            if let Some(kind) = kind {
+                self.readings.update(kind, payload);
+            }
             if kind == Some(HEARTBEAT) {
                 self.heartbeat_wanted = true;
             }

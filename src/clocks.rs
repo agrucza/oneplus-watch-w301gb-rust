@@ -56,6 +56,16 @@ pub fn configure(config: &mut Config) {
         divr: Some(PllRDiv::DIV2), // 96 MHz system clock
     });
     config.rcc.sys = Sysclk::PLL1_R;
+    // Display pixel clock, as in the stock app: PLLSAI2 = HSE / 3 * 10 / 2 =
+    // 40 MHz, which the LTDC divides by 2.
+    config.rcc.pllsai2 = Some(Pll {
+        source: PllSource::HSE,
+        prediv: PllPreDiv::DIV3,
+        mul: PllMul::MUL10,
+        divp: None,
+        divq: None,
+        divr: Some(PllRDiv::DIV2),
+    });
     // MSI stays on at 48 MHz as the 48 MHz peripheral clock (SDMMC1), as in
     // the stock firmware (CLK48SEL = MSI).
     config.rcc.msi = Some(MSIRange::RANGE48M);
