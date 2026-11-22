@@ -351,7 +351,7 @@ impl<'a> Iterator for Fields<'a> {
 }
 
 /// The latest sensor values the Apollo has reported.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct Readings {
     /// Percent, millivolts, USB power present.
     pub battery: Option<(u32, f32, bool)>,

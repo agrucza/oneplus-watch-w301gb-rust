@@ -88,6 +88,10 @@ pub struct Resources {
     pub blitter: Peri<'static, peripherals::DMA2D>,
 }
 
+/// Diagnosis: draw the next picture while the last one is still on its
+/// way to the panel. `false` waits for it first.
+const DRAW_WHILE_FRAME_TRAVELS: bool = false;
+
 pub struct Panel {
     /// Two frames, as in the stock app: one is on its way to the panel or
     /// was sent last, the other is free to be drawn into.
@@ -226,6 +230,7 @@ impl Panel {
     /// panel was sent last (`of_back` false) or of the frame that has just
     /// been drawn into (`of_back` true).
     pub async fn keep(&mut self, slot: usize, of_back: bool) -> bool {
+        self.settle().await;
         let from: *const Frame = self.frames[if of_back { 1 - self.shown } else { self.shown }];
         let to: *mut Frame = self.spare[slot];
         self.copy_columns(from, 0, to, 0, WIDTH).await
@@ -237,6 +242,7 @@ impl Panel {
     /// from the other side. `offset` 0 is all of picture 0, `WIDTH` all of
     /// picture 1. Two blitter copies, together one frame's worth.
     pub async fn slide(&mut self, offset: usize, leftwards: bool) -> bool {
+        self.settle().await;
         let offset = offset.min(WIDTH);
         let (old, new): (*const Frame, *const Frame) = (self.spare[0], self.spare[1]);
         let back: *mut Frame = self.frames[1 - self.shown];
@@ -248,6 +254,19 @@ impl Panel {
     }
 
     /// The frame to draw into, as a target for `embedded-graphics`.
+    /// Wait until the frame on its way to the panel has gone out, before
+    /// the frame memory is read or written for the next picture.
+    ///
+    /// While a frame travels, the display controller reads it from the
+    /// external memory without a pause, and drawing uses the same memory
+    /// bus. Under test (`DRAW_WHILE_FRAME_TRAVELS`): whether drawing in
+    /// that time is what disturbs the picture.
+    pub async fn settle(&mut self) {
+        if !DRAW_WHILE_FRAME_TRAVELS {
+            dsi::frame_out().await;
+        }
+    }
+
     pub fn canvas(&mut self) -> Canvas<'_> {
         Canvas::new(self.frames[1 - self.shown], &mut self.blitter)
     }

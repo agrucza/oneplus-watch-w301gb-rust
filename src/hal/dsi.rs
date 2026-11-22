@@ -12,6 +12,7 @@
 
 use core::ptr::read_volatile;
 
+use embassy_stm32::interrupt;
 use embassy_stm32::pac::{dsihost::regs as dsi, ltdc::regs as lt, DSIHOST, LTDC};
 use embassy_time::{Duration, Instant, Timer};
 
@@ -142,6 +143,10 @@ pub async fn init(c: &Config) -> Result<(), Error> {
     // long writes (the pixels) at high speed.
     DSIHOST.cmcr().write_value(dsi::Cmcr(0x0107_7F00));
     DSIHOST.cr().write_value(dsi::Cr(1)); // host on
+    // The tearing-effect pulse is answered in the interrupt handler below;
+    // it is switched on per frame (`refresh_from`).
+    DSIHOST.wier().write_value(dsi::Wier(0));
+    unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::interrupt::DSI) };
     Ok(())
 }
 
@@ -167,7 +172,23 @@ pub async fn frame_out() -> bool {
     // WISR bit 1: end of refresh.
     let done = wait_for(Duration::from_millis(200), || DSIHOST.wisr().read().0 & 1 << 1 != 0).await;
     IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+    // Did the display controller run short of pixels during that frame?
+    // (LTDC_ISR bit 1, "FIFO underrun"; bit 2, "transfer error".)
+    let flags = LTDC.isr().read().0;
+    if flags & 0b110 != 0 {
+        LTDC.icr().write_value(lt::Icr(0b110));
+        STARVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     done
+}
+
+/// Frames during which the display controller reported that it ran short
+/// of pixels or could not read them.
+static STARVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many frames were starved since this was last asked.
+pub fn take_starved() -> u32 {
+    STARVED.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
 async fn header(kind: u32, low: u32, high: u32) -> bool {
@@ -229,11 +250,46 @@ pub struct RefreshStatus {
 /// As the stock app (0x080ABC0A in B.70): on the tearing-effect pulse the
 /// DSI host is stopped, the layer's frame address is changed and loaded
 /// at once, and the host is started again; then the frame is requested.
+///
+/// The pulse is answered in the interrupt handler, as in the stock app,
+/// and not by looking for it from the task: the frame has to start within
+/// a fraction of a millisecond of the pulse, and a task that waits can be
+/// kept waiting for many milliseconds by the firmware's other task.
 pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
+    use core::sync::atomic::Ordering;
     let done = frame_out().await;
     DSIHOST.wifcr().write_value(dsi::Wifcr(0b11)); // clear "tearing effect" and "refresh done"
-    // WISR bit 0: tearing-effect pulse.
-    let in_step = wait_for(Duration::from_millis(40), || DSIHOST.wisr().read().0 & 1 != 0).await;
+    // Hand the frame to the interrupt handler and let the pulse call it
+    // (WIER bit 0).
+    ARMED.store(framebuffer, Ordering::Relaxed);
+    DSIHOST.wier().modify(|w| w.0 |= 1);
+    let in_step = wait_for(Duration::from_millis(40), || ARMED.load(Ordering::Relaxed) == 0).await;
+    if !in_step {
+        // No pulse: send the frame anyway, unless the pulse comes this
+        // very moment.
+        cortex_m::interrupt::free(|_| {
+            DSIHOST.wier().modify(|w| w.0 &= !1);
+            if ARMED.swap(0, Ordering::Relaxed) != 0 {
+                start_frame(framebuffer);
+            }
+        });
+    }
+    RefreshStatus {
+        done,
+        in_step,
+        wisr: DSIHOST.wisr().read().0,
+        isr0: DSIHOST.isr0().read().0,
+        isr1: DSIHOST.isr1().read().0,
+        psr: DSIHOST.psr().read().0,
+    }
+}
+
+/// The frame the next tearing-effect pulse starts: its address, or 0 for
+/// none.
+static ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Make `framebuffer` the frame the panel is sent and send it once.
+fn start_frame(framebuffer: u32) {
     DSIHOST.cr().write_value(dsi::Cr(0)); // host off
     DSIHOST.wcr().modify(|w| w.0 &= !(1 << 3)); // wrapper off
     LTDC.layer(0).cfbar().write_value(lt::Cfbar(framebuffer));
@@ -242,13 +298,19 @@ pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 3); // wrapper on
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 2); // request one frame
     IN_FLIGHT.store(true, core::sync::atomic::Ordering::Relaxed);
-    RefreshStatus {
-        done,
-        in_step,
-        wisr: DSIHOST.wisr().read().0,
-        isr0: DSIHOST.isr0().read().0,
-        isr1: DSIHOST.isr1().read().0,
-        psr: DSIHOST.psr().read().0,
+}
+
+/// The DSI host's interrupt: only the tearing-effect pulse is enabled,
+/// and only while a frame is waiting for it. Starts that frame and
+/// switches itself off again.
+#[interrupt]
+unsafe fn DSI() {
+    use core::sync::atomic::Ordering;
+    DSIHOST.wier().modify(|w| w.0 &= !1);
+    DSIHOST.wifcr().write_value(dsi::Wifcr(1));
+    let framebuffer = ARMED.swap(0, Ordering::Relaxed);
+    if framebuffer != 0 {
+        start_frame(framebuffer);
     }
 }
 

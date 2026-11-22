@@ -289,6 +289,8 @@ impl Apollo {
 
     /// Receive one block the Apollo has announced. False on timeout.
     async fn receive_block(&mut self) -> bool {
+        // Not while the display is drawing; see `services::turn`.
+        let _turn = crate::services::turn::take().await;
         self.idle();
         unsafe {
             write_volatile((DMAMUX1 + 4 * (RX_CHANNEL - 1)) as *mut u32, REQUEST_SPI1_RX);
@@ -308,6 +310,7 @@ impl Apollo {
 
     /// Send the block in `self.tx`. False on timeout.
     async fn send_block(&mut self) -> bool {
+        let _turn = crate::services::turn::take().await;
         self.idle();
         unsafe {
             write_volatile((DMAMUX1 + 4 * (TX_CHANNEL - 1)) as *mut u32, REQUEST_SPI1_TX);
@@ -683,10 +686,13 @@ impl Apollo {
                     let (event, at) = messages::key_event(payload);
                     self.last_key = Some(event);
                     // A click or long press outranks the press and release around it.
-                    if !matches!(self.key_pending, Some(messages::KeyEvent::Clicked | messages::KeyEvent::LongPressed)) {
+                    if !matches!(self.key_pending, Some(messages::KeyEvent::Clicked | messages::KeyEvent::LongPressed | messages::KeyEvent::Other(_))) {
                         self.key_pending = Some(event);
                     }
-                    let _ = writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at);
+                    let _ = match event {
+                        messages::KeyEvent::Other(value) => writeln!(log.stamp(), "button lower: event {} (Apollo time {} ms)", value, at),
+                        _ => writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at),
+                    };
                 }
             }
             if kind == Some(messages::PIN) {

@@ -1,11 +1,13 @@
 //! The application: bring the hardware up in a safe order, then run.
 
 mod face;
+mod shared;
 mod status;
 
 use core::fmt::Write;
 
-use embassy_time::{Duration, Instant};
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Instant, Timer};
 
 use crate::board::Board;
 use crate::boot::{faults, ticket, watchdog};
@@ -28,7 +30,7 @@ const LOG_VOLUME: usize = 3;
 
 /// Returns only if the watch cannot be reached or served; the caller then
 /// resets, which takes the watch back to the stock firmware.
-pub async fn run(board: Board) {
+pub async fn run(spawner: Spawner, board: Board) {
     crate::boot::stack::paint();
     board.power.switch_on().await;
     let _ = ticket::report(ticket::STAGE_POWER, 0);
@@ -128,7 +130,7 @@ pub async fn run(board: Board) {
         // PC has connected to this boot yet, that reset returns to the stock
         // firmware instead of looping.
         let _ = log.flush();
-        let mut screen = None;
+        let mut has_screen = false;
         psram::init().await;
         if PSRAM_FULL_TEST {
             // Before the display uses the memory: the test overwrites it all.
@@ -147,7 +149,13 @@ pub async fn run(board: Board) {
                 time_blitter(panel, &mut log).await;
                 let _ = log.flush();
             }
-            screen = panel.map(Screen::new);
+            // The display has a task of its own from here on, and the
+            // touch controller goes with it (see `display_task`).
+            let touch = touch::Touch::start(board.touch, &mut log).await;
+            if let Some(panel) = panel {
+                has_screen = true;
+                spawner.spawn(display_task(Screen::new(panel), touch).unwrap());
+            }
         } else {
             let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
@@ -172,11 +180,9 @@ pub async fn run(board: Board) {
             logged: 0,
             brightest: 0,
         };
-        let touch = touch::Touch::start(board.touch, &mut log).await;
-        let _ = log.flush();
         let buttons = buttons::Buttons::start(board.upper_button);
         if let Some(server) = Server::new(image_partition) {
-            main_loop(link, server, apollo, buttons, screen, sensors, touch).await;
+            main_loop(link, server, apollo, buttons, has_screen, sensors).await;
         }
     }
 
@@ -1038,6 +1044,7 @@ impl Screen {
             return;
         }
         self.next_frame = now + FACE_PERIOD;
+        self.panel.settle().await;
         if let Some((started, pixels)) = self.draw(now, new_second, readings, lux, bluetooth_connected, measuring_heart, log) {
             self.present(started, pixels, uptime_s, log).await;
         }
@@ -1323,6 +1330,7 @@ impl Screen {
                 self.draws / self.pictures.max(1)
             );
             let _ = writeln!(log.stamp(), "stack: {} of {} bytes used at most", crate::boot::stack::most_used(), crate::boot::stack::SIZE);
+            let _ = writeln!(log.stamp(), "display: {} frames in which the display controller ran short of pixels", crate::hal::dsi::take_starved());
             if !crate::services::canvas::blitter_usable() {
                 let _ = writeln!(log.stamp(), "display: the blitter did NOT finish an operation once; the processor draws everything now");
             }
@@ -1435,23 +1443,68 @@ impl Sensors {
     }
 }
 
-/// Everything that happens once the hardware is up. Each pass takes at most
-/// about 20 ms unless a packet is being dealt with or the screen is sent.
-/// Ends only in a reset: an installed update, a return to the stock
-/// firmware, or the watchdog.
+/// The display's own task: reads the touch controller, draws and presents.
+///
+/// It waits only for the panel (its tearing pulse, a frame on its way) and
+/// the blitter, and in those waits the main task does its work. So a
+/// picture no longer has to wait for a pass through everything else, which
+/// took longer than the panel takes for a frame.
+#[embassy_executor::task]
+async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! {
+    let mut log = Log::get();
+    let mut gestures = Gestures::new();
+    loop {
+        let state = shared::state();
+        while let Some(event) = shared::next_event() {
+            match event {
+                shared::Event::Click { upper } => {
+                    let _turn = crate::services::turn::take().await;
+                    screen.click(upper, &mut log).await
+                }
+                shared::Event::Wrist(gesture) => {
+                    let _turn = crate::services::turn::take().await;
+                    screen.gesture(gesture, &mut log).await;
+                }
+                shared::Event::Light(lux) => screen.ambient(lux),
+            }
+        }
+        shared::set_visible(screen.visible);
+        if state.transferring {
+            Timer::after_millis(20).await;
+            continue;
+        }
+        let touched = touch.as_mut().and_then(|touch| touch.poll(&mut log));
+        if let Some(gesture) = gestures.feed(touched, Instant::now()) {
+            screen.touch_gesture(gesture, &mut log);
+        }
+        {
+            // Not while a block is being exchanged with the Apollo; see
+            // `services::turn`.
+            let _turn = crate::services::turn::take().await;
+            screen.fade(&mut log).await;
+            screen.update(state.readings.as_ref(), state.lux, state.bluetooth_connected, state.measuring_heart, &mut log).await;
+        }
+        // Let the main task have its turn even when nothing was presented.
+        Timer::after_millis(1).await;
+    }
+}
+
+/// Everything besides the display, once the hardware is up: the Apollo,
+/// Bluetooth, the buttons, the sensors and the log file. Each pass takes
+/// at most about 20 ms unless a packet is being dealt with. Ends only in a
+/// reset: an installed update, a return to the stock firmware, or the
+/// watchdog.
 async fn main_loop(
     mut link: Link,
     mut server: Server,
     mut apollo: Option<apollo::Apollo>,
     mut buttons: buttons::Buttons,
-    mut screen: Option<Screen>,
+    has_screen: bool,
     mut sensors: Sensors,
-    mut touch: Option<touch::Touch>,
 ) -> ! {
     let mut log = Log::get();
     let mut last_save = Instant::now();
     let mut measuring_heart = false;
-    let mut gestures = Gestures::new();
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
         // pass - but not while a package is streaming in.
@@ -1472,6 +1525,11 @@ async fn main_loop(
         }
         let lower = apollo.as_mut().and_then(|a| a.take_key());
         let lower_click = lower == Some(KeyEvent::Clicked);
+        // Event 3 arrives in place of the second release when the button
+        // is pressed again within about 0.3 s of a release, and no
+        // "clicked" comes for either press: taken as a double click (from
+        // the timing in the log; not read in the Apollo's code).
+        let lower_double = lower == Some(KeyEvent::Other(3));
         // Feedback through the vibration motor: one short pulse for a
         // click, three for a long press.
         if let Some(apollo) = apollo.as_mut() {
@@ -1489,36 +1547,33 @@ async fn main_loop(
                 _ => {}
             }
         }
-        let touched = match touch.as_mut() {
-            Some(touch) if !server.transferring() => touch.poll(&mut log),
-            _ => None,
-        };
-        if let Some(screen) = screen.as_mut() {
-            if let Some(gesture) = gestures.feed(touched, Instant::now()) {
-                screen.touch_gesture(gesture, &mut log);
-            }
+        // What the display task needs to know, and what happened for it.
+        if has_screen {
+            shared::set_state(shared::State {
+                readings: apollo.as_ref().map(|a| a.readings),
+                lux: sensors.last_lux,
+                bluetooth_connected: server.connected,
+                measuring_heart,
+                transferring: server.transferring(),
+            });
             if let Some(lux) = lux {
-                screen.ambient(lux);
+                shared::send(shared::Event::Light(lux));
             }
             if upper_click {
-                screen.click(true, &mut log).await;
-                if let Some(apollo) = apollo.as_mut() {
-                    apollo.set_screen(screen.visible);
+                shared::send(shared::Event::Click { upper: true });
+            }
+            if lower_click || lower_double {
+                shared::send(shared::Event::Click { upper: false });
+            }
+            if lower_double {
+                shared::send(shared::Event::Click { upper: false });
+            }
+            if let Some(apollo) = apollo.as_mut() {
+                if let Some(gesture) = apollo.take_gesture() {
+                    shared::send(shared::Event::Wrist(gesture));
                 }
-            }
-            if lower_click {
-                screen.click(false, &mut log).await;
-            }
-            if let Some(gesture) = apollo.as_mut().and_then(|a| a.take_gesture()) {
-                if screen.gesture(gesture, &mut log).await {
-                    if let Some(apollo) = apollo.as_mut() {
-                        apollo.set_screen(screen.visible);
-                    }
-                }
-            }
-            if !server.transferring() {
-                screen.fade(&mut log).await;
-                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_lux, server.connected, measuring_heart, &mut log).await;
+                // The Apollo is told whenever this changes.
+                apollo.set_screen(shared::visible());
             }
         }
 

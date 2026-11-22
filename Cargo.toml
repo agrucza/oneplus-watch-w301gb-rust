@@ -16,6 +16,8 @@ bench = false
 embassy-stm32 = { version = "0.6", features = ["stm32l4r9zi", "dual-bank", "time-driver-any", "defmt", "unstable-pac"] }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+# What the tasks share: a guarded value and a short queue.
+embassy-sync = "0.8"
 
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 # set-sp / set-vtor: don't trust the state the bootloader hands us, re-load MSP

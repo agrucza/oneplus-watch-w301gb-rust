@@ -66,7 +66,7 @@ async fn main(spawner: Spawner) {
 
     // 3. The application.
     spawner.spawn(watchdog_feeder().unwrap());
-    app::run(board::Board::new(p)).await;
+    app::run(spawner, board::Board::new(p)).await;
     Timer::after_millis(100).await;
 
     SCB::sys_reset();
