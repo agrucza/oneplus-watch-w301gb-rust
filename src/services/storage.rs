@@ -40,6 +40,128 @@ impl fmt::Display for DeviceError {
 
 impl core::error::Error for DeviceError {}
 
+/// Diagnosis: how the filesystem crate writes. Sector writes in total, how
+/// many of them were to the sector right after the previous write, and the
+/// longest such run.
+pub struct WriteStats {
+    pub sectors: u32,
+    pub in_sequence: u32,
+    pub longest_run: u32,
+}
+
+static WRITES: [core::sync::atomic::AtomicU32; 5] = [const { core::sync::atomic::AtomicU32::new(0) }; 5];
+
+/// The write statistics since the last call; the call starts them afresh.
+pub fn take_write_stats() -> WriteStats {
+    use core::sync::atomic::Ordering::Relaxed;
+    let stats = WriteStats { sectors: WRITES[0].swap(0, Relaxed), in_sequence: WRITES[1].swap(0, Relaxed), longest_run: WRITES[2].swap(0, Relaxed) };
+    WRITES[3].store(0, Relaxed);
+    WRITES[4].store(u32::MAX - 1, Relaxed);
+    stats
+}
+
+fn note_write(sector: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    WRITES[0].fetch_add(1, Relaxed);
+    let run = if sector == WRITES[4].load(Relaxed).wrapping_add(1) {
+        WRITES[1].fetch_add(1, Relaxed);
+        WRITES[3].load(Relaxed) + 1
+    } else {
+        1
+    };
+    WRITES[3].store(run, Relaxed);
+    WRITES[2].fetch_max(run, Relaxed);
+    WRITES[4].store(sector, Relaxed);
+}
+
+/// Sector writes collected to go out with one command.
+///
+/// The filesystem crate writes one sector per call. Measured on a 256 KB
+/// file: 530 sector writes, 504 of them to the sector right after the one
+/// before, in runs of up to 64 (one cluster), with a few writes to the
+/// allocation table in between. So consecutive writes are collected here
+/// and sent together (`sdmmc::write_sectors`).
+///
+/// What is collected goes to the card when a write is not the next sector,
+/// when the run is full, when one of its sectors is asked for, and before
+/// any of this module's writing functions returns (`flush_writes`). So
+/// nothing stays in memory once a caller has its answer.
+struct Collected {
+    first: u32,
+    /// Sectors waiting in `data`; 0 = nothing.
+    count: u32,
+    data: [u32; COLLECT * 128],
+}
+
+const COLLECT: usize = 64;
+
+struct SharedCollected(core::cell::UnsafeCell<Collected>);
+// Safety: only touched from thread mode, by the one executor thread.
+unsafe impl Sync for SharedCollected {}
+static COLLECTED: SharedCollected = SharedCollected(core::cell::UnsafeCell::new(Collected { first: 0, count: 0, data: [0; COLLECT * 128] }));
+/// Diagnosis and safety valve: false sends every sector on its own.
+static COLLECT_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Switch collecting writes on or off; what is waiting goes out first.
+pub fn set_write_collecting(on: bool) {
+    let _ = flush_writes();
+    COLLECT_ON.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Send what is collected to the card.
+pub fn flush_writes() -> Result<(), DeviceError> {
+    // Safety: see `SharedCollected`.
+    let c = unsafe { &mut *COLLECTED.0.get() };
+    let count = core::mem::take(&mut c.count) as usize;
+    if count == 0 {
+        return Ok(());
+    }
+    let result = sdmmc::write_sectors(c.first, &c.data[..count * 128]);
+    crate::boot::watchdog::feed();
+    let Err(first_error) = result else {
+        return Ok(());
+    };
+    if count == 1 {
+        return Err(DeviceError::Emmc(first_error as u8));
+    }
+    // The run failed as a whole: get the card out of the transfer, do
+    // without collecting from here on, and write the sectors one by one.
+    COLLECT_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+    sdmmc::stop_transfer();
+    for i in 0..count {
+        sdmmc::write_sectors(c.first + i as u32, &c.data[i * 128..][..128]).map_err(|e| DeviceError::Emmc(e as u8))?;
+        crate::boot::watchdog::feed();
+    }
+    Ok(())
+}
+
+/// Take one sector for writing: collect it, or send it at once.
+fn write_collected(sector: u32, contents: &[u8; 512]) -> Result<(), DeviceError> {
+    // Safety: see `SharedCollected`.
+    let c = unsafe { &mut *COLLECTED.0.get() };
+    let fits = c.count != 0 && sector == c.first + c.count && (c.count as usize) < COLLECT;
+    if !fits {
+        flush_writes()?;
+        c.first = sector;
+    }
+    let slot = &mut c.data[c.count as usize * 128..][..128];
+    for (word, bytes) in slot.iter_mut().zip(contents.chunks_exact(4)) {
+        *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    c.count += 1;
+    if !COLLECT_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        flush_writes()?;
+    }
+    Ok(())
+}
+
+/// True if `sector` is waiting to be written.
+fn is_collected(sector: u32) -> bool {
+    // Safety: see `SharedCollected`.
+    let c = unsafe { &*COLLECTED.0.get() };
+    c.count != 0 && sector >= c.first && sector < c.first + c.count
+}
+
 /// Sectors fetched with one command when a file is read front to back.
 const READ_AHEAD: usize = 64;
 
@@ -68,7 +190,7 @@ struct SharedReadAhead(core::cell::UnsafeCell<ReadAhead>);
 // never across an await.
 unsafe impl Sync for SharedReadAhead {}
 static AHEAD: SharedReadAhead =
-    SharedReadAhead(core::cell::UnsafeCell::new(ReadAhead { first: 0, count: 0, last: 0, data: [0; READ_AHEAD * 128] })); // all zero: takes no room in the image
+    SharedReadAhead(core::cell::UnsafeCell::new(ReadAhead { first: 0, count: 0, last: 0, data: [0; READ_AHEAD * 128] })); // all zero: takes no room in the image // all zero: takes no room in the image
 /// Diagnosis and safety valve: false switches reading ahead off.
 static AHEAD_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -188,6 +310,16 @@ pub struct Emmc {
     writable: bool,
 }
 
+/// A last line of defence: when a writable device goes away, whatever is
+/// still collected goes to the card.
+impl Drop for Emmc {
+    fn drop(&mut self) {
+        if self.writable {
+            let _ = flush_writes();
+        }
+    }
+}
+
 impl BlockDevice for Emmc {
     type Error = DeviceError;
 
@@ -204,6 +336,9 @@ impl BlockDevice for Emmc {
                 block.contents[510] = 0x55;
                 block.contents[511] = 0xAA;
             } else {
+                if is_collected(sector) {
+                    flush_writes()?; // the card must have it before it is read
+                }
                 let p = &self.partition;
                 let end = p.start.saturating_add(p.sectors);
                 if sector >= p.start && sector < end {
@@ -221,25 +356,28 @@ impl BlockDevice for Emmc {
             return Err(DeviceError::ReadOnly);
         }
         let p = &self.partition;
-        let mut aligned = [0u32; 128];
         for (i, block) in blocks.iter().enumerate() {
             let sector = start.0 + i as u32;
             // Never the partition table, never another partition.
             if sector < p.start || sector - p.start >= p.sectors || p.start == 0 {
                 return Err(DeviceError::OutOfBounds);
             }
-            for (word, bytes) in aligned.iter_mut().zip(block.contents.chunks_exact(4)) {
-                *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            }
             forget_read_ahead();
-            sdmmc::write_sector(sector, &aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
-            crate::boot::watchdog::feed();
+            note_write(sector);
+            write_collected(sector, &block.contents)?;
         }
         Ok(())
     }
 
     fn num_blocks(&self) -> Result<BlockCount, DeviceError> {
-        Ok(BlockCount(u32::MAX)) // capacity is not read from the card yet
+        // The card's own figure once it has been read; until then no limit.
+        // Not if it would cut into this partition: then the figure is not
+        // to be trusted.
+        let end = self.partition.start.saturating_add(self.partition.sectors);
+        Ok(BlockCount(match sdmmc::sectors() {
+            n if n != 0 && n >= end => n,
+            _ => u32::MAX,
+        }))
     }
 }
 
@@ -295,11 +433,16 @@ pub fn append(partition: Partition, dir: &str, file: &str, data: &[u8]) -> Resul
     let root = volume.open_root_dir().map_err(|_| 3)?;
     let d = root.open_dir(dir).map_err(|_| 4)?;
     let f = d.open_file_in_dir(file, Mode::ReadWriteCreateOrAppend).map_err(|_| 5)?;
-    f.write(data).map_err(|_| 6)?;
-    f.close().map_err(|_| 7)?;
-    d.close().map_err(|_| 7)?;
-    root.close().map_err(|_| 7)?;
-    volume.close().map_err(|_| 7)
+    let written = (|| {
+        f.write(data).map_err(|_| 6)?;
+        f.close().map_err(|_| 7)?;
+        d.close().map_err(|_| 7)?;
+        root.close().map_err(|_| 7)?;
+        volume.close().map_err(|_| 7)
+    })();
+    // Whatever happened: nothing may stay collected in memory.
+    let flushed = flush_writes().map_err(|_| 6);
+    written.and(flushed)
 }
 
 /// Read the last `buf.len()` bytes (or all, if shorter) of `/dir/file`.
@@ -368,7 +511,7 @@ pub struct FileWriter {
 impl FileWriter {
     /// Open `/dirs.../long_name` on `partition` and truncate it. Directory
     /// names are short 8.3 names in upper case; the file is found by its
-    /// long name (case-insensitive).
+    /// long or its short name (case-insensitive).
     /// On failure returns the step: 2 volume, 3 root, 4 directory,
     /// 5 file not found, 6 open.
     pub fn rewrite(partition: Partition, dirs: &[&str], long_name: &str) -> Result<Self, u8> {
@@ -380,21 +523,10 @@ impl FileWriter {
             let _ = manager.close_dir(dir);
             dir = next;
         }
-        let mut storage = [0u8; 128];
-        let mut lfn = LfnBuffer::new(&mut storage);
-        let mut short: Option<ShortFileName> = None;
-        manager
-            .iterate_dir_lfn(dir, &mut lfn, |entry, long| {
-                let matches = long.is_some_and(|l| l.eq_ignore_ascii_case(long_name));
-                if matches {
-                    short = Some(entry.name.clone());
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-            .map_err(|_| 4)?;
-        let short = short.ok_or(5)?;
+        let short = match lookup(&manager, dir, long_name).map_err(|_| 4)? {
+            Some((short, false)) => short,
+            _ => return Err(5),
+        };
         let file = manager.open_file_in_dir(dir, &short, Mode::ReadWriteTruncate).map_err(|_| 6)?;
         let _ = manager.close_dir(dir);
         Ok(Self { manager, volume, file })
@@ -402,14 +534,18 @@ impl FileWriter {
 
     /// Append `data` to the file.
     pub fn write(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.manager.write(self.file, data).map_err(|_| ())
+        let written = self.manager.write(self.file, data).map_err(|_| ());
+        // Nothing stays collected in memory once the caller has its answer.
+        let flushed = flush_writes().map_err(|_| ());
+        written.and(flushed)
     }
 
     /// Close the file, which also stores its final length.
     pub fn finish(self) -> Result<(), ()> {
         let closed = self.manager.close_file(self.file);
         let _ = self.manager.close_volume(self.volume);
-        closed.map_err(|_| ())
+        let flushed = flush_writes().map_err(|_| ());
+        closed.map_err(|_| ()).and(flushed)
     }
 }
 

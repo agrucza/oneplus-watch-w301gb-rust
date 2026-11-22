@@ -70,6 +70,20 @@ pub async fn run(board: Board) {
         time_read_ahead(image_partition, &mut log);
         let _ = log.flush();
     }
+    if EMMC_TIMED_WRITE != 0 {
+        // The same file twice: every sector on its own, then with
+        // consecutive sectors collected into one command.
+        storage::set_write_collecting(false);
+        let _ = writeln!(log.stamp(), "storage: write timing, one sector per command");
+        time_file_write(log_partition, &mut log);
+        storage::set_write_collecting(true);
+        let _ = writeln!(log.stamp(), "storage: write timing, consecutive sectors collected");
+        if !time_file_write(log_partition, &mut log) {
+            storage::set_write_collecting(false);
+            let _ = writeln!(log.stamp(), "storage: collecting writes switched off");
+        }
+        let _ = log.flush();
+    }
 
     // --- Bluetooth: become the watch the PC is paired with -----------------
     // If Bluetooth cannot be started there is no way to reach us, so fall
@@ -249,6 +263,90 @@ fn time_read_ahead(partition: storage::Partition, log: &mut Log) {
     }
 }
 
+/// Diagnosis: write a scratch file of this many bytes to the log volume at
+/// start, time it, read it back and empty it again; 0 = no write timing.
+/// Measured with 256 KB: 397 ms one sector per command, 100 ms with
+/// consecutive sectors collected.
+const EMMC_TIMED_WRITE: usize = 0;
+
+/// Diagnosis: how fast writing through the filesystem is, and in what
+/// pattern the filesystem crate writes its sectors. True if the file was
+/// written and read back identical.
+fn time_file_write(partition: storage::Partition, log: &mut Log) -> bool {
+    const DIR: &str = "LOG";
+    const NAME: &str = "WTEST.BIN";
+    static mut PIECE: [u8; 16384] = [0; 16384];
+    // Safety: used only here, from the one task that starts the card.
+    let piece = unsafe { &mut *core::ptr::addr_of_mut!(PIECE) };
+    for (i, b) in piece.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2654435761).to_le_bytes()[3];
+    }
+    // The file has to exist before it can be rewritten.
+    if let Err(step) = storage::append(partition, DIR, NAME, &[]) {
+        let _ = writeln!(log.stamp(), "storage: scratch file could not be made (step {})", step);
+        return false;
+    }
+    let _ = storage::take_write_stats();
+    let start = Instant::now();
+    let written = (|| {
+        let mut writer = storage::FileWriter::rewrite(partition, &[DIR], NAME).map_err(|_| ())?;
+        for _ in 0..EMMC_TIMED_WRITE / piece.len() {
+            writer.write(piece)?;
+            watchdog::feed();
+        }
+        writer.finish()
+    })();
+    let ms = start.elapsed().as_millis();
+    let stats = storage::take_write_stats();
+    let _ = writeln!(
+        log.stamp(),
+        "storage: {} bytes written in {} ms ({}); {} sector writes, {} right after the one before, longest run {}",
+        EMMC_TIMED_WRITE,
+        ms,
+        if written.is_ok() { "ok" } else { "FAILED" },
+        stats.sectors,
+        stats.in_sequence,
+        stats.longest_run
+    );
+    // Read it back and compare.
+    let mut same = true;
+    let mut total = 0usize;
+    match storage::FileReader::open(partition, "log/WTEST.BIN") {
+        Ok(mut reader) => {
+            let mut buffer = [0u8; 2048];
+            loop {
+                let Ok(n) = reader.read(&mut buffer) else {
+                    same = false;
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                same &= buffer[..n] == piece[total % piece.len()..][..n];
+                total += n;
+                watchdog::feed();
+            }
+            reader.close();
+        }
+        Err(step) => {
+            let _ = writeln!(log.stamp(), "storage: scratch file could not be opened (step {})", step);
+            same = false;
+        }
+    }
+    let _ = writeln!(
+        log.stamp(),
+        "storage: {} bytes read back, {}",
+        total,
+        if same && total == EMMC_TIMED_WRITE { "identical" } else { "DIFFERENT" }
+    );
+    // Leave it empty.
+    let emptied = storage::FileWriter::rewrite(partition, &[DIR], NAME).map_err(|_| ()).and_then(|w| w.finish());
+    if emptied.is_err() {
+        let _ = writeln!(log.stamp(), "storage: scratch file could not be emptied");
+    }
+    written.is_ok() && same && total == EMMC_TIMED_WRITE && emptied.is_ok()
+}
+
 /// Sectors per command in the multi-sector timing.
 const EMMC_CHUNK: usize = 64;
 
@@ -337,7 +435,29 @@ fn speed_up_card(log: &mut Log) -> bool {
         }
         break;
     }
-    if EMMC_TIMED_SECTORS != 0 && !time_card_read_chunked(reference, log) {
+    // What the card says about itself, which also shows that it took the
+    // settings above.
+    let info_read = match sdmmc::card_info() {
+        Ok(info) => {
+            let _ = writeln!(
+                log.stamp(),
+                "emmc: {} sectors ({} MB), settings revision {}, speeds {:#04x}, timing {}, bus width {}, power notice {}",
+                info.sectors,
+                info.sectors / 2048,
+                info.revision,
+                info.device_type,
+                info.timing,
+                info.bus_width,
+                info.power_notice
+            );
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(log.stamp(), "emmc: extended settings could not be read (error {})", e as u8);
+            false
+        }
+    };
+    if !info_read || (EMMC_TIMED_SECTORS != 0 && !time_card_read_chunked(reference, log)) {
         // Start the card again and repeat the steps that had worked.
         let _ = writeln!(log.stamp(), "emmc: restarting the card after the failed read");
         if sdmmc::init().is_err() {

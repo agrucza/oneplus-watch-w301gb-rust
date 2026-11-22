@@ -21,7 +21,7 @@ runs its own stack. Each chip below hangs off one of them.
 
 | # | Chip / function | Interface | Firmware file | State in Rust |
 |---|---|---|---|---|
-| 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works at the stock bus settings (4-bit, 48 MHz), reads 64 sectors per command; writes one sector per command |
+| 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works at the stock bus settings (4-bit, 48 MHz), reads and writes up to 64 sectors per command |
 | 2 | Cypress CYW20721 Bluetooth | USART3 3 Mbaud (PC4, PC5, PB13, PB14), PB2, PC6, PB9, PC7 | `cypress/appdriver.bin`, `minidriver.bin` | works for existing pairings |
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking by button and by wrist gesture |
@@ -468,7 +468,7 @@ Steps:
    minutes.
 3. Firmware update path: leave alone.
 
-### 3.10 eMMC (item 1) - reading at stock speed, writing one sector at a time
+### 3.10 eMMC (item 1) - at the stock bus settings; one item left
 
 The HAL has no driver for this chip's card controller (also not in the
 pinned upstream commit: its chip data lists SDMMC1 without registers), so
@@ -487,21 +487,35 @@ and each checked at start by reading the same sectors before and after:
 A step that fails is taken back by restarting the card; if the card cannot
 be restarted the image gives up and the watch returns to stock.
 
+The card about itself (its extended settings, CMD8): 7,405,568 sectors
+(3616 MB), settings revision 7, supported speeds 0x07; read back after the
+steps above: timing 1 (high speed), bus width 1 (four lines), power notice
+0. The capacity is handed to the filesystem crate.
+
 The filesystem crate (embedded-sdmmc 0.10) reads and writes exactly one
-sector per call. `services::storage` therefore reads ahead: a request for
-the sector after the previous one fetches a run of 64 with one command.
-Measured on a 1.97 MB file: 944 ms sector by sector, 335 ms reading ahead.
+sector per call. `services::storage` therefore:
+
+- reads ahead: a request for the sector after the previous one fetches a
+  run of 64 with one command. Measured on a 1.97 MB file: 944 ms sector by
+  sector, 335 ms reading ahead.
+- collects writes: consecutive sector writes (the crate writes file data
+  in runs of one cluster, 64 sectors) go out with one command, CMD23 +
+  CMD25 as in the stock app (`0x080865C6`). Everything collected is on the
+  card before a writing function returns. Measured on a 256 KB file:
+  397 ms one sector per command, 100 ms collected, read back identical.
+
+Tried and dropped: keeping the last allocation-table sector in memory. It
+made no measurable difference (386 ms against 335 ms, one run each); the
+table is only read once per cluster.
 
 Remaining:
-1. Writing several sectors per command (stock: CMD23 + CMD25). The driver
-   writes one sector per command, and the filesystem crate never asks for
-   more, so this only pays off together with collecting writes in the
-   storage layer.
-2. A one-sector memory for the allocation table: the crate re-reads the
-   same table sector for every cluster of a file.
-3. Card capacity from the card instead of a constant.
-4. The power-off notice the stock app gives the card (CMD6 `0x03220100` at
-   start, `0x03220200` before switching it off).
+1. The power-off notice the stock app gives the card: CMD6 `0x03220100`
+   ("powered on") at the end of its start-up (`0x0804D8AA`), CMD6
+   `0x03220200` ("about to be switched off") in its shutdown routine
+   (`0x0804DB62`), which then cuts the card's supply through three pins.
+   This firmware never cuts the supply; it resets and the bootloader
+   starts the card again while it is powered. Not to be sent before it is
+   read when the stock app shuts the card down and what those pins do.
 
 ### 3.11 PSRAM, remaining work (item 5) - S
 
@@ -564,8 +578,8 @@ before adding new chips.
 
 1. **Full speed underneath:** 120 MHz system clock (section 4), PSRAM
    timing (3.11), eMMC at 48 MHz on four data lines with multi-sector
-   reads (3.10): done. Left there: multi-sector writes and the small
-   items listed in 3.10.
+   reads and writes (3.10): done. Left there: the card's power-off
+   notice.
 2. **Display pipeline** (3.3): regional updates, second frame buffer.
 3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
    press (3.2), clock backup file (3.12).

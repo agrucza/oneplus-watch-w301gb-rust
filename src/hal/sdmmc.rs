@@ -9,7 +9,7 @@
 //! `high_speed` switches card and controller to 48 MHz and
 //! `four_data_lines` to the 4-bit bus, as the stock app does (0x0804D93A
 //! and 0x0804D9D2 in B.70). Reads can cover several sectors per command
-//! (`read_sectors`); writes still go one sector at a time.
+//! (`read_sectors`), and so can writes (`write_sectors`).
 //!
 //! Wiring (bootloader `HAL_MMC_MspInit`, 0x08007F66): CLK PC12, CMD PD2,
 //! D0..D3 PC8..PC11, all alternate function 12, pull-up, very high speed.
@@ -60,6 +60,9 @@ const KERNEL_HZ: u32 = crate::hal::clocks::SDMMC_KERNEL_HZ;
 
 /// The card clock in Hz, for the data timeouts.
 static CARD_HZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(12_000_000);
+
+/// The card's capacity in sectors, from its extended settings.
+static CARD_SECTORS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Set by `init`: cards up to 2 GB take byte addresses, larger ones sectors.
 static BYTE_ADDRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -316,6 +319,59 @@ pub fn read_sectors(sector: u32, buf: &mut [u32]) -> Result<(), Error> {
     if count == 0 || buf.len() % 128 != 0 || count > 0xFFFF {
         return Err(Error::Command);
     }
+    let address = if byte_addressed() { sector.wrapping_mul(512) } else { sector };
+    read_data(if count > 1 { 18 } else { 17 }, address, buf)
+}
+
+/// The card's extended settings ("EXT_CSD", CMD8): 512 bytes.
+pub fn read_extended_settings(buf: &mut [u32; 128]) -> Result<(), Error> {
+    read_data(8, 0, buf)
+}
+
+/// What the card says about itself in its extended settings.
+#[derive(Clone, Copy)]
+pub struct CardInfo {
+    /// Capacity in 512-byte sectors (bytes 212 to 215).
+    pub sectors: u32,
+    /// Version of the settings table (byte 192).
+    pub revision: u8,
+    /// Speeds the card supports (byte 196): bit 0 = 26 MHz, bit 1 = 52 MHz.
+    pub device_type: u8,
+    /// Timing in use (byte 185): 0 = slow, 1 = high speed.
+    pub timing: u8,
+    /// Bus width in use (byte 183): 0 = one, 1 = four, 2 = eight lines.
+    pub bus_width: u8,
+    /// Power-off notice state (byte 34).
+    pub power_notice: u8,
+}
+
+/// Read the card's extended settings and pick out `CardInfo`. The capacity
+/// is remembered for `sectors`.
+pub fn card_info() -> Result<CardInfo, Error> {
+    let mut words = [0u32; 128];
+    read_extended_settings(&mut words)?;
+    let byte = |n: usize| (words[n / 4] >> (8 * (n % 4))) as u8;
+    let info = CardInfo {
+        sectors: words[212 / 4],
+        revision: byte(192),
+        device_type: byte(196),
+        timing: byte(185),
+        bus_width: byte(183),
+        power_notice: byte(34),
+    };
+    CARD_SECTORS.store(info.sectors, core::sync::atomic::Ordering::Relaxed);
+    Ok(info)
+}
+
+/// The card's capacity in sectors; 0 until `card_info` has run.
+pub fn sectors() -> u32 {
+    CARD_SECTORS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One data transfer from the card into `buf` with the given command.
+/// More than one sector is announced with CMD23 first.
+fn read_data(index: u32, address: u32, buf: &mut [u32]) -> Result<(), Error> {
+    let count = (buf.len() / 128) as u32;
     unsafe {
         write_volatile(ICR, ALL_FLAGS);
         if count > 1 {
@@ -327,8 +383,7 @@ pub fn read_sectors(sector: u32, buf: &mut [u32]) -> Result<(), Error> {
         write_volatile(IDMACTRLR, 1); // internal DMA, single buffer
         write_volatile(DCTRL, 9 << 4 | 1 << 1); // 512-byte blocks, card -> host
 
-        let address = if byte_addressed() { sector.wrapping_mul(512) } else { sector };
-        let result = match command(if count > 1 { 18 } else { 17 }, address, Resp::Short, true) {
+        let result = match command(index, address, Resp::Short, true) {
             Err(_) => Err(Error::Command),
             Ok(_) => {
                 let end = Instant::now() + Duration::from_secs(2);
@@ -356,21 +411,33 @@ pub fn read_sectors(sector: u32, buf: &mut [u32]) -> Result<(), Error> {
     }
 }
 
-/// Write one 512-byte sector and wait until the card has stored it.
-pub fn write_sector(sector: u32, buf: &[u32; 128]) -> Result<(), Error> {
+/// Write consecutive sectors from `buf`, whose length in words must be a
+/// multiple of 128 (one sector) and at most 65535 sectors, and wait until
+/// the card has stored them.
+///
+/// One sector goes as CMD24. More go as the stock app sends them
+/// (0x080865C6 in B.70): CMD23 with the number of sectors, then CMD25.
+pub fn write_sectors(sector: u32, buf: &[u32]) -> Result<(), Error> {
+    let count = (buf.len() / 128) as u32;
+    if count == 0 || buf.len() % 128 != 0 || count > 0xFFFF {
+        return Err(Error::Command);
+    }
     unsafe {
         write_volatile(ICR, ALL_FLAGS);
-        write_volatile(DTIMER, 2 * card_hz()); // 2 s of card clock
-        write_volatile(DLENR, 512);
+        if count > 1 {
+            command(23, count, Resp::Short, false).map_err(|_| Error::Command)?;
+        }
+        write_volatile(DTIMER, 4 * card_hz()); // 4 s of card clock
+        write_volatile(DLENR, count * 512);
         write_volatile(IDMABASE0R, buf.as_ptr() as u32);
         write_volatile(IDMACTRLR, 1); // internal DMA, single buffer
-        write_volatile(DCTRL, 9 << 4); // 512-byte block, host -> card
+        write_volatile(DCTRL, 9 << 4); // 512-byte blocks, host -> card
 
         let address = if byte_addressed() { sector.wrapping_mul(512) } else { sector };
-        let result = match command(24, address, Resp::Short, true) {
+        let result = match command(if count > 1 { 25 } else { 24 }, address, Resp::Short, true) {
             Err(_) => Err(Error::Command),
             Ok(_) => {
-                let end = Instant::now() + Duration::from_secs(3);
+                let end = Instant::now() + Duration::from_secs(5);
                 loop {
                     let st = read_volatile(STAR);
                     if st & DCRCFAIL != 0 {
@@ -394,9 +461,9 @@ pub fn write_sector(sector: u32, buf: &[u32; 128]) -> Result<(), Error> {
         result?;
     }
 
-    // The card programs the block after the transfer. Ask for its status
+    // The card programs the blocks after the transfer. Ask for its status
     // (CMD13) until it is back in the transfer state and ready for data.
-    let end = Instant::now() + Duration::from_secs(3);
+    let end = Instant::now() + Duration::from_secs(5);
     loop {
         match command(13, RCA << 16, Resp::Short, false) {
             // bits 12:9 = state (4 = transfer), bit 8 = ready for data,
@@ -410,4 +477,12 @@ pub fn write_sector(sector: u32, buf: &[u32; 128]) -> Result<(), Error> {
             return Err(Error::Program);
         }
     }
+}
+
+/// Tell the card to end a transfer (CMD12) and wait until it is ready
+/// again; for getting it out of a multi-sector transfer that failed.
+pub fn stop_transfer() {
+    let _ = command(12, 0, Resp::Short, false);
+    let _ = wait_not_busy(Duration::from_millis(500));
+    unsafe { write_volatile(ICR, ALL_FLAGS) };
 }
