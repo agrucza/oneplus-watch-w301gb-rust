@@ -13,6 +13,7 @@
 //! | Display | LTDC, DSI host; PF11 tearing effect; PG5, PF12 supplies, PF5 power, PA11 reset | `drivers::panel`, `hal::dsi` |
 //! | PSRAM | FMC bank 1: port D except PD2, PB7, PE0, PE1, PE3-PE15, PG9; PE2 CRE | `drivers::psram`, `hal::fmc` |
 //! | Sensor bus | I2C2: PF1 clock, PF0 data (external pull-ups); light sensor 0x45, NFC 0x28, a device at 0x36 | `SensorBus`, `drivers::light` |
+//! | Touch controller | I2C3: PC0 clock, PB4 data (external pull-ups), address 0x24; PF13 reset, PF4 enable, PA0 interrupt | `drivers::touch` |
 //! | Upper button | PC13 | `drivers::buttons` |
 //! | Crystals | PH0, PH1 (24 MHz); PC14, PC15 (32.768 kHz) | `hal::clocks` |
 //!
@@ -25,7 +26,7 @@ use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::time::Hertz;
 use embassy_time::{Duration, Timer};
 
-use crate::drivers::{apollo, cypress, light, panel};
+use crate::drivers::{apollo, cypress, light, panel, touch};
 
 pub struct Board {
     pub power: PowerPins,
@@ -34,6 +35,7 @@ pub struct Board {
     pub display: panel::Resources,
     pub upper_button: Peri<'static, peripherals::PC13>,
     pub sensor_bus: SensorBus,
+    pub touch: touch::Resources,
 }
 
 /// The enables the bootloader's `bsp_gpio_power_init` sets. Which of them
@@ -84,6 +86,7 @@ impl Board {
             },
             upper_button: p.PC13,
             sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
+            touch: touch::Resources { i2c: p.I2C3, scl: p.PC0, sda: p.PB4, reset: p.PF13, enable: p.PF4, irq: p.PA0 },
         }
     }
 }

@@ -6,3 +6,4 @@ pub mod cypress;
 pub mod light;
 pub mod panel;
 pub mod psram;
+pub mod touch;

@@ -26,7 +26,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works, few messages understood |
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
-| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | nothing |
+| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | works: finger position and events |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
@@ -66,7 +66,7 @@ their callers, and every GPIO setup call in the app), unless marked.
 | I2C2 | | second light-sensor driver, for a part with a Lite-On style register map (alternative fitting, **guess**) | 0x53 |
 | I2C2 | | NFC controller SN100T; silent in a bus scan (**measured**), so unpowered or in reset until enabled | 0x28 |
 | I2C2 | | device with 16-bit registers, most likely the speaker amplifier (**guess**, see 3.6); also silent in a bus scan (**measured**) | 0x36 |
-| I2C3 | PB4, PC0 | touch controller | 0x24 |
+| I2C3 | PC0 clock, PB4 data | touch controller (**measured**) | 0x24 |
 | I2C4 | PF14, PF15 (pull-ups) | the Apollo, for its firmware update only | 0x20 |
 | SPI1 | PA5, PA6, PA7 | Apollo message link (STM32 is the slave) | |
 | SPI2 | PB10 clock, PC1, PC2 data, PB12 chip select | not traced to a device; the audio codec is the likely one (**guess**) | |
@@ -78,10 +78,12 @@ Other pins the stock app sets up:
 
 | Pin | Setup | Likely role |
 |---|---|---|
-| PA0 | interrupt on falling edge, pull-up | not a button (**measured**); role unknown |
+| PA0 | interrupt on falling edge, pull-up | touch interrupt (**measured**) |
+| PF13 | output | touch reset, active low (**measured**) |
+| PF4 | output | switched with the touch reset; high in use |
 | PC13 | interrupt on both edges, pull-up | upper button (**measured**) |
-| PF2 | output | touch reset (**guess**: set up next to PG2) |
-| PG2 | interrupt on rising edge, pull-down | touch interrupt (**guess**) |
+| PF2 | output | unknown (not the touch reset) |
+| PG2 | interrupt on rising edge, pull-down | unknown (not the touch interrupt) |
 | PA4, PB3 | outputs, driven low at start | unknown |
 | PB1 | output | unknown, set up with the ADC pin PB0 |
 | PB6, PB12 and two pins in a group of 6 and 10 | outputs | unknown |
@@ -95,32 +97,45 @@ bus beyond the table.
 Effort is relative: S = an evening like the PSRAM, M = like the Apollo
 link, L = several sessions.
 
-### 3.1 Touch controller (item 6) - M
+### 3.1 Touch controller (item 6) - done, refinements left
 
-Known: on I2C3 at address 0x24 (**stock code**; the read and write
-wrappers are at `0x080A0018` and `0x080A00CE`, with "TP I2C" log texts).
-0x24 is the default address of Cypress/Parade TrueTouch controllers, and the
-threshold file `0:cmcp_threshold_file.csv` is that family's format. The
-stock app has a `TouchTask`, a firmware update path, a reset with timing and
-an "underwater mode". Reset is probably PF2, the interrupt PG2 (**guess**).
+**Measured:** a Cypress/Parade TrueTouch controller on I2C3 (PC0 clock, PB4
+data, 400 kHz) at address 0x24. Reset is PF13 (active low), the interrupt
+line PA0 (low while a report is waiting). PF4 is switched with the reset as
+in the stock app and is high while the chip is in use; what it feeds is not
+known. After the reset the chip runs its touch firmware straight away (mode
+byte 0xF7) and sends touch reports without further set-up.
 
-Steps:
-1. Confirm the reset and interrupt pins from the stock touch task.
-2. First image: reset the chip, read its identification, log it.
-3. Read touch reports on interrupt; log coordinates.
-4. Draw a dot under the finger. This is the first interactive feature.
+Coordinates are display pixels, same orientation as the picture: X 0 (left)
+to 453, Y 0 (top) to 453; the system information also gives 454 x 454. A
+report carries the event per finger (down, move, lifted); reports come about
+every 15 ms while a finger is on the glass.
 
-Risk: TrueTouch controllers speak a packet protocol with a bootloader mode.
-If the chip comes up in bootloader mode it needs a start command first.
+`drivers::touch` resets the chip, logs its description and system
+information and returns finger events; the app marks each touch with a dot.
+The messages sent to the chip are byte for byte the stock app's (driver at
+`0x08077C74` to `0x08079270`).
+
+Not exercised: the path for a chip that starts in its bootloader (the
+command is the stock one, but the chip never was in that state).
+
+A finger on the glass also shades the light sensor, so the brightness
+drops a little while touching.
+
+Remaining:
+1. Gestures: tap, swipe, long press.
+2. Sleep and wake: the stock app has a deep-sleep command pair and a
+   wake-up report (kind 4).
+3. The stock app's settings after start (`0x0807857A`) and its "underwater
+   mode".
+4. Firmware update of the chip from `tp_firmware.bin` (only if ever needed).
 
 ### 3.2 Buttons (item 11) - done
 
 **Measured:** the upper button is PC13 (pull-up, pressed reads low). The
 lower button is wired to the Apollo, which reports it in message kind 51:
-pressed, released, clicked, and long press after 1.5 s. PA0, set up by the
-stock app as a falling-edge interrupt, is not a button; it follows something
-else (it went high about 3.8 s after boot in one run and stayed low in
-another).
+pressed, released, clicked, and long press after 1.5 s. PA0, once
+suspected to be a button, is the touch controller's interrupt line (3.1).
 
 **In use:** a click of the upper button (released within 800 ms) blanks
 and shows the display; a click of the lower one steps the brightness mode.
@@ -333,23 +348,20 @@ Would give a live log without Bluetooth.
 ## 5. Suggested order
 
 Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor and automatic brightness (3.4).
+sensor and automatic brightness (3.4), touch (3.1).
 
-1. **Touch** (3.1): interaction.
-2. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
+1. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
    step 1): removes the two hard-coded values.
-3. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
-4. **Low power** (section 4): after that the watch can be worn.
-5. **Audio** (3.6).
-6. **GPS, pairing, BLE, NFC** as wanted.
+2. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
+3. **Low power** (section 4): after that the watch can be worn.
+4. **Audio** (3.6).
+5. **GPS, pairing, BLE, NFC** as wanted.
 
 ## 6. Open questions
 
-- The touch controller's reset and interrupt pins (PF2 / PG2 are candidates).
+- What PF4 feeds (switched together with the touch reset).
 - Why the lower button's first press after a display command once came
   without a "clicked" message from the Apollo.
-- What PA0 signals (not a button; the stock app takes a falling-edge
-  interrupt from it).
 - What SPI2, ADC1 (PB0) and the outputs PA4, PB3, PB1 are used for.
 - Whether the device at 0x36 on I2C2 is the speaker amplifier, and which
   pins power or enable it and the NFC controller (neither answers on the

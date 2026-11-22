@@ -11,7 +11,8 @@ use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
-use crate::drivers::{apollo, buttons, light, panel, psram};
+use crate::drivers::touch::TouchEvent;
+use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
@@ -97,9 +98,11 @@ pub async fn run(board: Board) {
             logged: 0,
             brightest: 0,
         };
+        let touch = touch::Touch::start(board.touch, &mut log).await;
+        let _ = log.flush();
         let buttons = buttons::Buttons::start(board.upper_button);
         if let Some(server) = Server::new(image_partition) {
-            main_loop(link, server, apollo, buttons, screen, sensors).await;
+            main_loop(link, server, apollo, buttons, screen, sensors, touch).await;
         }
     }
 
@@ -138,6 +141,10 @@ struct Screen {
     level_logged: u8,
     faded_at: Instant,
     last_button: &'static str,
+    /// Where the glass was last touched, if that is newer than the button.
+    last_touch: Option<(u16, u16)>,
+    /// The frame has changed since it was last sent to the panel.
+    changed: bool,
     /// Uptime second the screen was last drawn for.
     drawn_for: Option<u64>,
     refresh_logged: bool,
@@ -155,6 +162,8 @@ impl Screen {
             level_logged: START_BRIGHTNESS,
             faded_at: Instant::now(),
             last_button: "no button yet",
+            last_touch: None,
+            changed: false,
             drawn_for: None,
             refresh_logged: false,
         }
@@ -191,7 +200,15 @@ impl Screen {
         if !taken {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
+        self.last_touch = None;
         self.drawn_for = None; // show the change at once
+    }
+
+    /// A finger is on the glass: mark the place with a dot.
+    fn touched(&mut self, x: u16, y: u16) {
+        status::dot(self.panel.frame, x, y);
+        self.last_touch = Some((x, y));
+        self.changed = true;
     }
 
     /// A new light reading, in lux.
@@ -214,8 +231,8 @@ impl Screen {
         }
     }
 
-    /// Redraw and send the picture if a second has passed or something
-    /// changed. Takes about 40 ms when it does.
+    /// Send the picture if it changed; once a second, redraw the status
+    /// text first. Takes about 40 ms when it sends.
     async fn update(
         &mut self,
         readings: Option<&Readings>,
@@ -224,9 +241,41 @@ impl Screen {
         log: &mut Log,
     ) {
         let uptime_s = Instant::now().as_secs();
-        if !self.visible || self.drawn_for == Some(uptime_s) {
+        let new_second = self.drawn_for != Some(uptime_s);
+        if !self.visible || !(new_second || self.changed) {
             return;
         }
+        self.changed = false;
+        if new_second {
+            self.redraw(uptime_s, readings, light, bluetooth_connected, log);
+        }
+        let started = Instant::now();
+        let r = self.panel.refresh().await;
+        // The first refresh and every failed one go to the log.
+        if !r.done || !self.refresh_logged {
+            self.refresh_logged = true;
+            let _ = writeln!(
+                log.stamp(),
+                "display: refresh {} after {} ms; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
+                if r.done { "done" } else { "NOT finished" },
+                started.elapsed().as_millis(),
+                r.wisr,
+                r.isr0,
+                r.isr1,
+                r.psr
+            );
+        }
+    }
+
+    /// Draw the status text for this second into the frame.
+    fn redraw(
+        &mut self,
+        uptime_s: u64,
+        readings: Option<&Readings>,
+        light: Option<light::Raw>,
+        bluetooth_connected: bool,
+        log: &mut Log,
+    ) {
         self.drawn_for = Some(uptime_s);
         // Where automatic brightness has arrived, at most once a second.
         if self.fixed.is_none() && self.level == self.auto.wanted() && self.level != self.level_logged {
@@ -249,24 +298,9 @@ impl Screen {
                 brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
                 brightness: self.level,
                 last_button: self.last_button,
+                last_touch: self.last_touch,
             },
         );
-        let started = Instant::now();
-        let r = self.panel.refresh().await;
-        // The first refresh and every failed one go to the log.
-        if !r.done || !self.refresh_logged {
-            self.refresh_logged = true;
-            let _ = writeln!(
-                log.stamp(),
-                "display: refresh {} after {} ms; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
-                if r.done { "done" } else { "NOT finished" },
-                started.elapsed().as_millis(),
-                r.wisr,
-                r.isr0,
-                r.isr1,
-                r.psr
-            );
-        }
     }
 }
 
@@ -352,6 +386,7 @@ async fn main_loop(
     mut buttons: buttons::Buttons,
     mut screen: Option<Screen>,
     mut sensors: Sensors,
+    mut touch: Option<touch::Touch>,
 ) -> ! {
     let mut log = Log::get();
     let mut last_save = Instant::now();
@@ -369,7 +404,14 @@ async fn main_loop(
         // Buttons: the upper one is ours, the lower one comes through the Apollo.
         let upper_click = matches!(buttons.poll(&mut log), Some(ButtonEvent::Released { held_ms }) if held_ms < CLICK_MS);
         let lower_click = apollo.as_mut().and_then(|a| a.take_key()) == Some(KeyEvent::Clicked);
+        let touched = match touch.as_mut() {
+            Some(touch) if !server.transferring() => touch.poll(&mut log),
+            _ => None,
+        };
         if let Some(screen) = screen.as_mut() {
+            if let Some(TouchEvent::Down { x, y }) = touched {
+                screen.touched(x, y);
+            }
             if let Some(lux) = lux {
                 screen.ambient(lux);
             }

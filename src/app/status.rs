@@ -10,6 +10,7 @@ use core::fmt::{self, Write};
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{Circle, PrimitiveStyle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 use profont::{PROFONT_18_POINT, PROFONT_24_POINT};
 
@@ -34,6 +35,8 @@ pub struct Status<'a> {
     /// What the panel is set to, 0 to 255.
     pub brightness: u8,
     pub last_button: &'a str,
+    /// Where the glass was last touched, if that is newer than the button.
+    pub last_touch: Option<(u16, u16)>,
 }
 
 /// A line of text of fixed capacity; longer text is cut off.
@@ -74,6 +77,13 @@ impl fmt::Write for Line {
 /// Paint the frame black; call once before the first `draw`.
 pub fn clear(frame: &mut Frame) {
     Canvas(frame).clear_to(BACKGROUND);
+}
+
+/// Mark the place of a touch with a dot.
+pub fn dot(frame: &mut Frame, x: u16, y: u16) {
+    let _ = Circle::with_center(Point::new(x as i32, y as i32), 13)
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::MAGENTA))
+        .draw(&mut Canvas(frame));
 }
 
 /// Draw all lines of the status screen.
@@ -143,7 +153,14 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
     put(300, false, Rgb565::CYAN, 26, &mut line);
 
     let mut line = Line::new();
-    let _ = write!(line, "{}", s.last_button);
+    match s.last_touch {
+        Some((x, y)) => {
+            let _ = write!(line, "touch {}, {}", x, y);
+        }
+        None => {
+            let _ = write!(line, "{}", s.last_button);
+        }
+    }
     put(336, false, Rgb565::YELLOW, 22, &mut line);
 
     let mut line = Line::new();
