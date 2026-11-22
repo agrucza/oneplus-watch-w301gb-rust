@@ -155,13 +155,50 @@ the PSRAM, drawing with `embedded-graphics`, a status screen redrawn and
 sent once a second, brightness (command `0x51`) and blanking (display off /
 on commands) from the buttons.
 
+**How the stock app sends pictures** (read in B.70; its display layer is
+TouchGFX, as its assertion texts show):
+
+- Whole frames, never regions: before every frame it sends the column
+  window again, always the full width (`0x08039D56`, `0x080ABE1A`).
+- Each frame is started in its handler for the panel's tearing-effect
+  pulse; the pulse is set to line 444 with the "tear scanline" command
+  before the first frame (`0x08039D1C`).
+- Two frame buffers behind each other in the PSRAM, 512 x 454 pixels each
+  (464,896 bytes); before a frame the display controller is pointed at
+  the other one (`0x080ABBD0`, `0x080ABC0A`).
+- It reckons with up to 60 frames a second (`0x080ABDDE`).
+
+Done and measured (2026-11-22):
+
+- Frames are started on the tearing-effect pulse and the tear scanline is
+  set as in the stock app. The same picture sent 120 times: 2040 ms, 58
+  frames a second, every one in step with the panel.
+- Two frames in the PSRAM, the second where the stock app has its own.
+  A picture is drawn into the one that is not shown, then presented: on
+  the pulse the display controller is pointed at it (host off, new
+  address, immediate reload, host on, as at `0x080ABC0A`) and the frame is
+  requested. `Panel::present` returns while the frame travels, so the next
+  picture is drawn meanwhile. Panel commands wait for a frame in transit.
+- Speed with the placeholder status screen (nine lines of text, drawn
+  with embedded-graphics): drawing takes about 29 ms a picture. Drawing,
+  sending and waiting: 19 pictures a second. Drawing while the frame
+  travels: 29 a second, one every second pulse.
+
+So the link is at the stock level and drawing is what limits the rate.
+What was tried: handing text to the frame a rectangle at a time instead
+of pixel by pixel changed nothing (31 ms), so the time is not in placing
+pixels. Not yet measured: how much of it is the cost of writing to the
+PSRAM (the memory test suggests roughly 0.15 to 0.2 us a word) and how
+much the library's work on the font. The stock app draws with the chip's
+hardware blitter (DMA2D; its base address is referenced at `0x0808EE14`).
+
 Remaining:
-1. Full power-down and power-up with the stock sequences (`0x08039464`,
+1. Drawing speed: measure filling and copying with the processor against
+   the hardware blitter, then build the drawing layer for a real
+   interface on what is faster.
+2. Redrawing when something changes instead of once a second.
+3. Full power-down and power-up with the stock sequences (`0x08039464`,
    `0x080397E2`); blanking keeps the panel powered. Belongs with low power.
-2. Partial refresh: the stock app updates regions; needed for smooth
-   drawing.
-3. Double buffering in the PSRAM (the stock app reserves 2 MB at
-   `0x60C00000`; one frame is 412 KB).
 4. Larger fonts and a real watch face.
 5. Always-on mode (`lcd_alwayson` in the stock strings): later.
 
@@ -580,7 +617,8 @@ before adding new chips.
 1. **Full speed underneath:** 120 MHz system clock (section 4), PSRAM
    timing (3.11), eMMC at 48 MHz on four data lines with multi-sector
    reads and writes (3.10): done.
-2. **Display pipeline** (3.3): regional updates, second frame buffer.
+2. **Display pipeline** (3.3): frames in step with the panel and two
+   frame buffers: done. Left: drawing speed (hardware blitter).
 3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
    press (3.2), clock backup file (3.12).
 4. **Low power** (section 4): after that the watch can be worn.

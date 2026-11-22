@@ -1,7 +1,7 @@
 //! Drawing into the display's framebuffer with `embedded-graphics`.
 //!
 //! `Canvas` borrows the frame for as long as something is being drawn; the
-//! picture reaches the panel with the next `Panel::refresh`.
+//! picture reaches the panel with the next `Panel::present`.
 
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;

@@ -155,7 +155,24 @@ async fn command_fifo_empty() -> bool {
     wait_for(Duration::from_millis(100), || DSIHOST.gpsr().read().0 & 1 != 0).await
 }
 
+/// A frame has been requested and may still be on its way to the panel.
+static IN_FLIGHT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Wait until the frame that is on its way has gone out (up to 200 ms).
+/// True if none was, or it finished in time.
+pub async fn frame_out() -> bool {
+    if !IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    // WISR bit 1: end of refresh.
+    let done = wait_for(Duration::from_millis(200), || DSIHOST.wisr().read().0 & 1 << 1 != 0).await;
+    IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+    done
+}
+
 async fn header(kind: u32, low: u32, high: u32) -> bool {
+    // Commands and a frame do not share the link.
+    frame_out().await;
     if !command_fifo_empty().await {
         return false;
     }
@@ -195,21 +212,70 @@ pub async fn dcs_long(command: u8, params: &[u8]) -> bool {
 pub struct RefreshStatus {
     /// The frame went out within the time limit.
     pub done: bool,
+    /// The panel's tearing-effect pulse was seen before the frame was
+    /// started (see `refresh`).
+    pub in_step: bool,
     pub wisr: u32,
     pub isr0: u32,
     pub isr1: u32,
     pub psr: u32,
 }
 
-/// Send the framebuffer to the panel once; waits up to 200 ms (a missing
-/// tearing-effect pulse shows up as `done == false`).
-pub async fn refresh() -> RefreshStatus {
+/// Start sending the frame at `framebuffer` to the panel and return while
+/// it is on its way, so the next picture can be drawn into the other
+/// frame meanwhile. `done` in the answer is about the frame before: it
+/// had gone out when this one was started.
+///
+/// As the stock app (0x080ABC0A in B.70): on the tearing-effect pulse the
+/// DSI host is stopped, the layer's frame address is changed and loaded
+/// at once, and the host is started again; then the frame is requested.
+pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
+    let done = frame_out().await;
     DSIHOST.wifcr().write_value(dsi::Wifcr(0b11)); // clear "tearing effect" and "refresh done"
+    // WISR bit 0: tearing-effect pulse.
+    let in_step = wait_for(Duration::from_millis(40), || DSIHOST.wisr().read().0 & 1 != 0).await;
+    DSIHOST.cr().write_value(dsi::Cr(0)); // host off
+    DSIHOST.wcr().modify(|w| w.0 &= !(1 << 3)); // wrapper off
+    LTDC.layer(0).cfbar().write_value(lt::Cfbar(framebuffer));
+    LTDC.srcr().write_value(lt::Srcr(1)); // load the layer settings now
+    DSIHOST.cr().write_value(dsi::Cr(1)); // host on
+    DSIHOST.wcr().modify(|w| w.0 |= 1 << 3); // wrapper on
+    DSIHOST.wcr().modify(|w| w.0 |= 1 << 2); // request one frame
+    IN_FLIGHT.store(true, core::sync::atomic::Ordering::Relaxed);
+    RefreshStatus {
+        done,
+        in_step,
+        wisr: DSIHOST.wisr().read().0,
+        isr0: DSIHOST.isr0().read().0,
+        isr1: DSIHOST.isr1().read().0,
+        psr: DSIHOST.psr().read().0,
+    }
+}
+
+/// Send the framebuffer to the panel once.
+///
+/// As the stock app (0x080ABE1A in B.70, its handler for the panel's
+/// tearing-effect pulse): the frame is started on that pulse, which the
+/// panel gives once per picture at the line set with its "tear scanline"
+/// command, so the panel never shows half an old and half a new frame.
+/// Without a pulse within 40 ms the frame is sent anyway (`in_step` is
+/// then false).
+pub async fn refresh() -> RefreshStatus {
+    frame_out().await;
+    DSIHOST.wifcr().write_value(dsi::Wifcr(0b11)); // clear "tearing effect" and "refresh done"
+    // WISR bit 0: tearing-effect pulse.
+    let in_step = wait_for(Duration::from_millis(40), || DSIHOST.wisr().read().0 & 1 != 0).await;
+    request_frame(in_step).await
+}
+
+/// Ask for one frame and wait until it has gone out (up to 200 ms).
+async fn request_frame(in_step: bool) -> RefreshStatus {
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 2); // request one frame
     // WISR bit 1: end of refresh.
     let done = wait_for(Duration::from_millis(200), || DSIHOST.wisr().read().0 & 1 << 1 != 0).await;
     RefreshStatus {
         done,
+        in_step,
         wisr: DSIHOST.wisr().read().0,
         isr0: DSIHOST.isr0().read().0,
         isr1: DSIHOST.isr1().read().0,

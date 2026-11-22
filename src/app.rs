@@ -40,8 +40,18 @@ pub async fn run(board: Board) {
         let _ = ticket::report(ticket::STAGE_LOG, 1);
         return;
     };
+    let rotated = rotate_log(log_partition);
     let mut log = Log::start(log_partition);
     let _ = writeln!(log.stamp(), "--- w301 rust app: ota server ---");
+    match rotated {
+        Some(Ok(len)) => {
+            let _ = writeln!(log.stamp(), "log: the previous log ({} bytes) is now log/rust.old; this file starts afresh", len);
+        }
+        Some(Err(step)) => {
+            let _ = writeln!(log.stamp(), "log: could not move the old log aside (step {}); it stays as it is", step);
+        }
+        None => {}
+    }
     faults::write_reset_cause(log.stamp());
     clocks::log_state(&mut log);
     clock::start(&mut log);
@@ -125,8 +135,10 @@ pub async fn run(board: Board) {
         if psram::quick_check(&mut log) {
             let _ = writeln!(log.stamp(), "psram: ready");
             // The 2 MB at FRAMEBUFFER belong to the display alone.
-            let frame = unsafe { &mut *(psram::FRAMEBUFFER as *mut panel::Frame) };
-            screen = panel::Panel::start(board.display, frame, &mut log).await.map(Screen::new);
+            let frames = unsafe {
+                [&mut *(psram::FRAMEBUFFER as *mut panel::Frame), &mut *(psram::FRAMEBUFFER_2 as *mut panel::Frame)]
+            };
+            screen = panel::Panel::start(board.display, frames, &mut log).await.map(Screen::new);
         } else {
             let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
@@ -473,6 +485,47 @@ fn speed_up_card(log: &mut Log) -> bool {
     true
 }
 
+/// The log file is started afresh at a start that finds it larger than
+/// this; what was in it is kept as `log/rust.old` (one generation).
+const LOG_LIMIT: u32 = 256 * 1024;
+
+/// Start the log file afresh if it has grown past `LOG_LIMIT`. Returns
+/// the size of the file that was moved aside, for the first log line.
+fn rotate_log(partition: storage::Partition) -> Option<Result<u32, u8>> {
+    static mut PIECE: [u8; 16384] = [0; 16384];
+    let mut probe = [0u8; 1];
+    let (len, _) = storage::read_tail(partition, "LOG", "RUST.LOG", &mut probe).ok()?;
+    if len <= LOG_LIMIT {
+        return None;
+    }
+    // Safety: used only here, once, before anything else runs.
+    let piece = unsafe { &mut *core::ptr::addr_of_mut!(PIECE) };
+    let copied = (|| {
+        storage::append(partition, "LOG", "RUST.OLD", &[]).map_err(|_| 1u8)?; // make sure it exists
+        let mut reader = storage::FileReader::open(partition, "log/RUST.LOG").map_err(|_| 2u8)?;
+        let mut writer = storage::FileWriter::rewrite(partition, &["LOG"], "RUST.OLD").map_err(|_| 3u8)?;
+        loop {
+            let n = reader.read(piece).map_err(|()| 4u8)?;
+            if n == 0 {
+                break;
+            }
+            writer.write(&piece[..n]).map_err(|()| 5u8)?;
+            watchdog::feed();
+        }
+        reader.close();
+        writer.finish().map_err(|()| 6u8)
+    })();
+    // Only once the copy is safely there is the log emptied.
+    Some(copied.and_then(|()| {
+        storage::FileWriter::rewrite(partition, &["LOG"], "RUST.LOG").map_err(|_| 7u8)?.finish().map_err(|()| 8u8)?;
+        Ok(len)
+    }))
+}
+
+/// Diagnosis: after the first picture, send this many frames in a row and
+/// time them; 0 = no timing.
+const DISPLAY_TIMED_FRAMES: u32 = 0;
+
 /// Diagnosis: write and read back the whole PSRAM at every start (about
 /// 4 s). On while the memory bus speed is being changed.
 const PSRAM_FULL_TEST: bool = false;
@@ -544,7 +597,10 @@ struct Screen {
     last_button: &'static str,
     /// Where the glass was last touched, if that is newer than the button.
     last_touch: Option<(u16, u16)>,
-    /// The frame has changed since it was last sent to the panel.
+    /// Where the glass was touched, the latest 64 places; drawn as dots.
+    dots: [(u16, u16); 64],
+    dot_count: usize,
+    /// The picture has changed since it was last sent to the panel.
     changed: bool,
     /// Uptime second the screen was last drawn for.
     drawn_for: Option<u64>,
@@ -552,8 +608,8 @@ struct Screen {
 }
 
 impl Screen {
-    fn new(panel: panel::Panel) -> Self {
-        status::clear(panel.frame);
+    fn new(mut panel: panel::Panel) -> Self {
+        panel.both(status::clear);
         Self {
             panel,
             visible: true,
@@ -567,6 +623,8 @@ impl Screen {
             wear: WearView::new(),
             last_button: "no button yet",
             last_touch: None,
+            dots: [(0, 0); 64],
+            dot_count: 0,
             changed: false,
             drawn_for: None,
             refresh_logged: false,
@@ -635,7 +693,9 @@ impl Screen {
 
     /// A finger is on the glass: mark the place with a dot.
     fn touched(&mut self, x: u16, y: u16) {
-        status::dot(self.panel.frame, x, y);
+        // Kept in a list, because every picture is drawn afresh.
+        self.dots[self.dot_count % self.dots.len()] = (x, y);
+        self.dot_count += 1;
         self.last_touch = Some((x, y));
         self.changed = true;
     }
@@ -676,24 +736,61 @@ impl Screen {
             return;
         }
         self.changed = false;
-        if new_second {
-            self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
-        }
+        // Always the whole picture: the frame drawn into is the one from
+        // two pictures ago.
+        self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
         let started = Instant::now();
-        let r = self.panel.refresh().await;
+        let r = self.panel.present().await;
         // The first refresh and every failed one go to the log.
         if !r.done || !self.refresh_logged {
+            let first = !self.refresh_logged;
             self.refresh_logged = true;
             let _ = writeln!(
                 log.stamp(),
-                "display: refresh {} after {} ms; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
+                "display: refresh {}{} after {} ms; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
                 if r.done { "done" } else { "NOT finished" },
+                if r.in_step { ", in step with the panel" } else { ", NO tearing-effect pulse" },
                 started.elapsed().as_millis(),
                 r.wisr,
                 r.isr0,
                 r.isr1,
                 r.psr
             );
+            if first && DISPLAY_TIMED_FRAMES != 0 {
+                // Diagnosis: the status screen drawn and sent again and
+                // again, to see how many frames a second drawing and the
+                // link manage together, and how long drawing alone takes.
+                // Measured: sending the same picture without drawing, 120
+                // frames in 2040 ms (58 a second). Drawing, then sending
+                // and waiting for it: 6112 ms (19 a second), drawing alone
+                // 27 ms a frame. Drawing the next picture while the frame
+                // travels: 4081 ms (29 a second), drawing 29 ms a frame.
+                // (Handing text to the frame a rectangle at a time instead
+                // of pixel by pixel made no difference: 31 ms a frame.)
+                let (mut in_step, mut finished) = (0u32, 0u32);
+                let mut drawing = Duration::from_ticks(0);
+                let started = Instant::now();
+                for _ in 0..DISPLAY_TIMED_FRAMES {
+                    let before = Instant::now();
+                    self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
+                    drawing += before.elapsed();
+                    let r = self.panel.present().await;
+                    in_step += r.in_step as u32;
+                    finished += r.done as u32;
+                    watchdog::feed();
+                }
+                let ms = started.elapsed().as_millis().max(1);
+                let _ = writeln!(
+                    log.stamp(),
+                    "display: {} frames drawn and presented in {} ms ({} a second), drawing alone {} ms a frame; {} in step with the panel, {} gone out before the next",
+                    DISPLAY_TIMED_FRAMES,
+                    ms,
+                    DISPLAY_TIMED_FRAMES as u64 * 1000 / ms,
+                    drawing.as_millis() / DISPLAY_TIMED_FRAMES as u64,
+                    in_step,
+                    finished
+                );
+            }
         }
     }
 
@@ -720,8 +817,11 @@ impl Screen {
             self.level_logged = self.level;
         }
         let worn = self.wear.update(readings.and_then(|r| r.wear).map(|w| w.on_wrist), self.visible_since);
+        for &(x, y) in &self.dots[..self.dot_count.min(self.dots.len())] {
+            status::dot(self.panel.back(), x, y);
+        }
         status::draw(
-            self.panel.frame,
+            self.panel.back(),
             &status::Status {
                 uptime_s,
                 readings,

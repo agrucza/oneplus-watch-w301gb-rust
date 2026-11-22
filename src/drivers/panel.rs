@@ -13,8 +13,10 @@
 //!   clock divider 2
 //! * commands: see `PANEL_ON`
 //!
-//! The framebuffer is handed in by the caller. Like the stock app, we keep
-//! it in the external PSRAM; the LTDC reads it from there itself.
+//! The two frames are handed in by the caller. Like the stock app, we
+//! keep them in the external PSRAM; the LTDC reads from there itself. One
+//! frame is drawn into while the other is the one the panel was sent
+//! (`back`, `present`).
 
 use core::fmt::Write;
 
@@ -35,13 +37,15 @@ enum Step {
     Set(u8, u8),
     /// DCS command without parameter.
     Do(u8),
+    /// DCS command with two parameters.
+    Pair(u8, [u8; 2]),
     /// DCS command with four parameters.
     Window(u8, [u8; 4]),
     WaitMs(u64),
 }
 
 /// The stock app's "display on" sequence.
-const PANEL_ON: [Step; 17] = [
+const PANEL_ON: [Step; 18] = [
     Step::Set(0xFE, 0x01), // vendor register page 1
     Step::Set(0x6A, 0x03),
     Step::Set(0xFE, 0x05),
@@ -49,7 +53,11 @@ const PANEL_ON: [Step; 17] = [
     Step::Set(0xFE, 0x01),
     Step::Set(0x0A, 0xF8),
     Step::Set(0xFE, 0x00),                        // back to the standard commands
-    Step::Set(0x35, 0x00),                        // tearing-effect output on
+    // Tearing-effect pulse at line 444 (0x01BC), then its output on: what
+    // the stock app's display layer sends before its first frame
+    // (0x08039D1C in B.70).
+    Step::Pair(0x44, [0x01, 0xBC]),
+    Step::Set(0x35, 0x00),
     Step::Set(0x53, 0x20),                        // brightness control on
     Step::Window(0x2A, [0x00, 0x0C, 0x01, 0xD1]), // columns 12..=465
     Step::Set(0x3A, 0x75),                        // 16 bits per pixel
@@ -72,7 +80,11 @@ pub struct Resources {
 }
 
 pub struct Panel {
-    pub frame: &'static mut Frame,
+    /// Two frames, as in the stock app: one is on its way to the panel or
+    /// was sent last, the other is free to be drawn into.
+    frames: [&'static mut Frame; 2],
+    /// Which of the two the panel was sent last.
+    shown: usize,
     _pins: [Output<'static>; 4],
 }
 
@@ -80,7 +92,7 @@ impl Panel {
     /// Power the panel, set up LTDC and DSI with `frame` as the picture
     /// source, switch the panel on. Every stage is logged; `None` if one of
     /// them does not complete.
-    pub async fn start(r: Resources, frame: &'static mut Frame, log: &mut Log) -> Option<Self> {
+    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
         // Power-up, as in the stock app.
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
@@ -95,7 +107,7 @@ impl Panel {
         let config = dsi::Config {
             width: WIDTH as u32,
             height: HEIGHT as u32,
-            framebuffer: frame.as_ptr() as u32,
+            framebuffer: frames[0].as_ptr() as u32,
             back_porch: 1, // the bootloader uses sync 2, back porch 4
             pll_ndiv: 80,
             pll_idf: 6,
@@ -122,6 +134,7 @@ impl Panel {
             let taken = match *step {
                 Step::Set(command, value) => dsi::dcs_1(command, value).await,
                 Step::Do(command) => dsi::dcs(command).await,
+                Step::Pair(command, params) => dsi::dcs_long(command, &params).await,
                 Step::Window(command, params) => dsi::dcs_long(command, &params).await,
                 Step::WaitMs(ms) => {
                     Timer::after_millis(ms).await;
@@ -135,13 +148,38 @@ impl Panel {
         }
         dsi::enable();
         let _ = writeln!(log.stamp(), "display: panel switched on");
-        Some(Self { frame, _pins: [pg5, pf12, power, reset] })
+        Some(Self { frames, shown: 0, _pins: [pg5, pf12, power, reset] })
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
     /// did not finish within 200 ms (for example no tearing-effect pulse).
+    #[allow(dead_code)] // `present` is what the app uses
     pub async fn refresh(&mut self) -> dsi::RefreshStatus {
         dsi::refresh().await
+    }
+
+    /// The frame to draw the next picture into. It holds what was drawn
+    /// two pictures ago, so a picture has to be drawn completely.
+    pub fn back(&mut self) -> &mut Frame {
+        self.frames[1 - self.shown]
+    }
+
+    /// Run `f` on both frames (for clearing them).
+    pub fn both(&mut self, mut f: impl FnMut(&mut Frame)) {
+        f(self.frames[0]);
+        f(self.frames[1]);
+    }
+
+    /// Start sending the frame that was drawn into (`back`) to the panel,
+    /// in step with it, and make the other one the frame to draw into. It
+    /// returns while the frame is on its way; the next `present` waits for
+    /// it first. `done` in the answer says whether the frame before had
+    /// gone out.
+    pub async fn present(&mut self) -> dsi::RefreshStatus {
+        let next = 1 - self.shown;
+        let status = dsi::refresh_from(self.frames[next].as_ptr() as u32).await;
+        self.shown = next;
+        status
     }
 
     /// Set the brightness, 0 (darkest) to 255. False if the command was
@@ -167,12 +205,12 @@ impl Panel {
                 1 => 0x07E0,
                 _ => 0x001F,
             };
-            let row = &mut self.frame[y * WIDTH..(y + 1) * WIDTH];
+            let row = &mut self.back()[y * WIDTH..(y + 1) * WIDTH];
             row.fill(band);
             row[..40].fill(0xFFFF);
         }
         for y in HEIGHT / 2 - 50..HEIGHT / 2 + 50 {
-            self.frame[y * WIDTH + WIDTH / 2 - 50..y * WIDTH + WIDTH / 2 + 50].fill(0);
+            self.back()[y * WIDTH + WIDTH / 2 - 50..y * WIDTH + WIDTH / 2 + 50].fill(0);
         }
     }
 }
