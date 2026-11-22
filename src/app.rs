@@ -15,6 +15,7 @@ use crate::drivers::{apollo, buttons, light, panel, psram};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
+use crate::services::brightness::AutoBrightness;
 use crate::services::{bluetooth, storage};
 
 /// Volume the update package and the installed image file live on.
@@ -86,7 +87,16 @@ pub async fn run(board: Board) {
         light::scan(&mut bus, &mut log);
         let light = light::LightSensor::start(&mut bus, &mut log).await;
         let _ = log.flush();
-        let sensors = Sensors { bus, light, last_raw: None, read_for: None, logged: 0 };
+        let sensors = Sensors {
+            bus,
+            light,
+            last_raw: None,
+            ready_at: Instant::now() + LIGHT_FIRST_READING,
+            read_at: None,
+            logged_for: None,
+            logged: 0,
+            brightest: 0,
+        };
         let buttons = buttons::Buttons::start(board.upper_button);
         if let Some(server) = Server::new(image_partition) {
             main_loop(link, server, apollo, buttons, screen, sensors).await;
@@ -103,16 +113,30 @@ pub async fn run(board: Board) {
     }
 }
 
-/// Brightness steps the lower button cycles through (panel values).
+/// Fixed brightness steps (panel values). The lower button goes from
+/// automatic through these and back to automatic.
 const BRIGHTNESS: [u8; 4] = [0x20, 0x60, 0x85, 0xFF];
+/// What the stock app's panel set-up leaves the brightness at.
+const START_BRIGHTNESS: u8 = 0x85;
 /// A press of the upper button shorter than this is a click.
 const CLICK_MS: u64 = 800;
+/// Automatic brightness moves the panel by at most `FADE_STEP` every
+/// `FADE_INTERVAL`: from darkest to brightest in about two seconds.
+const FADE_STEP: u8 = 4;
+const FADE_INTERVAL: Duration = Duration::from_millis(30);
 
 /// The panel and what is currently shown on it.
 struct Screen {
     panel: panel::Panel,
     visible: bool,
-    brightness: usize,
+    /// `None`: brightness follows the light. `Some(n)`: fixed at `BRIGHTNESS[n]`.
+    fixed: Option<usize>,
+    auto: AutoBrightness,
+    /// What the panel is set to now.
+    level: u8,
+    /// The last level written to the log.
+    level_logged: u8,
+    faded_at: Instant,
     last_button: &'static str,
     /// Uptime second the screen was last drawn for.
     drawn_for: Option<u64>,
@@ -122,12 +146,22 @@ struct Screen {
 impl Screen {
     fn new(panel: panel::Panel) -> Self {
         status::clear(panel.frame);
-        // 2 = the stock app's start-up brightness, which the panel is on now.
-        Self { panel, visible: true, brightness: 2, last_button: "no button yet", drawn_for: None, refresh_logged: false }
+        Self {
+            panel,
+            visible: true,
+            fixed: None,
+            auto: AutoBrightness::new(START_BRIGHTNESS),
+            level: START_BRIGHTNESS,
+            level_logged: START_BRIGHTNESS,
+            faded_at: Instant::now(),
+            last_button: "no button yet",
+            drawn_for: None,
+            refresh_logged: false,
+        }
     }
 
     /// React to a click: the upper button blanks and shows the picture,
-    /// the lower one steps the brightness.
+    /// the lower one steps the brightness (automatic, then the fixed steps).
     async fn click(&mut self, upper: bool, log: &mut Log) {
         let taken = if upper {
             self.visible = !self.visible;
@@ -135,15 +169,49 @@ impl Screen {
             let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
             self.panel.set_visible(self.visible).await
         } else {
-            self.brightness = (self.brightness + 1) % BRIGHTNESS.len();
             self.last_button = "lower: click";
-            let _ = writeln!(log.stamp(), "display: brightness step {} of {}", self.brightness + 1, BRIGHTNESS.len());
-            self.panel.set_brightness(BRIGHTNESS[self.brightness]).await
+            self.fixed = match self.fixed {
+                None => Some(0),
+                Some(n) if n + 1 < BRIGHTNESS.len() => Some(n + 1),
+                Some(_) => None,
+            };
+            match self.fixed {
+                Some(n) => {
+                    let _ = writeln!(log.stamp(), "display: brightness fixed, step {} of {}", n + 1, BRIGHTNESS.len());
+                    self.level = BRIGHTNESS[n];
+                    self.level_logged = self.level;
+                    self.panel.set_brightness(self.level).await
+                }
+                None => {
+                    let _ = writeln!(log.stamp(), "display: brightness automatic");
+                    true // `fade` takes it from here
+                }
+            }
         };
         if !taken {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
         self.drawn_for = None; // show the change at once
+    }
+
+    /// A new light reading, in lux.
+    fn ambient(&mut self, lux: u32) {
+        self.auto.feed(lux);
+    }
+
+    /// In automatic mode, move the panel one step towards the brightness
+    /// the light asks for. Call on every pass; does nothing most of the time.
+    async fn fade(&mut self, log: &mut Log) {
+        let wanted = self.auto.wanted();
+        if self.fixed.is_some() || !self.visible || self.level == wanted || self.faded_at.elapsed() < FADE_INTERVAL {
+            return;
+        }
+        self.faded_at = Instant::now();
+        let step = self.level.abs_diff(wanted).min(FADE_STEP);
+        self.level = if wanted > self.level { self.level + step } else { self.level - step };
+        if !self.panel.set_brightness(self.level).await {
+            let _ = writeln!(log.stamp(), "display: the panel did not take brightness {}", self.level);
+        }
     }
 
     /// Redraw and send the picture if a second has passed or something
@@ -160,6 +228,17 @@ impl Screen {
             return;
         }
         self.drawn_for = Some(uptime_s);
+        // Where automatic brightness has arrived, at most once a second.
+        if self.fixed.is_none() && self.level == self.auto.wanted() && self.level != self.level_logged {
+            let _ = writeln!(
+                log.stamp(),
+                "display: automatic brightness {} -> {} at {} lux",
+                self.level_logged,
+                self.level,
+                self.auto.lux()
+            );
+            self.level_logged = self.level;
+        }
         status::draw(
             self.panel.frame,
             &status::Status {
@@ -167,7 +246,8 @@ impl Screen {
                 readings,
                 light,
                 bluetooth_connected,
-                brightness: (self.brightness + 1, BRIGHTNESS.len()),
+                brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
+                brightness: self.level,
                 last_button: self.last_button,
             },
         );
@@ -190,30 +270,43 @@ impl Screen {
     }
 }
 
+/// How often the light sensor is read.
+const LIGHT_INTERVAL: Duration = Duration::from_millis(250);
+/// The sensor reads 0 until its first measurement is finished (measured:
+/// 0 after 22 ms, a real value after 270 ms), so wait this long after
+/// switching it on.
+const LIGHT_FIRST_READING: Duration = Duration::from_millis(400);
+
 /// The sensor bus and what is on it.
 struct Sensors {
     bus: light::Bus,
     light: Option<light::LightSensor>,
     last_raw: Option<light::Raw>,
-    /// Uptime second the light sensor was last read in.
-    read_for: Option<u64>,
+    /// From when the light sensor's values can be used.
+    ready_at: Instant,
+    /// When the light sensor was last read.
+    read_at: Option<Instant>,
+    /// Uptime second of the last reading written to the log.
+    logged_for: Option<u64>,
     logged: u32,
+    /// Highest light channel value logged so far.
+    brightest: u16,
 }
 
 impl Sensors {
-    /// Read the light sensor once a second. The first values and then one
+    /// Read the light sensor four times a second; returns the brightness in
+    /// lux when there is a new reading. The first values and then one
     /// reading every ten seconds go to the log.
-    fn poll(&mut self, log: &mut Log) {
-        let now = Instant::now().as_secs();
-        let Some(light) = self.light.as_mut() else {
-            return;
-        };
-        if self.read_for == Some(now) {
-            return;
+    fn poll(&mut self, log: &mut Log) -> Option<u32> {
+        let light = self.light.as_mut()?;
+        if Instant::now() < self.ready_at || self.read_at.is_some_and(|at| at.elapsed() < LIGHT_INTERVAL) {
+            return None;
         }
-        self.read_for = Some(now);
+        self.read_at = Some(Instant::now());
         self.last_raw = light.read(&mut self.bus);
-        if self.logged < 5 || now % 10 == 0 {
+        let now = Instant::now().as_secs();
+        if (self.logged < 5 || now % 10 == 0) && self.logged_for != Some(now) {
+            self.logged_for = Some(now);
             self.logged += 1;
             match self.last_raw {
                 Some(raw) => {
@@ -230,6 +323,21 @@ impl Sensors {
                 }
             }
         }
+        // Every new maximum (by a quarter or more) goes to the log, to see
+        // how the sensor behaves in bright light.
+        if let Some(raw) = self.last_raw {
+            if raw.light >= 1000 && raw.light as u32 * 4 >= self.brightest as u32 * 5 {
+                self.brightest = raw.light;
+                let _ = writeln!(
+                    log.stamp(),
+                    "light sensor: new maximum, {} lux (raw {} / {})",
+                    light::LightSensor::lux(raw),
+                    raw.light,
+                    raw.second
+                );
+            }
+        }
+        self.last_raw.map(light::LightSensor::lux)
     }
 }
 
@@ -256,14 +364,15 @@ async fn main_loop(
             }
         }
 
-        if !server.transferring() {
-            sensors.poll(&mut log);
-        }
+        let lux = if server.transferring() { None } else { sensors.poll(&mut log) };
 
         // Buttons: the upper one is ours, the lower one comes through the Apollo.
         let upper_click = matches!(buttons.poll(&mut log), Some(ButtonEvent::Released { held_ms }) if held_ms < CLICK_MS);
         let lower_click = apollo.as_mut().and_then(|a| a.take_key()) == Some(KeyEvent::Clicked);
         if let Some(screen) = screen.as_mut() {
+            if let Some(lux) = lux {
+                screen.ambient(lux);
+            }
             if upper_click {
                 screen.click(true, &mut log).await;
             }
@@ -271,6 +380,7 @@ async fn main_loop(
                 screen.click(false, &mut log).await;
             }
             if !server.transferring() {
+                screen.fade(&mut log).await;
                 screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_raw, server.connected, &mut log).await;
             }
         }

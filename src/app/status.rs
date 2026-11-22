@@ -28,8 +28,11 @@ pub struct Status<'a> {
     /// Raw light sensor values.
     pub light: Option<light::Raw>,
     pub bluetooth_connected: bool,
-    /// Brightness step, 1-based, and the number of steps.
-    pub brightness: (usize, usize),
+    /// Fixed brightness step, 1-based, and the number of steps; `None`
+    /// while the brightness follows the light.
+    pub brightness_step: Option<(usize, usize)>,
+    /// What the panel is set to, 0 to 255.
+    pub brightness: u8,
     pub last_button: &'a str,
 }
 
@@ -155,6 +158,13 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
     put(368, false, Rgb565::WHITE, 20, &mut line);
 
     let mut line = Line::new();
-    let _ = write!(line, "level {}/{}", s.brightness.0, s.brightness.1);
+    match s.brightness_step {
+        Some((step, of)) => {
+            let _ = write!(line, "level {}/{}", step, of);
+        }
+        None => {
+            let _ = write!(line, "auto {}", s.brightness);
+        }
+    }
     put(396, false, DIM, 10, &mut line);
 }

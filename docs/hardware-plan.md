@@ -30,7 +30,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
-| 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: approximate lux |
+| 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: approximate lux, automatic brightness |
 | 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
 | 13 | Real-time clock, backup domain | internal, LSE crystal | none | left running, not used |
@@ -122,11 +122,14 @@ stock app as a falling-edge interrupt, is not a button; it follows something
 else (it went high about 3.8 s after boot in one run and stayed low in
 another).
 
+**In use:** a click of the upper button (released within 800 ms) blanks
+and shows the display; a click of the lower one steps the brightness mode.
+
 Remaining:
-1. Click and long-press detection for the upper button, matching what the
-   Apollo does for the lower one.
-2. Use a button to switch the display off and on, and a long hold as a
-   "return to stock" gesture that does not depend on Bluetooth.
+1. Long-press detection for the upper button, matching what the Apollo
+   does for the lower one.
+2. A long hold as a "return to stock" gesture that does not depend on
+   Bluetooth.
 
 ### 3.3 Display, remaining work (item 4) - M
 
@@ -152,7 +155,7 @@ holds the light channel's gain (bits 5:4: x1, x4, x16, x64) and measurement
 time (bits 3:0); register 0x4E the second channel's gain (bits 5:4, plus a
 large step in bit 2). With the light channel at x64 and the second at x4,
 and the stock lux formula (`0x08077948`), an indoor desk reads about 270
-lux, steady within a few lux.
+lux in the evening and 400 to 550 lux by day, steady within a few lux.
 
 The stock driver's table of 14 register settings is in the app's compressed
 initial data and was not recovered; the gains above were found by
@@ -162,8 +165,28 @@ the stock formula, and the stock calibration offsets are not applied.
 The stock app also carries a driver for a second part at 0x53; this watch
 has the STK.
 
+**Range (measured with a phone torch):** the light channel rises smoothly
+from about 400 counts (room) to 59,000 with the torch at the glass, without
+saturating; its 16-bit limit is 65,535, so direct sun will exceed it at this
+gain. The sensor reads 0 until its first measurement is finished (within
+270 ms of switching on). The display's own light does not reach the sensor:
+the reading is the same with the display dark and at full brightness.
+
+**The lux formula jumps:** it multiplies by 1.36, 1.00, 0.78 or 0.63
+depending on the ratio of the two channels. Where the ratio crosses a
+limit the lux value steps (seen with the torch: 8301 lux at 6104 counts,
+then 8136 lux at 8136 counts). On the other hand, two room readings with
+quite different raw values (403 / 83 and 878 / 329) both came out at about
+550 lux, so the formula does compensate for the kind of light.
+
+**Automatic brightness** (`services::brightness`): four readings a second,
+averaged over about a second, mapped by our own curve (0 lux: 16, 250 lux:
+133, 5000 lux and above: 255), with hysteresis; the panel fades towards the
+result. The lower button steps through automatic and four fixed levels.
+
 Remaining:
-1. Automatic brightness: the screen follows the room light.
+1. Switch the gain down in very bright light, if lux above about 60,000
+   is ever needed (brightness is at its maximum long before).
 2. Recover the stock settings table (the app's data initialisation would
    have to be unpacked) if exact lux ever matters.
 
@@ -310,17 +333,15 @@ Would give a live log without Bluetooth.
 ## 5. Suggested order
 
 Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor (3.4).
+sensor and automatic brightness (3.4).
 
-1. **Automatic brightness** (3.4): small; finishes what the light sensor
-   is for.
-2. **Touch** (3.1): interaction.
-3. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
+1. **Touch** (3.1): interaction.
+2. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
    step 1): removes the two hard-coded values.
-4. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
-5. **Low power** (section 4): after that the watch can be worn.
-6. **Audio** (3.6).
-7. **GPS, pairing, BLE, NFC** as wanted.
+3. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
+4. **Low power** (section 4): after that the watch can be worn.
+5. **Audio** (3.6).
+6. **GPS, pairing, BLE, NFC** as wanted.
 
 ## 6. Open questions
 
