@@ -35,8 +35,11 @@
 
 pub const ACK: u32 = 3;
 pub const HEARTBEAT: u32 = 20;
-/// The Apollo's own log text (field 4, up to 200 bytes).
-pub const APOLLO_LOG: u32 = 4;
+/// A 200-byte binary block (field 4) with three small numbers (fields 1
+/// to 3), sent in pairs after the Apollo's start. Not its log text, which
+/// travels in blocks starting with 0x7F (see `log_setting`). What it holds
+/// has not been read.
+pub const DATA_BLOCK: u32 = 4;
 pub const TIME: u32 = 5;
 pub const OFF_WRIST: u32 = 11;
 pub const PIN: u32 = 7;

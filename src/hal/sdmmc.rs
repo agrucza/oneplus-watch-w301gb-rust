@@ -5,8 +5,11 @@
 //! manual (RM0432, SDMMC chapter) and the sequence of ST's `HAL_MMC_Init`
 //! that the stock bootloader uses.
 //!
-//! Deliberately simple for the first bring-up: polling, one block at a time,
-//! 1-bit bus (D0 only), 12 MHz. The stock firmware uses 4-bit at 48 MHz.
+//! Polling. `init` leaves the card at 12 MHz on one data line;
+//! `high_speed` switches card and controller to 48 MHz and
+//! `four_data_lines` to the 4-bit bus, as the stock app does (0x0804D93A
+//! and 0x0804D9D2 in B.70). Reads can cover several sectors per command
+//! (`read_sectors`); writes still go one sector at a time.
 //!
 //! Wiring (bootloader `HAL_MMC_MspInit`, 0x08007F66): CLK PC12, CMD PD2,
 //! D0..D3 PC8..PC11, all alternate function 12, pull-up, very high speed.
@@ -55,6 +58,9 @@ const CPSMEN: u32 = 1 << 12;
 
 const KERNEL_HZ: u32 = crate::hal::clocks::SDMMC_KERNEL_HZ;
 
+/// The card clock in Hz, for the data timeouts.
+static CARD_HZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(12_000_000);
+
 /// Set by `init`: cards up to 2 GB take byte addresses, larger ones sectors.
 static BYTE_ADDRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -93,6 +99,8 @@ pub enum Error {
     Stuck = 11,
     /// The card stayed busy, or reported an error, after a write.
     Program = 12,
+    /// The card did not take a change of its settings (CMD6).
+    Switch = 13,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -229,25 +237,98 @@ pub fn init() -> Result<u32, Error> {
     }
 
     set_clock(12_000_000);
+    CARD_HZ.store(12_000_000, core::sync::atomic::Ordering::Relaxed);
 
     // CMD16: 512-byte blocks.
     command(16, 512, Resp::Short, false).map_err(|_| Error::BlockLen)?;
     Ok(ocr)
 }
 
+fn card_hz() -> u32 {
+    CARD_HZ.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Write one byte of the card's extended settings (CMD6, "write byte"),
+/// wait until the card is done and check that it took the value.
+fn switch(index: u32, value: u32) -> Result<(), Error> {
+    command(6, 3 << 24 | index << 16 | value << 8, Resp::Short, false).map_err(|_| Error::Switch)?;
+    if !wait_not_busy(Duration::from_millis(500)) {
+        return Err(Error::Switch);
+    }
+    // Status (CMD13): bit 7 = the switch failed; bits 12:9 = state, 4 =
+    // ready for transfers.
+    let end = Instant::now() + Duration::from_millis(500);
+    loop {
+        match command(13, RCA << 16, Resp::Short, false) {
+            Ok(status) if status & 1 << 7 != 0 => return Err(Error::Switch),
+            Ok(status) if (status >> 9) & 0xF == 4 => return Ok(()),
+            Ok(_) => {}
+            Err(_) => return Err(Error::Switch),
+        }
+        if Instant::now() > end {
+            return Err(Error::Switch);
+        }
+    }
+}
+
+/// Switch the card to its high-speed timing and the clock to 48 MHz.
+///
+/// As the stock app (0x0804D93A in B.70): CMD6 with the argument
+/// 0x03B90100 (extended setting 185, "HS_TIMING", = 1), then the
+/// controller's clock divider 0 (the 48 MHz kernel clock undivided) with
+/// its high-speed bit (CLKCR bit 19) set.
+///
+/// On an error the card may be in either timing: call `init` again.
+pub fn high_speed() -> Result<(), Error> {
+    switch(185, 1)?;
+    unsafe { modify(CLKCR, 0x3FF, 1 << 19) };
+    CARD_HZ.store(KERNEL_HZ, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Switch the card and the controller to four data lines.
+///
+/// As the stock app (0x0804D9D2 in B.70): CMD6 with the argument
+/// 0x03B70100 (extended setting 183, "BUS_WIDTH", = 1), then the
+/// controller's bus width field (CLKCR bits 15:14) = 1.
+///
+/// On an error the card may be in either width: call `init` again.
+pub fn four_data_lines() -> Result<(), Error> {
+    switch(183, 1)?;
+    unsafe { modify(CLKCR, 0b11 << 14, 0b01 << 14) };
+    Ok(())
+}
+
 /// Read one 512-byte sector. `buf` is word-aligned because the controller's
 /// internal DMA writes it directly.
 pub fn read_sector(sector: u32, buf: &mut [u32; 128]) -> Result<(), Error> {
+    read_sectors(sector, buf)
+}
+
+/// Read consecutive sectors into `buf`, whose length in words must be a
+/// multiple of 128 (one sector) and at most 65535 sectors.
+///
+/// One sector goes as CMD17. More go as the stock app sends them
+/// (0x080864D6 in B.70): CMD23 with the number of sectors, then CMD18; the
+/// card stops by itself after that many, so no stop command is needed.
+pub fn read_sectors(sector: u32, buf: &mut [u32]) -> Result<(), Error> {
+    let count = (buf.len() / 128) as u32;
+    if count == 0 || buf.len() % 128 != 0 || count > 0xFFFF {
+        return Err(Error::Command);
+    }
     unsafe {
         write_volatile(ICR, ALL_FLAGS);
-        write_volatile(DTIMER, 12_000_000); // 1 s of card clock
-        write_volatile(DLENR, 512);
+        if count > 1 {
+            command(23, count, Resp::Short, false).map_err(|_| Error::Command)?;
+        }
+        write_volatile(DTIMER, card_hz()); // 1 s of card clock
+        write_volatile(DLENR, count * 512);
         write_volatile(IDMABASE0R, buf.as_mut_ptr() as u32);
         write_volatile(IDMACTRLR, 1); // internal DMA, single buffer
-        write_volatile(DCTRL, 9 << 4 | 1 << 1); // 512-byte block, card -> host
+        write_volatile(DCTRL, 9 << 4 | 1 << 1); // 512-byte blocks, card -> host
 
         let address = if byte_addressed() { sector.wrapping_mul(512) } else { sector };
-        let result = match command(17, address, Resp::Short, true) {
+        let result = match command(if count > 1 { 18 } else { 17 }, address, Resp::Short, true) {
             Err(_) => Err(Error::Command),
             Ok(_) => {
                 let end = Instant::now() + Duration::from_secs(2);
@@ -279,7 +360,7 @@ pub fn read_sector(sector: u32, buf: &mut [u32; 128]) -> Result<(), Error> {
 pub fn write_sector(sector: u32, buf: &[u32; 128]) -> Result<(), Error> {
     unsafe {
         write_volatile(ICR, ALL_FLAGS);
-        write_volatile(DTIMER, 24_000_000); // 2 s of card clock
+        write_volatile(DTIMER, 2 * card_hz()); // 2 s of card clock
         write_volatile(DLENR, 512);
         write_volatile(IDMABASE0R, buf.as_ptr() as u32);
         write_volatile(IDMACTRLR, 1); // internal DMA, single buffer

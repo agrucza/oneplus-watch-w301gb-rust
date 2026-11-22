@@ -40,6 +40,82 @@ impl fmt::Display for DeviceError {
 
 impl core::error::Error for DeviceError {}
 
+/// Sectors fetched with one command when a file is read front to back.
+const READ_AHEAD: usize = 64;
+
+/// The last run of sectors fetched ahead, and what is needed to notice
+/// reading in sequence.
+///
+/// The filesystem crate asks for one sector at a time, also when it reads
+/// a file from front to back, and in between it re-reads the allocation
+/// table. One command per sector costs about 0.15 ms each; a run of 64
+/// sectors with one command costs 2 ms (measured: 1 MB in 312 ms against
+/// 64 ms). So: a request for the sector right after the previous request,
+/// or right after the run, fetches a whole run; any other request (the
+/// allocation table, directories) is read on its own and leaves the run
+/// alone.
+struct ReadAhead {
+    first: u32,
+    /// Sectors in `data` that are valid; 0 = nothing.
+    count: u32,
+    /// The sector asked for last.
+    last: u32,
+    data: [u32; READ_AHEAD * 128],
+}
+
+struct SharedReadAhead(core::cell::UnsafeCell<ReadAhead>);
+// Safety: only touched from thread mode, by the one executor thread, and
+// never across an await.
+unsafe impl Sync for SharedReadAhead {}
+static AHEAD: SharedReadAhead =
+    SharedReadAhead(core::cell::UnsafeCell::new(ReadAhead { first: 0, count: 0, last: 0, data: [0; READ_AHEAD * 128] })); // all zero: takes no room in the image
+/// Diagnosis and safety valve: false switches reading ahead off.
+static AHEAD_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Switch reading ahead on or off (off also forgets what was fetched).
+pub fn set_read_ahead(on: bool) {
+    AHEAD_ON.store(on, core::sync::atomic::Ordering::Relaxed);
+    forget_read_ahead();
+}
+
+/// Forget what was fetched ahead; called after every write.
+fn forget_read_ahead() {
+    // Safety: see `SharedReadAhead`.
+    unsafe { (*AHEAD.0.get()).count = 0 };
+}
+
+/// Read `sector`, which lies in a partition that ends before `end`, using
+/// and filling the read-ahead run.
+fn read_cached(sector: u32, end: u32, out: &mut [u8; 512]) -> Result<(), DeviceError> {
+    // Safety: see `SharedReadAhead`.
+    let a = unsafe { &mut *AHEAD.0.get() };
+    let in_sequence = sector == a.last.wrapping_add(1) || (a.count != 0 && sector == a.first + a.count);
+    a.last = sector;
+    if !AHEAD_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return read_raw(sector, out);
+    }
+    if a.count == 0 || sector < a.first || sector >= a.first + a.count {
+        let run = (end.saturating_sub(sector) as usize).min(READ_AHEAD);
+        if !in_sequence || run < 2 {
+            return read_raw(sector, out);
+        }
+        a.count = 0;
+        if sdmmc::read_sectors(sector, &mut a.data[..run * 128]).is_err() {
+            // Do without reading ahead from here on, and try the plain way.
+            AHEAD_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+            return read_raw(sector, out);
+        }
+        a.first = sector;
+        a.count = run as u32;
+        crate::boot::watchdog::feed();
+    }
+    let words = &a.data[(sector - a.first) as usize * 128..][..128];
+    for (bytes, word) in out.chunks_exact_mut(4).zip(words) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    Ok(())
+}
+
 fn read_raw(sector: u32, out: &mut [u8; 512]) -> Result<(), DeviceError> {
     let mut aligned = [0u32; 128]; // the controller's DMA needs a word-aligned buffer
     sdmmc::read_sector(sector, &mut aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
@@ -128,7 +204,13 @@ impl BlockDevice for Emmc {
                 block.contents[510] = 0x55;
                 block.contents[511] = 0xAA;
             } else {
-                read_raw(sector, &mut block.contents)?;
+                let p = &self.partition;
+                let end = p.start.saturating_add(p.sectors);
+                if sector >= p.start && sector < end {
+                    read_cached(sector, end, &mut block.contents)?;
+                } else {
+                    read_raw(sector, &mut block.contents)?;
+                }
             }
         }
         Ok(())
@@ -149,6 +231,7 @@ impl BlockDevice for Emmc {
             for (word, bytes) in aligned.iter_mut().zip(block.contents.chunks_exact(4)) {
                 *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
+            forget_read_ahead();
             sdmmc::write_sector(sector, &aligned).map_err(|e| DeviceError::Emmc(e as u8))?;
             crate::boot::watchdog::feed();
         }

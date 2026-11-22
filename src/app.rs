@@ -51,11 +51,25 @@ pub async fn run(board: Board) {
     }
     let _ = ticket::report(ticket::STAGE_LOG, 0); // log works; the rest follows
 
+    if EMMC_HIGH_SPEED || EMMC_FOUR_LINES {
+        if !speed_up_card(&mut log) {
+            // No storage: leave, which resets and returns to the stock
+            // firmware, as for a card that never started.
+            let _ = ticket::report(ticket::STAGE_INIT_FAILED, 14);
+            return;
+        }
+        let _ = log.flush();
+    }
+
     let Ok(image_partition) = storage::inspect(IMAGE_VOLUME) else {
         let _ = writeln!(log.stamp(), "volume 1 not readable");
         let _ = log.flush();
         return;
     };
+    if !EMMC_TIMED_FILE.is_empty() {
+        time_read_ahead(image_partition, &mut log);
+        let _ = log.flush();
+    }
 
     // --- Bluetooth: become the watch the PC is paired with -----------------
     // If Bluetooth cannot be started there is no way to reach us, so fall
@@ -152,6 +166,192 @@ const CLICK_MS: u64 = 800;
 /// `FADE_INTERVAL`: from darkest to brightest in about two seconds.
 const FADE_STEP: u8 = 4;
 const FADE_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Run the card at 48 MHz instead of 12 (`sdmmc::high_speed`).
+const EMMC_HIGH_SPEED: bool = true;
+/// Run the card on four data lines instead of one (`sdmmc::four_data_lines`).
+const EMMC_FOUR_LINES: bool = true;
+/// Diagnosis: time reading this many sectors from the card at start, before
+/// and after each change; 0 = no timing (each change is then still checked
+/// by reading eight sectors before and after). Measured with 2048 sectors:
+/// 1049 ms at 12 MHz on one data line, 443 ms at 48 MHz, 312 ms on four
+/// data lines, 64 ms with 64 sectors per command.
+const EMMC_TIMED_SECTORS: u32 = 0;
+
+/// Read `EMMC_TIMED_SECTORS` sectors from the start of the card; returns
+/// the milliseconds it took and a sum over the data.
+fn time_card_read() -> Result<(u64, u32), sdmmc::Error> {
+    let mut buffer = [0u32; 128];
+    let mut sum = 0u32;
+    let start = Instant::now();
+    for sector in 0..EMMC_TIMED_SECTORS.max(8) {
+        sdmmc::read_sector(sector, &mut buffer)?;
+        sum = buffer.iter().fold(sum, |s, &w| s.rotate_left(1) ^ w);
+        if sector % 256 == 0 {
+            watchdog::feed();
+        }
+    }
+    Ok((start.elapsed().as_millis(), sum))
+}
+
+/// Diagnosis: a large file to read through the filesystem at start, once
+/// without and once with reading ahead; empty = no timing. Measured with
+/// `packetA/stm32/stm32_app.bin` (1,974,264 bytes): 944 ms sector by
+/// sector, 335 ms reading ahead.
+const EMMC_TIMED_FILE: &str = "";
+
+/// Read the whole of `EMMC_TIMED_FILE`; returns its length, a sum over its
+/// bytes and the milliseconds it took.
+fn time_file_read(partition: storage::Partition) -> Result<(u32, u32, u64), u8> {
+    let mut reader = storage::FileReader::open(partition, EMMC_TIMED_FILE)?;
+    let mut buffer = [0u8; 2048];
+    let (mut total, mut sum) = (0u32, 0u32);
+    let start = Instant::now();
+    loop {
+        let n = reader.read(&mut buffer).map_err(|()| 6u8)?;
+        if n == 0 {
+            break;
+        }
+        sum = buffer[..n].iter().fold(sum, |s, &b| s.rotate_left(1) ^ b as u32);
+        total += n as u32;
+        watchdog::feed();
+    }
+    reader.close();
+    Ok((total, sum, start.elapsed().as_millis()))
+}
+
+/// Diagnosis: time the same file without and with reading ahead and
+/// compare what was read.
+fn time_read_ahead(partition: storage::Partition, log: &mut Log) {
+    storage::set_read_ahead(false);
+    let plain = time_file_read(partition);
+    storage::set_read_ahead(true);
+    let ahead = time_file_read(partition);
+    match (plain, ahead) {
+        (Ok((len, sum, ms)), Ok((len_ahead, sum_ahead, ms_ahead))) => {
+            let _ = writeln!(
+                log.stamp(),
+                "storage: {} bytes of {} read in {} ms sector by sector, {} ms reading ahead, data {}",
+                len,
+                EMMC_TIMED_FILE,
+                ms,
+                ms_ahead,
+                if len == len_ahead && sum == sum_ahead { "identical" } else { "DIFFERENT" }
+            );
+            if len != len_ahead || sum != sum_ahead {
+                storage::set_read_ahead(false);
+                let _ = writeln!(log.stamp(), "storage: reading ahead switched off");
+            }
+        }
+        (plain, ahead) => {
+            let _ = writeln!(log.stamp(), "storage: file timing failed (plain {:?}, ahead {:?})", plain.err(), ahead.err());
+        }
+    }
+}
+
+/// Sectors per command in the multi-sector timing.
+const EMMC_CHUNK: usize = 64;
+
+/// Diagnosis: read the timed sectors again, `EMMC_CHUNK` per command, and
+/// compare with what the single reads delivered. False if a read failed:
+/// the card may then be stuck in the middle of a transfer.
+fn time_card_read_chunked(reference: u32, log: &mut Log) -> bool {
+    static mut BUFFER: [u32; EMMC_CHUNK * 128] = [0; EMMC_CHUNK * 128];
+    // Safety: used only here, from the one task that starts the card.
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+    let mut sum = 0u32;
+    let start = Instant::now();
+    let mut sector = 0;
+    while sector < EMMC_TIMED_SECTORS {
+        if let Err(e) = sdmmc::read_sectors(sector, buffer) {
+            let _ = writeln!(log.stamp(), "emmc: {} sectors per command failed at sector {} (error {})", EMMC_CHUNK, sector, e as u8);
+            return false;
+        }
+        sum = buffer.iter().fold(sum, |s, &w| s.rotate_left(1) ^ w);
+        sector += EMMC_CHUNK as u32;
+        watchdog::feed();
+    }
+    let _ = writeln!(
+        log.stamp(),
+        "emmc: {} sectors per command: read in {} ms, data {}",
+        EMMC_CHUNK,
+        start.elapsed().as_millis(),
+        if sum == reference { "identical" } else { "DIFFERENT" }
+    );
+    true
+}
+
+/// Apply one change to the card's bus and check it: the same sectors are
+/// read before and after, timed, and compared. False if the change failed
+/// or the data differs; the card is then in an unknown state.
+fn card_step(what: &str, reference: u32, change: fn() -> Result<(), sdmmc::Error>, log: &mut Log) -> bool {
+    match change().and_then(|()| time_card_read()) {
+        Ok((ms, sum)) => {
+            let same = sum == reference;
+            if EMMC_TIMED_SECTORS != 0 || !same {
+                let _ = writeln!(log.stamp(), "emmc: {}: read in {} ms, data {}", what, ms, if same { "identical" } else { "DIFFERENT" });
+            }
+            same
+        }
+        Err(e) => {
+            let _ = writeln!(log.stamp(), "emmc: {} failed (error {})", what, e as u8);
+            false
+        }
+    }
+}
+
+/// Bring the card's bus up to the stock firmware's speed, one step at a
+/// time. A step that fails is taken back by starting the card again and
+/// repeating the steps that worked. False only if the card could not be
+/// brought back: then there is no storage and the caller must give up.
+fn speed_up_card(log: &mut Log) -> bool {
+    let Ok((ms, reference)) = time_card_read() else {
+        let _ = writeln!(log.stamp(), "emmc: reading failed before any change");
+        return sdmmc::init().is_ok();
+    };
+    if EMMC_TIMED_SECTORS != 0 {
+        let _ = writeln!(log.stamp(), "emmc: 12 MHz, one data line: {} sectors read in {} ms", EMMC_TIMED_SECTORS, ms);
+    }
+    let steps: [(bool, &str, fn() -> Result<(), sdmmc::Error>); 2] =
+        [(EMMC_HIGH_SPEED, "48 MHz", sdmmc::high_speed), (EMMC_FOUR_LINES, "four data lines", sdmmc::four_data_lines)];
+    let mut done = 0;
+    for (n, &(wanted, what, change)) in steps.iter().enumerate() {
+        if !wanted {
+            break;
+        }
+        if card_step(what, reference, change, log) {
+            done = n + 1;
+            continue;
+        }
+        // Start the card again and repeat what worked before this step.
+        let _ = writeln!(log.stamp(), "emmc: taking \"{}\" back", what);
+        if sdmmc::init().is_err() {
+            let _ = writeln!(log.stamp(), "emmc: CARD RESTART FAILED");
+            return false;
+        }
+        for &(_, _, earlier) in &steps[..done] {
+            if earlier().is_err() {
+                // Even that fails now: stay at the slow settings.
+                return sdmmc::init().is_ok();
+            }
+        }
+        break;
+    }
+    if EMMC_TIMED_SECTORS != 0 && !time_card_read_chunked(reference, log) {
+        // Start the card again and repeat the steps that had worked.
+        let _ = writeln!(log.stamp(), "emmc: restarting the card after the failed read");
+        if sdmmc::init().is_err() {
+            let _ = writeln!(log.stamp(), "emmc: CARD RESTART FAILED");
+            return false;
+        }
+        for &(_, _, step) in &steps[..done] {
+            if step().is_err() {
+                return sdmmc::init().is_ok();
+            }
+        }
+    }
+    true
+}
 
 /// Diagnosis: write and read back the whole PSRAM at every start (about
 /// 4 s). On while the memory bus speed is being changed.

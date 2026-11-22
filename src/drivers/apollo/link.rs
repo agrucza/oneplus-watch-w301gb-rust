@@ -730,23 +730,10 @@ impl Apollo {
                     );
                 }
             }
-            if kind == Some(messages::APOLLO_LOG) {
-                // The Apollo's own log text, up to 200 bytes a message.
-                let number = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
-                let _ = writeln!(log.stamp(), "apollo log ({} {} {}):", number(1), number(2), number(3));
-                if let Some((_, Value::Bytes(text))) = Fields(payload).find(|&(tag, _)| tag == 4) {
-                    let end = text.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-                    for chunk in text[..end].chunks(32) {
-                        let mut out = [b'.'; 32];
-                        for (o, &b) in out.iter_mut().zip(chunk) {
-                            if b == b'\n' || (0x20..0x7F).contains(&b) {
-                                *o = b;
-                            }
-                        }
-                        let _ = log.write_str(core::str::from_utf8(&out[..chunk.len()]).unwrap_or(""));
-                    }
-                    let _ = log.write_str("\n");
-                }
+            if kind == Some(messages::DATA_BLOCK) {
+                // A 200-byte binary block the Apollo sends in pairs after
+                // its start; not text. The first one is logged in full by
+                // the "first message of kind" line, the rest only counted.
             }
             if kind == Some(messages::VERSION) {
                 // The Apollo's answer to our version text: its own.

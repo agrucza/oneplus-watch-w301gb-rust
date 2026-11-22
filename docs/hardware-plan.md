@@ -21,7 +21,7 @@ runs its own stack. Each chip below hangs off one of them.
 
 | # | Chip / function | Interface | Firmware file | State in Rust |
 |---|---|---|---|---|
-| 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works (1-bit, 12 MHz) |
+| 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works at the stock bus settings (4-bit, 48 MHz), reads 64 sectors per command; writes one sector per command |
 | 2 | Cypress CYW20721 Bluetooth | USART3 3 Mbaud (PC4, PC5, PB13, PB14), PB2, PC6, PB9, PC7 | `cypress/appdriver.bin`, `minidriver.bin` | works for existing pairings |
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking by button and by wrist gesture |
@@ -468,13 +468,40 @@ Steps:
    minutes.
 3. Firmware update path: leave alone.
 
-### 3.10 eMMC, remaining work (item 1) - S
+### 3.10 eMMC (item 1) - reading at stock speed, writing one sector at a time
 
-1. 4-bit bus and 48 MHz, as the stock firmware runs it.
-2. Multi-block transfers.
+The HAL has no driver for this chip's card controller (also not in the
+pinned upstream commit: its chip data lists SDMMC1 without registers), so
+`hal::sdmmc` works on the registers.
+
+Done and measured (2026-11-22), each step as the stock app does it (B.70)
+and each checked at start by reading the same sectors before and after:
+
+| Step | Stock | 1 MB read in |
+|---|---|---|
+| as before: 12 MHz, one data line, one sector per command | | 1049 ms |
+| 48 MHz: CMD6 `0x03B90100`, clock undivided, high-speed bit | `0x0804D93A` | 443 ms |
+| four data lines: CMD6 `0x03B70100`, 4-bit bus | `0x0804D9D2` | 312 ms |
+| 64 sectors per command: CMD23 + CMD18 | `0x080864D6` | 64 ms |
+
+A step that fails is taken back by restarting the card; if the card cannot
+be restarted the image gives up and the watch returns to stock.
+
+The filesystem crate (embedded-sdmmc 0.10) reads and writes exactly one
+sector per call. `services::storage` therefore reads ahead: a request for
+the sector after the previous one fetches a run of 64 with one command.
+Measured on a 1.97 MB file: 944 ms sector by sector, 335 ms reading ahead.
+
+Remaining:
+1. Writing several sectors per command (stock: CMD23 + CMD25). The driver
+   writes one sector per command, and the filesystem crate never asks for
+   more, so this only pays off together with collecting writes in the
+   storage layer.
+2. A one-sector memory for the allocation table: the crate re-reads the
+   same table sector for every cluster of a file.
 3. Card capacity from the card instead of a constant.
-
-Only worth it when file speed starts to matter (resources, audio).
+4. The power-off notice the stock app gives the card (CMD6 `0x03220100` at
+   start, `0x03220200` before switching it off).
 
 ### 3.11 PSRAM, remaining work (item 5) - S
 
@@ -535,9 +562,10 @@ pulses (3.5).
 Decided 2026-11-22: bring what works up to the stock firmware's level
 before adding new chips.
 
-1. **Full speed underneath:** 120 MHz system clock (section 4) and PSRAM
-   timing (3.11): done. Left: eMMC with four data lines at 48 MHz and
-   multi-block transfers (3.10).
+1. **Full speed underneath:** 120 MHz system clock (section 4), PSRAM
+   timing (3.11), eMMC at 48 MHz on four data lines with multi-sector
+   reads (3.10): done. Left there: multi-sector writes and the small
+   items listed in 3.10.
 2. **Display pipeline** (3.3): regional updates, second frame buffer.
 3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
    press (3.2), clock backup file (3.12).
