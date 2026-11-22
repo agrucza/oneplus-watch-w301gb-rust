@@ -13,7 +13,8 @@
 //! |     7 | not known                       | 1..4 numbers                                  |
 //! |    20 | heartbeat                       | 2 = 0xA5A5A5A5 from the Apollo                |
 //! |    43 | barometer ("BAR")               | 1 time ms, 2 pressure Pa, 3 altitude m        |
-//! |    45 | wear detection ("CAP", isWear)  | 1 time ms, 2 state                            |
+//! |    44 | heart rate, SpO2, stress        | 1 time ms, 2 bpm, 5 SpO2, 7 stress, 8 type, 25 status |
+//! |    45 | wear detection                  | 1 time ms, 2 state (2 = on the wrist, 1 = not), 3 reason |
 //! |    47 | battery ("Bat Receive")         | 1 time ms, 2 usb, 3 percent, 5 millivolts     |
 //! |    50 | temperatures ("NTC msg")        | 1 time ms, 2..4 degrees Celsius               |
 //! |    51 | lower button                    | 2 event (see `KeyEvent`), 3 Apollo uptime ms  |
@@ -21,18 +22,216 @@
 //! |    54 | sensor status (unconfirmed)     | 1 time ms, 3, 4, 8 numbers                    |
 //! |    59 | Apollo's own reset info         | 1 shutdown type, 2 reset reason               |
 //! |    80 | 180-byte record, type 19        | 1 time s, 2 type, 3 bytes                     |
+//! |    84 | vibration motor (to the Apollo) | see `motor_pulses`                            |
+//! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
+//! |   140 | setup status (to the Apollo)    | see `setup_finished`                          |
 //! |    81 | daily-activity record, type 42  | 1 time s, 2 type, 3 bytes                     |
 //!
 //! Times are the watch's real-time clock as Unix time.
 
 pub const ACK: u32 = 3;
 pub const HEARTBEAT: u32 = 20;
+pub const TIME: u32 = 5;
+pub const PIN: u32 = 7;
+pub const VERSION: u32 = 6;
+pub const SENSOR_NAMES: u32 = 52;
 pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
 pub const BATTERY: u32 = 47;
 pub const TEMPERATURES: u32 = 50;
 pub const KEY: u32 = 51;
 pub const RESET_INFO: u32 = 59;
+pub const MOTOR: u32 = 84;
+pub const HEART: u32 = 44;
+pub const HEART_RATE_SET: u32 = 123;
+pub const SETUP_STATUS: u32 = 140;
+pub const DO_NOT_DISTURB: u32 = 122;
+pub const SEDENTARY: u32 = 125;
+
+/// Builds a sub-message field by field. Fields with the value zero are
+/// left out, as the encoding has it.
+pub struct Encoder {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl Encoder {
+    pub fn new() -> Self {
+        Self { bytes: [0; 64], len: 0 }
+    }
+
+    /// Add a number field (field numbers up to 15).
+    pub fn number(mut self, field: u8, mut value: u32) -> Self {
+        if value == 0 || self.len + 6 > self.bytes.len() {
+            return self;
+        }
+        self.bytes[self.len] = field << 3;
+        self.len += 1;
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            self.bytes[self.len] = if value == 0 { byte } else { byte | 0x80 };
+            self.len += 1;
+            if value == 0 {
+                return self;
+            }
+        }
+    }
+
+    /// Add a text field (field numbers up to 15); longer text is cut.
+    pub fn text(mut self, field: u8, text: &str) -> Self {
+        let room = self.bytes.len().saturating_sub(self.len + 2);
+        let n = text.len().min(room).min(127);
+        if n == 0 {
+            return self;
+        }
+        self.bytes[self.len] = field << 3 | 2;
+        self.bytes[self.len + 1] = n as u8;
+        self.bytes[self.len + 2..self.len + 2 + n].copy_from_slice(&text.as_bytes()[..n]);
+        self.len += 2 + n;
+        self
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+// What the stock app sends when the Apollo has started. Its trigger is the
+// Apollo's list of sensor chips (kind 52): the handler at 0x0806CFE8
+// acknowledges it and calls 0x080AB4BC, which sends the time (kind 5), the
+// STM32 firmware's version text (kind 6) and then the settings, beginning
+// with the setup status (kind 140, see `setup_finished`).
+
+/// The time: field 2 = seconds since 1970 (GMT), field 3 = time zone in
+/// minutes (stock sender 0x0806D594). We keep local time only, so local
+/// time goes out as GMT with a zone of zero.
+pub fn time(unix_seconds: u32) -> Encoder {
+    Encoder::new().number(2, unix_seconds)
+}
+
+/// Answer to the Apollo's question for the board revision.
+///
+/// After its start the Apollo sends kind 7 with field 1 = 11 and field
+/// 4 = 1 ("get", from its main task near 0x3FDB8) and repeats it until it
+/// is answered. The stock app answers with kind 7, field 3 = the revision
+/// and field 4 = 2 (0x0805C654); the Apollo then stores the revision
+/// (its handler at 0x3F1BA; it logs "HardWareVer get report ok").
+pub fn revision_answer(revision: u8) -> Encoder {
+    Encoder::new().number(3, revision as u32).number(4, 2)
+}
+
+/// True if a kind 7 message is the Apollo's question for the board
+/// revision.
+pub fn asks_for_revision(payload: &[u8]) -> bool {
+    let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+    field(1) == 11 && field(4) == 1
+}
+
+/// The STM32 firmware's version text: field 1 = 1, field 2 = the text, up
+/// to 47 characters (stock sender 0x0806D5E8; the stock text is
+/// "CONBINE_LTAQ4002_0664_202109111518").
+pub fn version(text: &str) -> Encoder {
+    Encoder::new().number(1, 1).text(2, text)
+}
+
+/// Motor command "custom vibration": `count` pulses of `on_ms`, `off_ms`
+/// apart.
+///
+/// From the stock app's `service_LinearMotor_Control` (0x08091BD4), which
+/// sends kind 84 for every vibration. Its table of effects at 0x081C54C0
+/// gives the type and the numbers; for type 2 the sender at 0x08091B1A
+/// fills field 1 = 1 (on), 2 = number of pulses, 3 = pause in ms, 5 = 2
+/// (the type) and 9 = pulse length in ms. Examples from the table: one
+/// pulse of 200 ms, one of 1000 ms, two of 200 ms with 100 ms between.
+pub fn motor_pulses(on_ms: u16, off_ms: u16, count: u8) -> Encoder {
+    Encoder::new().number(1, 1).number(2, count as u32).number(3, off_ms as u32).number(5, 2).number(9, on_ms as u32)
+}
+
+/// Tell the Apollo that the watch is past its first-time setup.
+///
+/// Without this the Apollo never detects the wrist, and without a wrist it
+/// does not switch the heart-rate sensor on:
+///
+///   - The stock app sends kind 140 with the value 3 when setup is over
+///     (0x08033CBC, log text "SEND OOBE status").
+///   - The Apollo's handler for it (`lcAlgoOOBEStatusSet`, 0x151B2 in its
+///     image) stores the value and, if it is 3, switches its capacitive
+///     wear detection on (`lcAlgoOffbodySwitchCap`).
+///   - Its wrist check (`lcAlgoWearWristCheckExe`) then sets the wear state
+///     to 8 once both the capacitive sensor and the optical sensor see
+///     skin, and `lcAlgoHeartRateEnable` does nothing unless the state is 8.
+///
+/// The Apollo keeps the value in its own flash.
+pub fn setup_finished() -> Encoder {
+    Encoder::new().number(1, 3)
+}
+
+// Settings. After the setup status the stock app sends its settings to the
+// Apollo, in this order (0x08033D38): do-not-disturb (kind 122), sedentary
+// reminder (125), a daily time window that switches the Apollo's algorithm
+// 13 (kind 121, probably raise-to-wake), heart-rate monitoring (123) with
+// stress monitoring (135), kind 142, SpO2 monitoring (124) and kind 130.
+// Only the first two are read through on both sides and sent here; the
+// values are "off" until this firmware has settings of its own.
+
+/// A time of day in minutes since midnight.
+pub type Minutes = u16;
+
+/// Do-not-disturb: switched on or off, with up to two daily time windows.
+///
+/// Stock sender 0x0806D6CE, called from 0x0803394A; the Apollo's
+/// `lcSensorDisturbSet` (0x146FC in its image) logs the fields as
+/// "onOff, 0: start~end, 1: start~end". With nothing set the stock app
+/// sends off, a first window of the whole day and an unused second one
+/// (0xFFFF).
+pub fn do_not_disturb(on: bool, first: (Minutes, Minutes), second: Option<(Minutes, Minutes)>) -> Encoder {
+    let second = second.unwrap_or((0xFFFF, 0xFFFF));
+    Encoder::new()
+        .number(1, on as u32)
+        .number(2, first.0 as u32)
+        .number(3, first.1 as u32)
+        .number(4, second.0 as u32)
+        .number(5, second.1 as u32)
+}
+
+/// Sedentary reminder: up to two daily time windows in which the Apollo
+/// reminds the wearer to move; `None` switches a window off.
+///
+/// Stock sender 0x0806D840, called from 0x08033C16 with the stock setting
+/// 0xA8; the Apollo stores the message and switches its "sedentary"
+/// algorithm (number 7) by field 1 (its event 13, 0x1544E).
+pub fn sedentary(first: Option<(Minutes, Minutes)>, second: Option<(Minutes, Minutes)>) -> Encoder {
+    let (a, b) = (first.unwrap_or((0, 0)), second.unwrap_or((0, 0)));
+    Encoder::new()
+        .number(1, first.is_some() as u32)
+        .number(2, a.0 as u32)
+        .number(3, a.1 as u32)
+        .number(4, second.is_some() as u32)
+        .number(5, b.0 as u32)
+        .number(6, b.1 as u32)
+}
+
+/// Start or stop a single heart-rate measurement.
+///
+/// The stock app sends kind 123 from `sendHeartRateSet` (0x0806D70A); the
+/// Apollo hands it to `lcSensorHeartRateSet`. Field 8 is the mode: the
+/// stock app's measurement screen uses 3 (0x0805289A); 2 belongs to the
+/// stress measurement, which sends a second message with it, and the other
+/// values to automatic monitoring. Measured: with mode 2 alone the Apollo
+/// acknowledges and measures nothing.
+///
+/// The fields for mode 3: 1 = on, 3 = 40, 7 = 1, 8 = 3, and 2 and 4 from
+/// the stock app's heart-rate settings, sent as zero here. What 3, 2 and 4
+/// mean is not known. Results come back as kind `HEART`.
+pub fn heart_rate(on: bool) -> Encoder {
+    Encoder::new().number(1, on as u32).number(3, 40).number(7, 1).number(8, 3)
+}
+
+/// Motor command "stop" (stock: 0x08091D18): field 1 = 0, field 5 = 6.
+pub fn motor_stop() -> Encoder {
+    Encoder::new().number(5, 6)
+}
 
 /// One protobuf field value.
 #[derive(Clone, Copy)]
@@ -110,6 +309,10 @@ pub struct Readings {
     pub worn: Option<bool>,
     /// The Apollo's reported (shutdown type, reset reason).
     pub apollo_reset: Option<(u32, u32)>,
+    /// Heart rate in beats per minute from the latest heart report (kind
+    /// `HEART`, field 2; the stock app logs that field as "hr" at
+    /// 0x0806CB8A). 0 while the Apollo has no result yet.
+    pub heart_bpm: Option<u32>,
 }
 
 impl Readings {
@@ -138,8 +341,13 @@ impl Readings {
                 }
             }
             WEAR => {
-                // An absent field means zero in this encoding.
-                self.worn = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0) != 0);
+                // The Apollo sends 2 when its wear state is "on the wrist"
+                // and 1 otherwise (`lcAlgo_send_offbody_reminder`, 0x32E78
+                // in its image).
+                self.worn = Some(field(2).and_then(|v| v.as_u32()) == Some(2));
+            }
+            HEART => {
+                self.heart_bpm = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0));
             }
             RESET_INFO => {
                 let n = |i| field(i).and_then(|v| v.as_u32()).unwrap_or(0);

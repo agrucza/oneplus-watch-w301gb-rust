@@ -15,11 +15,13 @@
 //! | Sensor bus | I2C2: PF1 clock, PF0 data (external pull-ups); light sensor 0x45, NFC 0x28, a device at 0x36 | `SensorBus`, `drivers::light` |
 //! | Touch controller | I2C3: PC0 clock, PB4 data (external pull-ups), address 0x24; PF13 reset, PF4 enable, PA0 interrupt | `drivers::touch` |
 //! | Upper button | PC13 | `drivers::buttons` |
+//! | Board revision | ADC1 channel 15 on PB0 (a resistor divider) | `RevisionPin` |
 //! | Crystals | PH0, PH1 (24 MHz); PC14, PC15 (32.768 kHz) | `hal::clocks` |
 //!
 //! The lower button is on the Apollo. See `docs/hardware-plan.md` for the
 //! chips that are not driven yet and their pins.
 
+use embassy_stm32::adc::{Adc, SampleTime};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::{peripherals, Peri, Peripherals};
 use embassy_stm32::i2c::{self, I2c};
@@ -36,6 +38,7 @@ pub struct Board {
     pub upper_button: Peri<'static, peripherals::PC13>,
     pub sensor_bus: SensorBus,
     pub touch: touch::Resources,
+    pub revision: RevisionPin,
 }
 
 /// The enables the bootloader's `bsp_gpio_power_init` sets. Which of them
@@ -86,8 +89,62 @@ impl Board {
             },
             upper_button: p.PC13,
             sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
+            revision: RevisionPin { adc: p.ADC1, pin: p.PB0 },
             touch: touch::Resources { i2c: p.I2C3, scl: p.PC0, sda: p.PB4, reset: p.PF13, enable: p.PF4, irq: p.PA0 },
         }
+    }
+}
+
+/// The board revision, coded as a voltage on PB0.
+#[allow(dead_code)] // not measured yet, see `app::run`
+pub struct RevisionPin {
+    adc: Peri<'static, peripherals::ADC1>,
+    pin: Peri<'static, peripherals::PB0>,
+}
+
+#[allow(dead_code)] // not measured yet, see `app::run`
+impl RevisionPin {
+    /// Measure the voltage and return the revision number the stock app
+    /// derives from it, with the average reading for the log.
+    ///
+    /// The stock app does this once at start (`0x0805C7A4`): five
+    /// conversions, the highest and lowest dropped, the rest averaged and
+    /// taken as a fraction of 1.8 V. Its classification, found by running
+    /// that routine in an emulator for every possible reading: below 1.55 V
+    /// revision 3, from 1.55 V revision 0, from 1.60 V revision 2; a
+    /// reading of zero leaves its start value 0. The Apollo asks for this
+    /// number after it has started and names the revisions B280_DVT (0),
+    /// B280_PVT (1) and B281_DVT (2).
+    ///
+    /// Before this is used, the converter's clock source has to be chosen
+    /// in `hal::clocks` (`config.rcc.mux.adcsel`); it is left alone for now.
+    pub fn measure(mut self) -> (u8, u16) {
+        let mut adc = Adc::new(self.adc);
+        // The HAL calibrates at the full system clock, which is above the
+        // converter's limit. Divide the clock by 128 as the stock app does
+        // (its ADC set-up at 0x0808F224) and calibrate again.
+        embassy_stm32::pac::ADC1_COMMON.ccr().modify(|w| w.0 = (w.0 & !(0xF << 18)) | 0b1010 << 18);
+        embassy_stm32::pac::ADC1.cr().modify(|w| w.0 = (w.0 & 0x3000_0000) | 1 << 31); // start calibration
+        for _ in 0..2_000_000 {
+            if embassy_stm32::pac::ADC1.cr().read().0 & 1 << 31 == 0 {
+                break;
+            }
+        }
+        let mut samples = [0u16; 5];
+        for sample in samples.iter_mut() {
+            *sample = adc.blocking_read(&mut self.pin, SampleTime::CYCLES2_5);
+        }
+        let sum: u32 = samples.iter().map(|&s| s as u32).sum();
+        let lowest = *samples.iter().min().unwrap_or(&0) as u32;
+        let highest = *samples.iter().max().unwrap_or(&0) as u32;
+        let average = ((sum - lowest - highest) / 3) as u16;
+        let revision = match average {
+            0 => 0,
+            1..=3527 => 3,
+            3528..=3640 => 0,
+            _ => 2,
+        };
+        (revision, average)
     }
 }
 

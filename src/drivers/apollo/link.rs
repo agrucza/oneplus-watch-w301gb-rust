@@ -43,6 +43,7 @@ use embassy_stm32::{peripherals, Peri};
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::hal::reg::{RCC_AHB1ENR, RCC_APB2ENR, modify};
+use crate::hal::rtc;
 use crate::drivers::apollo::messages::{self as messages, Fields, Readings, Value};
 use crate::services::log::Log;
 use crate::boot::ticket::crc8;
@@ -54,6 +55,21 @@ const HEARTBEAT: u32 = messages::HEARTBEAT;
 const ACK: u32 = messages::ACK;
 /// Frame flag: the sender wants an acknowledgement.
 const FLAG_WANTS_ACK: u8 = 0x02;
+/// How often the setup status is tried, and the pause between tries.
+const SETUP_TRIES: u32 = 10;
+const SETUP_RETRY: Duration = Duration::from_secs(3);
+// Parts of the stock start-up exchange that are written but switched off:
+// each is sent by the stock app, but what the Apollo does with it has not
+// been read through yet. One is switched on at a time, once it has been.
+
+/// Time (kind 5) and version text (kind 6) after the Apollo's announcement.
+const SEND_TIME_AND_VERSION: bool = false;
+/// Do-not-disturb and sedentary settings after the setup status.
+const SEND_SETTINGS: bool = false;
+/// The answer to the Apollo's question for the board revision.
+const ANSWER_REVISION: bool = false;
+/// How this firmware names itself to the Apollo.
+const VERSION_TEXT: &str = "W301_RUST";
 /// The stock app's own heartbeat period.
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30 * 60);
 
@@ -113,6 +129,21 @@ pub struct Apollo {
     next_heartbeat: Instant,
     /// The Apollo asked for a heartbeat and has not had one yet.
     heartbeat_wanted: bool,
+    /// Heart reports written to the log since the last start.
+    heart_logged: u32,
+    /// The board revision to answer the Apollo's question with, and
+    /// whether the question is waiting for its answer.
+    revision: u8,
+    revision_asked: bool,
+    revision_answers: u32,
+    /// Setup status: when to send it next, the sequence number it went
+    /// out with, how often it was tried, and whether the Apollo has
+    /// acknowledged it.
+    setup_due: Option<Instant>,
+    setup_sequence: u32,
+    setup_tries: u32,
+    setup_acknowledged: bool,
+    settings_sent: bool,
     /// Frames to acknowledge: (sequence, kind).
     acks: [(u32, u32); 8],
     acks_pending: usize,
@@ -167,6 +198,15 @@ impl Apollo {
             sequence: 0,
             next_heartbeat: Instant::now() + HEARTBEAT_PERIOD,
             heartbeat_wanted: false,
+            heart_logged: 0,
+            revision: 0,
+            revision_asked: false,
+            revision_answers: 0,
+            setup_due: None,
+            setup_sequence: 0,
+            setup_tries: 0,
+            setup_acknowledged: false,
+            settings_sent: false,
             acks: [(0, 0); 8],
             acks_pending: 0,
             blocks_received: 0,
@@ -331,6 +371,53 @@ impl Apollo {
                 let _ = writeln!(log.stamp(), "apollo: heartbeat not taken within 1 s");
             }
         }
+        if self.revision_asked {
+            self.revision_asked = false;
+            self.revision_answers += 1;
+            if ANSWER_REVISION {
+                if self.revision_answers <= 5 {
+                    let _ = writeln!(log.stamp(), "apollo: asked for the board revision; answering {}", self.revision);
+                }
+                self.send(messages::PIN, messages::revision_answer(self.revision).as_bytes(), log).await;
+            } else if self.revision_answers == 1 {
+                let _ = writeln!(log.stamp(), "apollo: asked for the board revision (not answered yet)");
+            }
+        }
+        // What the stock app sends when the Apollo has announced itself
+        // (see `messages::time`): the time and our version once, then the
+        // setup status. Without the setup status the Apollo's wear
+        // detection stays off. Measured: sent right after the first
+        // heartbeat, before the Apollo's announcement, the Apollo takes
+        // the setup status but does not act on it; so it is repeated until
+        // the Apollo acknowledges it.
+        if SEND_TIME_AND_VERSION && self.setup_tries == 0 && self.setup_due.is_some_and(|due| Instant::now() >= due) {
+            match rtc::now() {
+                Some(t) => {
+                    self.send(messages::TIME, messages::time(t.unix_seconds()).as_bytes(), log).await;
+                }
+                None => {
+                    let _ = writeln!(log.stamp(), "apollo: no time to send, the clock is not set");
+                }
+            }
+            self.send(messages::VERSION, messages::version(VERSION_TEXT).as_bytes(), log).await;
+        }
+        if !self.setup_acknowledged && self.setup_tries < SETUP_TRIES && self.setup_due.is_some_and(|due| Instant::now() >= due) {
+            self.setup_tries += 1;
+            self.setup_due = Some(Instant::now() + SETUP_RETRY);
+            if self.send(messages::SETUP_STATUS, messages::setup_finished().as_bytes(), log).await {
+                self.setup_sequence = self.sequence;
+            }
+            if self.setup_tries == SETUP_TRIES {
+                let _ = writeln!(log.stamp(), "apollo: setup status never acknowledged; wear detection will stay off");
+            }
+        }
+        // The settings follow the setup status, as in the stock app. Until
+        // this firmware has settings of its own: everything off.
+        if SEND_SETTINGS && self.setup_acknowledged && !self.settings_sent {
+            self.settings_sent = true;
+            self.send(messages::DO_NOT_DISTURB, messages::do_not_disturb(false, (0, 1439), None).as_bytes(), log).await;
+            self.send(messages::SEDENTARY, messages::sedentary(None, None).as_bytes(), log).await;
+        }
         if Instant::now() >= self.next_summary {
             self.next_summary = Instant::now() + Duration::from_secs(60);
             if self.counts.iter().any(|&c| c != 0) {
@@ -347,7 +434,62 @@ impl Apollo {
         }
     }
 
-    /// One line with the latest sensor values.
+    /// Send one message of `kind` with the given sub-message. False if the
+    /// Apollo did not take the block within a second. The Apollo answers
+    /// with an acknowledgement, which `digest_block` logs.
+    pub async fn send(&mut self, kind: u32, payload: &[u8], log: &mut Log) -> bool {
+        let mut body = [0u8; 80];
+        if payload.len() > body.len() - 16 {
+            return false;
+        }
+        self.sequence += 1;
+        body[0] = 0x08;
+        let mut n = 1 + put_varint(&mut body[1..], self.sequence);
+        n += put_varint(&mut body[n..], kind << 3 | 2);
+        n += put_varint(&mut body[n..], payload.len() as u32);
+        body[n..n + payload.len()].copy_from_slice(payload);
+        n += payload.len();
+        self.tx.fill(0);
+        self.push_frame(0, &body[..n]);
+        let taken = self.send_block().await;
+        let _ = writeln!(
+            log.stamp(),
+            "apollo: kind {} {} (sequence {}):",
+            kind,
+            if taken { "sent" } else { "NOT taken within 1 s" },
+            self.sequence
+        );
+        log.hex(&body[..n]);
+        taken
+    }
+
+    /// Vibrate: `count` pulses of `on_ms`, `off_ms` apart.
+    pub async fn vibrate(&mut self, on_ms: u16, off_ms: u16, count: u8, log: &mut Log) -> bool {
+        self.send(messages::MOTOR, messages::motor_pulses(on_ms, off_ms, count).as_bytes(), log).await
+    }
+
+    /// Tell the driver the board revision, for the Apollo's question.
+    #[allow(dead_code)] // unused while `ANSWER_REVISION` is off
+    pub fn set_revision(&mut self, revision: u8) {
+        self.revision = revision;
+    }
+
+    /// Start or stop a heart-rate measurement. Results arrive in
+    /// `readings.heart_bpm`.
+    pub async fn measure_heart_rate(&mut self, on: bool, log: &mut Log) -> bool {
+        if !on {
+            self.readings.heart_bpm = None;
+        }
+        self.heart_logged = 0;
+        self.send(messages::HEART_RATE_SET, messages::heart_rate(on).as_bytes(), log).await
+    }
+
+    /// Stop a vibration that is still going.
+    #[allow(dead_code)] // not needed yet: the pulses in use end by themselves
+    pub async fn stop_vibration(&mut self, log: &mut Log) -> bool {
+        self.send(messages::MOTOR, messages::motor_stop().as_bytes(), log).await
+    }
+
     /// The lower button's most significant event since the last call.
     pub fn take_key(&mut self) -> Option<messages::KeyEvent> {
         self.key_pending.take()
@@ -417,8 +559,51 @@ impl Apollo {
                     let _ = writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at);
                 }
             }
+            if kind == Some(messages::PIN) && messages::asks_for_revision(payload) {
+                self.revision_asked = true;
+            }
+            if kind == Some(messages::SENSOR_NAMES) && self.setup_due.is_none() {
+                // The Apollo has announced itself: the stock app's moment
+                // for its start-up messages.
+                self.setup_due = Some(Instant::now());
+            }
+            if kind == Some(messages::WEAR) {
+                // Rare (only when the state changes), so every one is logged.
+                let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+                let _ = writeln!(
+                    log.stamp(),
+                    "apollo: wear state {} ({}), reason {}",
+                    field(2),
+                    if field(2) == 2 { "on the wrist" } else { "not on the wrist" },
+                    field(3)
+                );
+            }
+            if kind == Some(messages::HEART) && self.heart_logged < 300 {
+                // Every report in full while this is new, to learn the fields.
+                self.heart_logged += 1;
+                let _ = write!(log.stamp(), "apollo: heart report:");
+                for (tag, value) in Fields(payload) {
+                    if let Some(v) = value.as_u32() {
+                        let _ = write!(log, " {}={}", tag, v);
+                    }
+                }
+                let _ = writeln!(log);
+            }
             if kind == Some(HEARTBEAT) {
                 self.heartbeat_wanted = true;
+            }
+            if kind == Some(ACK) {
+                // Acknowledgements of our heartbeats come every few seconds
+                // and are not worth a line; the others are.
+                let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+                if field(2) != HEARTBEAT {
+                    let _ = writeln!(log.stamp(), "apollo: acknowledged our kind {} (sequence {})", field(2), field(1));
+                }
+                // Matched by sequence number: the kind the Apollo names is
+                // not always the one it answers.
+                if self.setup_tries > 0 && field(1) == self.setup_sequence {
+                    self.setup_acknowledged = true;
+                }
             }
             if block[i + 3] & FLAG_WANTS_ACK != 0 && self.acks_pending < self.acks.len() {
                 if let (Some(sq), Some(k)) = (sequence, kind) {

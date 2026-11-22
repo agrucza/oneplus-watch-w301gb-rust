@@ -1,6 +1,6 @@
 # W301 hardware bring-up plan
 
-Written 2026-11-21, updated as chips come up, from the firmware files in the watch dump
+Written 2026-11-21, updated as chips come up. The aim is every feature of every chip; a chip is not finished while its section lists open items, from the firmware files in the watch dump
 (`~/opwatch/work/dump/mirror`), the stock bootloader and app disassembly, and
 what the Rust firmware has measured on the watch so far.
 
@@ -85,7 +85,8 @@ Other pins the stock app sets up:
 | PF2 | output | unknown (not the touch reset) |
 | PG2 | interrupt on rising edge, pull-down | unknown (not the touch interrupt) |
 | PA4, PB3 | outputs, driven low at start | unknown |
-| PB1 | output | unknown, set up with the ADC pin PB0 |
+| PB0 | analog input, ADC1 channel 15 | board revision (**from stock code**) |
+| PB1 | output | unknown; set by the stock app after the revision measurement (`0x0805C958`), depending on the revision |
 | PB6, PB12 and two pins in a group of 6 and 10 | outputs | unknown |
 
 Cross-check: the stock app's clock selections name exactly USART3, LPUART1,
@@ -204,36 +205,71 @@ Remaining:
 1. The display-dependent offsets, if the reading ever turns out to follow
    the picture.
 
-### 3.5 Apollo, remaining work (item 3 and items 15-24) - L
+### 3.5 Apollo (item 3 and items 15-24) - L, in progress
 
-Works: transport, heartbeat, acknowledgements, 9 of 79 message kinds
-identified.
+Works: transport, heartbeat, acknowledgements, sending messages, the
+vibration motor's "custom pulses" command. Decoded reports: barometer,
+battery, temperatures, lower button, sensor chip names, reset info, wear.
+
+**The Apollo's firmware file** (`0:packet/apollo/apollo_app.bin`) is stored
+in 98 chunks, each with a 0x60-byte header (load address at +0x58, length
+at +0x5C). Reassembled it is one image at 0xC000. Its functions carry their
+names as text, which makes it readable as the other half of every message.
+
+**Start-up exchange (from both firmwares; ours is incomplete):**
+
+| Step | Stock behaviour | Ours |
+|---|---|---|
+| Handshake | Apollo sends its heartbeat every second until answered (`lcMainDualComHandshake`) | done |
+| Announcement | Apollo sends its sensor chip list (kind 52); stock acknowledges and starts its own messages (`0x0806CFE8`, `0x080AB4BC`) | acknowledged; used as trigger |
+| Time | stock sends kind 5: GMT seconds and time zone in minutes | written, switched off: the Apollo's side is not read yet, and we would send local time where it expects GMT |
+| Version | stock sends kind 6: its version text | written, switched off: the Apollo's side is not read yet |
+| Setup status | stock sends kind 140 = 3 when first-time setup is over; the Apollo then switches its capacitive wear detection on (`lcAlgoOOBEStatusSet`) | sent on the announcement, repeated until acknowledged; **measured: acknowledged, capacitive sensor on, wrist detected about 4 s after putting the watch on** |
+| Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), a daily time window for the Apollo's algorithm 13, probably raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), kind 130 | do-not-disturb and sedentary are read through on both sides, written and switched off; **the others are identified but not read through**; none can be changed yet because the firmware has no settings of its own |
+| Board revision | Apollo asks "get pin 11" (kind 7) and repeats it until answered; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`); the Apollo names the revisions B280_DVT, B280_PVT, B281_DVT and stores the answer | measurement and answer written, switched off: untested, and what the Apollo does per revision is not read yet |
+| Battery identification | kept inside the Apollo (its stored item 0x25); it tells the STM32 the value (kind 7, field 2 = 0x25) and can be set or read with kind 24 | not handled; the STM32 has no part in measuring it |
+| Sensor switches | stock switches sensors with kind 120 (field 1: 0 compass, 1 barometer, 2 battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 power control; field 2 on/off; field 3 interval) | **not done** |
+
+**Wear detection:** the Apollo's wear message (kind 45) carries 2 for "on
+the wrist" and 1 for "not" (`lcAlgo_send_offbody_reminder`; the stock log
+line is "isWear, offbodyReason, offbodyData"). Until the setup status was sent it was always 1 and the Apollo's status
+message (kind 54: compass, barometer, motion, gyroscope, GPS, capacitive,
+optical) showed the capacitive sensor off; our earlier decoding ("worn")
+was wrong. With the setup status it works: field 3 gives the reason (seen:
+4 when put on, 1 when taken off).
+
+**Heart rate:** command kind 123 (field 8 = mode: 3 single measurement, 2
+with the stress measurement, 0xFF test), results kind 44 (field 2 = beats
+per minute, 5 SpO2, 7 stress, 8 type, 25 status). The Apollo's
+`lcAlgoHeartRateEnable` does nothing unless its wear state is "on the
+wrist", so this depends on wear detection.
+
+Measured: a long press of the lower button starts a measurement, the
+green light comes on, and one report a second arrives. No value for the
+first 21 s, then early values (106 to 122 with field 4 = 1), settling at 61
+to 69 with field 4 = 4 to 6; field 4 looks like the confidence of the
+value. Not done: SpO2, stress, automatic monitoring, the limits and
+warnings, the other fields of the report.
+
+**Vibration motor:** command kind 84. Works: type 2, pulses with length,
+pause and count. Not done: type 1 and type 3 (the Apollo's built-in effects
+by number), stop, the stock app's table of about 30 effects
+(`0x081C54C0`), motor calibration.
 
 Steps:
-1. Name the rest of the schema. For each kind: the handler's log text in
-   the stock app, then a capture on the watch. Kinds seen but not solved:
-   4, 7, 51, 54, 80.
-2. Sending: the stock app's outgoing messages (sensor enable, settings,
-   time, user data). The stock function that builds them is at
-   `0x0806C40A`; its callers give the list.
-3. Motion data (LSM6DSO): find how the stock app requests raw or step
-   data; decode kind 81 "daily activity".
-4. Heart rate and SpO2 (MT6670): find the start/stop messages; the Apollo
-   runs the algorithm and reports results.
-5. Haptics (AW8695): find the vibrate message; fire it.
-6. GPS position data: see 3.9.
-7. Battery and charger: complete the fields of kind 47 (fault mask,
-   charge state).
-8. Sleep: the stock app tells the Apollo when the STM32 sleeps
-   (`service_snd_req_to_sleep_apollo`); needed before we add low power.
-9. Apollo firmware update: the stock app can reflash it
-   (`start to update APOLLO`). It does so over I2C4 (PF14, PF15, address
-   0x20) from a task at `0x08079A64` that also toggles the Apollo's reset
-   pin, started from the update screen. Not needed unless we want to change
-   the Apollo's firmware; do not drive I2C4 otherwise.
-
-The Apollo's firmware is 811 KB with full driver names. If a message stays
-unclear from the STM32 side, the Apollo image can be read as the other half.
+1. Finish the start-up exchange above, in the stock order.
+2. Battery identification with the ADC.
+3. Name the rest of the schema (about 80 kinds; see
+   `src/drivers/apollo/messages.rs` for those known).
+4. Motion data (LSM6DSO), compass (MMC5603): switches, rates, reports.
+5. Heart rate, SpO2, stress: all modes, automatic monitoring, limits.
+6. Vibration: all types and the effect table.
+7. GPS position data: see 3.9.
+8. Battery and charger: all fields of kind 47, charge control.
+9. Records (kinds 80-96): daily activity, sleep, sport.
+10. Sleep: the stock app tells the Apollo when the STM32 sleeps.
+11. Apollo firmware update over I2C4 (PF14, PF15, address 0x20), from the
+    stock task at `0x08079A64`.
 
 ### 3.6 Audio codec, speaker, microphone (items 7, 8) - L
 
@@ -375,7 +411,7 @@ sensor and automatic brightness (3.4), touch (3.1), real-time clock (3.12), Blue
 - What PF4 feeds (switched together with the touch reset).
 - Why the lower button's first press after a display command once came
   without a "clicked" message from the Apollo.
-- What SPI2, ADC1 (PB0) and the outputs PA4, PB3, PB1 are used for.
+- What SPI2 and the outputs PA4, PB3, PB1 are used for.
 - Whether the device at 0x36 on I2C2 is the speaker amplifier, and which
   pins power or enable it and the NFC controller (neither answers on the
   bus as things are).

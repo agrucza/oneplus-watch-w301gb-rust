@@ -64,6 +64,12 @@ pub async fn run(board: Board) {
         let _ = log.flush();
         // Bluetooth first, then the Apollo: once released it may reset us
         // again, and by then the PC must be able to reach the watch.
+        // The board revision, measured once as in the stock app; the Apollo
+        // asks for it.
+        // The board revision is not measured yet (`board.revision`): the
+        // measurement is written but untested, and what the Apollo does
+        // with the answer has not been read through.
+        let _ = &board.revision;
         let apollo = apollo::Apollo::start(board.apollo).await;
         let _ = writeln!(log.stamp(), "apollo: {}", if apollo.is_some() { "released from reset" } else { "not started" });
 
@@ -244,6 +250,7 @@ impl Screen {
         readings: Option<&Readings>,
         lux: Option<u32>,
         bluetooth_connected: bool,
+        measuring_heart: bool,
         log: &mut Log,
     ) {
         let uptime_s = Instant::now().as_secs();
@@ -253,7 +260,7 @@ impl Screen {
         }
         self.changed = false;
         if new_second {
-            self.redraw(uptime_s, readings, lux, bluetooth_connected, log);
+            self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
         }
         let started = Instant::now();
         let r = self.panel.refresh().await;
@@ -280,6 +287,7 @@ impl Screen {
         readings: Option<&Readings>,
         lux: Option<u32>,
         bluetooth_connected: bool,
+        measuring_heart: bool,
         log: &mut Log,
     ) {
         self.drawn_for = Some(uptime_s);
@@ -301,6 +309,7 @@ impl Screen {
                 readings,
                 lux,
                 bluetooth_connected,
+                measuring_heart,
                 brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
                 brightness: self.level,
                 last_button: self.last_button,
@@ -399,6 +408,7 @@ async fn main_loop(
 ) -> ! {
     let mut log = Log::get();
     let mut last_save = Instant::now();
+    let mut measuring_heart = false;
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
         // pass - but not while a package is streaming in.
@@ -412,7 +422,25 @@ async fn main_loop(
 
         // Buttons: the upper one is ours, the lower one comes through the Apollo.
         let upper_click = matches!(buttons.poll(&mut log), Some(ButtonEvent::Released { held_ms }) if held_ms < CLICK_MS);
-        let lower_click = apollo.as_mut().and_then(|a| a.take_key()) == Some(KeyEvent::Clicked);
+        let lower = apollo.as_mut().and_then(|a| a.take_key());
+        let lower_click = lower == Some(KeyEvent::Clicked);
+        // Feedback through the vibration motor: one short pulse for a
+        // click, three for a long press.
+        if let Some(apollo) = apollo.as_mut() {
+            match lower {
+                Some(KeyEvent::Clicked) => {
+                    apollo.vibrate(200, 0, 1, &mut log).await;
+                }
+                Some(KeyEvent::LongPressed) => {
+                    // A long press starts and stops a heart-rate
+                    // measurement: three pulses for start, two for stop.
+                    measuring_heart = !measuring_heart;
+                    apollo.measure_heart_rate(measuring_heart, &mut log).await;
+                    apollo.vibrate(200, 100, if measuring_heart { 3 } else { 2 }, &mut log).await;
+                }
+                _ => {}
+            }
+        }
         let touched = match touch.as_mut() {
             Some(touch) if !server.transferring() => touch.poll(&mut log),
             _ => None,
@@ -432,7 +460,7 @@ async fn main_loop(
             }
             if !server.transferring() {
                 screen.fade(&mut log).await;
-                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_lux, server.connected, &mut log).await;
+                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_lux, server.connected, measuring_heart, &mut log).await;
             }
         }
 

@@ -29,6 +29,8 @@ pub struct Status<'a> {
     /// Ambient light in lux.
     pub lux: Option<u32>,
     pub bluetooth_connected: bool,
+    /// A heart-rate measurement is running.
+    pub measuring_heart: bool,
     /// Fixed brightness step, 1-based, and the number of steps; `None`
     /// while the brightness follows the light.
     pub brightness_step: Option<(usize, usize)>,
@@ -169,6 +171,14 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
 
     let mut line = Line::new();
     match s.last_touch {
+        _ if s.measuring_heart => match s.readings.and_then(|r| r.heart_bpm) {
+            Some(bpm) if bpm != 0 => {
+                let _ = write!(line, "heart {} bpm", bpm);
+            }
+            _ => {
+                let _ = write!(line, "heart: measuring");
+            }
+        },
         Some((x, y)) => {
             let _ = write!(line, "touch {}, {}", x, y);
         }

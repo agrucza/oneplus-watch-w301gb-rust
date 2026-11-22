@@ -45,6 +45,21 @@ pub struct DateTime {
     pub second: u8,
 }
 
+impl DateTime {
+    /// Seconds since 1970-01-01 00:00:00, taking the fields as they are
+    /// (no time zone applied). Valid for 2000 to 2099.
+    pub fn unix_seconds(&self) -> u32 {
+        const DAYS_BEFORE_MONTH: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        let years = (self.year - 2000) as u32;
+        // 2000-01-01 is day 10957; leap days before this year, then this year's.
+        let mut days = 10957 + years * 365 + (years + 3) / 4 + DAYS_BEFORE_MONTH[(self.month - 1) as usize] + self.day as u32 - 1;
+        if self.year % 4 == 0 && self.month > 2 {
+            days += 1;
+        }
+        days * 86400 + self.hour as u32 * 3600 + self.minute as u32 * 60 + self.second as u32
+    }
+}
+
 /// The clock's set-up registers, for the log.
 pub struct State {
     pub cr: u32,
