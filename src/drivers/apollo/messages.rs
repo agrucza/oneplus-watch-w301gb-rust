@@ -591,17 +591,37 @@ pub fn off_wrist_timeout(minutes: u8) -> Encoder {
 }
 
 /// What the lower side button did. It is wired to the Apollo, which reports
-/// it in messages of kind `KEY` (measured on the watch): a short press gives
-/// `Pressed`, `Released` about 200 ms later and `Clicked` about 300 ms after
-/// that; holding gives `Pressed`, `LongPressed` after 1.5 s, and `Released`
-/// when let go.
+/// it in messages of kind `KEY`.
+///
+/// How the Apollo arrives at these (read in its firmware: the edge handler
+/// at 0x40FAC, the timer callback at 0x40F00, the sender at 0x40CF8):
+///
+/// - `Pressed` and `Released` are sent on the edges.
+/// - `Clicked` comes 300 ms after a release, from a timer, if the button
+///   was held for less than 800 ms and is not pressed again in that time.
+/// - Pressed again within those 300 ms, and let go within 300 ms of that
+///   press: `DoubleClicked` is sent in place of the second release, and no
+///   `Clicked` for either press. Held longer the second time: one
+///   `Clicked` after its release, and the first press counts for nothing.
+/// - Held: nothing at 800 ms (an inner step that is not sent), then
+///   `LongPressed` at 1.5 s and `VeryLongPressed` at 5 s. A release after
+///   800 ms gives `Released` and no `Clicked`.
+/// - A second release report while none is expected (the button bounces;
+///   seen on the watch as two with the same Apollo time) stops the timer,
+///   and the `Clicked` that was due never comes.
+///
+/// Because of the last three points, short presses are counted here from
+/// `Pressed` and `Released` (`Apollo::take_short_presses`) wherever every
+/// press matters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KeyEvent {
     Released,
     Pressed,
     Clicked,
+    DoubleClicked,
     LongPressed,
-    /// A value not seen so far.
+    VeryLongPressed,
+    /// A value the Apollo's code does not send.
     Other(u32),
 }
 
@@ -611,7 +631,9 @@ impl KeyEvent {
             KeyEvent::Released => "released",
             KeyEvent::Pressed => "pressed",
             KeyEvent::Clicked => "clicked",
+            KeyEvent::DoubleClicked => "double click",
             KeyEvent::LongPressed => "long press",
+            KeyEvent::VeryLongPressed => "very long press",
             KeyEvent::Other(_) => "unknown event",
         }
     }
@@ -624,7 +646,9 @@ pub fn key_event(payload: &[u8]) -> (KeyEvent, u32) {
         0 => KeyEvent::Released,
         1 => KeyEvent::Pressed,
         2 => KeyEvent::Clicked,
+        3 => KeyEvent::DoubleClicked,
         4 => KeyEvent::LongPressed,
+        5 => KeyEvent::VeryLongPressed,
         other => KeyEvent::Other(other),
     };
     (event, field(3))

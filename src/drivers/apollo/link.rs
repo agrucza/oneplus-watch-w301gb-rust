@@ -189,6 +189,12 @@ pub struct Apollo {
     pub last_key: Option<messages::KeyEvent>,
     /// Lower-button events not yet fetched with `take_key`.
     key_pending: Option<messages::KeyEvent>,
+    /// The Apollo's time of the lower button's last `Pressed`, until its
+    /// release.
+    key_down_at: Option<u32>,
+    /// Short presses of the lower button not yet fetched with
+    /// `take_short_presses`.
+    short_presses: u8,
 }
 
 impl Apollo {
@@ -257,6 +263,8 @@ impl Apollo {
             readings: Readings::default(),
             last_key: None,
             key_pending: None,
+            key_down_at: None,
+            short_presses: 0,
         })
     }
 
@@ -610,6 +618,15 @@ impl Apollo {
         self.key_pending.take()
     }
 
+    /// How many short presses of the lower button there were since this
+    /// was last asked: a press let go after 10 to 800 ms by the Apollo's
+    /// clock, the same limits the Apollo uses for a click. Counted from
+    /// the press and release reports, so that every press counts, however
+    /// quickly they follow each other (see `messages::KeyEvent`).
+    pub fn take_short_presses(&mut self) -> u8 {
+        core::mem::take(&mut self.short_presses)
+    }
+
     fn log_readings(&self, log: &mut Log) {
         let r = &self.readings;
         let _ = write!(log.stamp(), "sensors:");
@@ -686,8 +703,22 @@ impl Apollo {
                     let (event, at) = messages::key_event(payload);
                     self.last_key = Some(event);
                     // A click or long press outranks the press and release around it.
-                    if !matches!(self.key_pending, Some(messages::KeyEvent::Clicked | messages::KeyEvent::LongPressed | messages::KeyEvent::Other(_))) {
+                    use messages::KeyEvent::*;
+                    if !matches!(self.key_pending, Some(Clicked | DoubleClicked | LongPressed | VeryLongPressed | Other(_))) {
                         self.key_pending = Some(event);
+                    }
+                    match event {
+                        Pressed => self.key_down_at = Some(at),
+                        // A double click is sent in place of the second
+                        // press's release, so it ends a press as well.
+                        Released | DoubleClicked => {
+                            if let Some(down) = self.key_down_at.take() {
+                                if (10..800).contains(&at.wrapping_sub(down)) {
+                                    self.short_presses = self.short_presses.saturating_add(1);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                     let _ = match event {
                         messages::KeyEvent::Other(value) => writeln!(log.stamp(), "button lower: event {} (Apollo time {} ms)", value, at),

@@ -1524,19 +1524,17 @@ async fn main_loop(
             }
         }
         let lower = apollo.as_mut().and_then(|a| a.take_key());
-        let lower_click = lower == Some(KeyEvent::Clicked);
-        // Event 3 arrives in place of the second release when the button
-        // is pressed again within about 0.3 s of a release, and no
-        // "clicked" comes for either press: taken as a double click (from
-        // the timing in the log; not read in the Apollo's code).
-        let lower_double = lower == Some(KeyEvent::Other(3));
+        // Short presses are counted from the press and release reports;
+        // the Apollo's own "clicked" comes 300 ms late and not for every
+        // press (see `messages::KeyEvent`).
+        let lower_presses = apollo.as_mut().map_or(0, |a| a.take_short_presses());
         // Feedback through the vibration motor: one short pulse for a
         // click, three for a long press.
         if let Some(apollo) = apollo.as_mut() {
+            if lower_presses > 0 {
+                apollo.vibrate(200, 0, 1, &mut log).await;
+            }
             match lower {
-                Some(KeyEvent::Clicked) => {
-                    apollo.vibrate(200, 0, 1, &mut log).await;
-                }
                 Some(KeyEvent::LongPressed) => {
                     // A long press starts and stops a heart-rate
                     // measurement: three pulses for start, two for stop.
@@ -1562,10 +1560,7 @@ async fn main_loop(
             if upper_click {
                 shared::send(shared::Event::Click { upper: true });
             }
-            if lower_click || lower_double {
-                shared::send(shared::Event::Click { upper: false });
-            }
-            if lower_double {
+            for _ in 0..lower_presses {
                 shared::send(shared::Event::Click { upper: false });
             }
             if let Some(apollo) = apollo.as_mut() {
