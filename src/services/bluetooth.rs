@@ -1,5 +1,6 @@
-//! Bluetooth as the watch: give the Cypress chip the watch's address and
-//! the pairing keys the stock firmware stored, then make it connectable.
+//! Bluetooth as the watch: give the Cypress chip the watch's address (from
+//! the factory data) and the pairing keys the stock firmware stored, then
+//! make it connectable.
 
 use core::fmt::Write;
 
@@ -7,34 +8,7 @@ use embassy_time::Duration;
 
 use crate::drivers::cypress;
 use crate::services::log::Log;
-use crate::services::storage;
-
-/// The watch's Bluetooth address. The chip starts on a default address;
-/// the stock app sets this one from its factory data (not located yet).
-/// Here it comes from `OPW_MAC` at build time (see `build.rs`), because it
-/// is personal to one watch and does not belong in the sources.
-const BLUETOOTH_ADDRESS: [u8; 6] = parse_address(env!("W301_BT_ADDRESS"));
-
-/// Parse "AA:BB:CC:DD:EE:FF" (already validated by `build.rs`).
-const fn parse_address(text: &str) -> [u8; 6] {
-    const fn nibble(c: u8) -> u8 {
-        match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => panic!("bad hex digit in the Bluetooth address"),
-        }
-    }
-    let t = text.as_bytes();
-    assert!(t.len() == 17, "Bluetooth address must look like AA:BB:CC:DD:EE:FF");
-    let mut out = [0u8; 6];
-    let mut i = 0;
-    while i < 6 {
-        out[i] = nibble(t[i * 3]) << 4 | nibble(t[i * 3 + 1]);
-        i += 1;
-    }
-    out
-}
+use crate::services::{factory, storage};
 
 /// Stored pairings: `2:bluethooth_pair.cfg`, a raw copy of the stock app's
 /// table of nine 175-byte slots (loaded at 0x0802AEEE). A slot is in use when
@@ -54,6 +28,9 @@ const PAIR_RECORD_LEN: usize = 2 + 136;
 /// PC its pairing with the stock firmware. So every step is checked and the
 /// chip only becomes connectable if all of them worked.
 pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link> {
+    // The chip starts on a default address; without the watch's own there
+    // is no point in starting it.
+    let address = factory::bluetooth_address(log)?;
     let Some(mut link) = cypress::Link::power_up(r).await else {
         let _ = writeln!(log.stamp(), "cypress: could not open the link");
         return None;
@@ -76,18 +53,18 @@ pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link
 
     let connectable = 'setup: {
         // 2. Address: set it (last byte first), then read it back.
-        let mut reversed = BLUETOOTH_ADDRESS;
+        let mut reversed = address;
         reversed.reverse();
         if !link.command(log, cypress::CMD_SET_LOCAL_BDA, &reversed).await {
             break 'setup false;
         }
         match link.request(log, cypress::CMD_READ_LOCAL_BDA, &[], cypress::EVT_LOCAL_BDA).await {
-            Some((address, 6)) if address[..6] == BLUETOOTH_ADDRESS => {
+            Some((read_back, 6)) if read_back[..6] == address => {
                 let _ = writeln!(log.stamp(), "cypress: address set and read back correctly");
             }
-            Some((address, n)) => {
-                let _ = writeln!(log.stamp(), "cypress: address reads back differently:");
-                log.hex(&address[..n]);
+            Some((_, n)) => {
+                // Not shown: the address is personal to this watch.
+                let _ = writeln!(log.stamp(), "cypress: address reads back differently ({} bytes)", n);
                 break 'setup false;
             }
             None => break 'setup false,

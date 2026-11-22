@@ -284,10 +284,10 @@ Steps:
 Works: existing pairings, serial port, update protocol.
 
 Steps:
-1. Address from factory data. Found: `0:flash_device.txt` holds the
-   address as text ("5C17CF8F8CF0" at offset 0x21, after an `A5` marker)
-   next to what looks like the serial number. Read it instead of the
-   `local.env` constant.
+1. Address from factory data: done. `0:flash_device.txt` (1024 bytes,
+   checksummed) holds a record at 0x28 with the address as twelve hex
+   digits; `services::factory` reads and checks it as the stock app does
+   (`0x08031ED0`). The address is no longer built into the image.
 2. Pairing: handle the chip's pairing events and store new keys in
    `2:bluethooth_pair.cfg` in the stock layout, so both firmwares keep
    sharing pairings.
@@ -364,14 +364,12 @@ Would give a live log without Bluetooth.
 ## 5. Suggested order
 
 Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor and automatic brightness (3.4), touch (3.1), real-time clock (3.12).
+sensor and automatic brightness (3.4), touch (3.1), real-time clock (3.12), Bluetooth address from factory data (3.8).
 
-1. **Bluetooth address from factory data** (3.8 step 1): removes the last
-   hard-coded value.
-2. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
-3. **Low power** (section 4): after that the watch can be worn.
-4. **Audio** (3.6).
-5. **GPS, pairing, BLE, NFC** as wanted.
+1. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
+2. **Low power** (section 4): after that the watch can be worn.
+3. **Audio** (3.6).
+4. **GPS, pairing, BLE, NFC** as wanted.
 
 ## 6. Open questions
 

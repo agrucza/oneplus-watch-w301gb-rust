@@ -15,7 +15,7 @@
 #
 # Settings come from the environment or from the untracked file `local.env`
 # in the project root (see `local.env.example`):
-#   OPW_MAC       the watch's Bluetooth address (required; also built into the app)
+#   OPW_MAC       the watch's Bluetooth address (required)
 #   OPW_CHAN      RFCOMM channel                  (default 2)
 #   OPW_DIR       folder with opw_bt.py           (default ~/opwatch/work)
 #   OPW_TEMPLATE  known-good uncompressed package (default $OPW_DIR/B280STM32_ota.swdfull.bin)
