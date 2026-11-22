@@ -12,7 +12,7 @@ use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
-use crate::drivers::touch::TouchEvent;
+use crate::services::gestures::{Gesture, Gestures};
 use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
@@ -29,6 +29,7 @@ const LOG_VOLUME: usize = 3;
 /// Returns only if the watch cannot be reached or served; the caller then
 /// resets, which takes the watch back to the stock firmware.
 pub async fn run(board: Board) {
+    crate::boot::stack::paint();
     board.power.switch_on().await;
     let _ = ticket::report(ticket::STAGE_POWER, 0);
 
@@ -689,19 +690,34 @@ fn start_cycle_counter() {
     core.DWT.enable_cycle_counter();
 }
 
-/// Pictures a change of page takes.
+/// Pictures a change of page takes when it runs the whole width by
+/// itself; a shorter run takes fewer in proportion.
 const SLIDE_STEPS: usize = 14;
 
-/// A change of page under way: one page slides out, the other in.
-struct Slide {
-    /// Pictures presented so far.
-    step: u32,
+/// A flick: letting go faster than this many pixels a second finishes a
+/// change of page however short the pull was.
+const FLICK: i32 = 400;
+
+/// A change of page under way: one page moves out, the other follows in.
+/// Kept small on purpose; see `Screen::left_keys`.
+#[derive(Clone, Copy)]
+struct Pull {
+    /// The page being pulled in.
+    target: Page,
+    /// The pages move to the left (the new one comes from the right).
     leftwards: bool,
+    /// How far the pages should be moved, in pixels: where the finger is.
+    wanted: usize,
+    /// How far they were moved in the last picture; `None` until the two
+    /// pages' pictures have been made.
+    shown: Option<usize>,
+    /// The finger has let go: finish the change, or let it fall back.
+    release: Option<bool>,
     began: Instant,
     /// How long keeping the old picture and drawing the new page took.
     prepared: Duration,
-    /// The longest a picture took to put together and present.
-    longest: Duration,
+    /// Pictures presented while the finger was down.
+    pictures: u32,
     /// No blitter error and no missed pulse so far.
     good: bool,
 }
@@ -711,6 +727,53 @@ struct Slide {
 enum Page {
     Face,
     Status,
+}
+
+/// What the screen keeps track of to redraw only what changes: several
+/// kilobytes of rectangles and keys.
+///
+/// It lives in memory of its own, not inside `Screen`, because `Screen` is
+/// handed about by value while the firmware starts, and every such
+/// hand-over needs room for the whole of it on the stack. With these
+/// tables inside it, the function that starts the firmware needed 54 KB
+/// of the 64 KB stack for itself, and the first page pull ran out of it.
+struct Tracking {
+    /// What every element of the watch face showed when it was last
+    /// looked at (`face::key`).
+    face_keys: [Option<u32>; face::ELEMENTS],
+    /// Where every element of the watch face was when it was last drawn.
+    face_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
+    /// The lines of the status page as they were last composed.
+    lines: Option<[status::Line; status::LINES]>,
+    /// What has changed on the picture since each frame was drawn.
+    damage: Damage,
+    /// Where the status page was tapped, the latest 64 places; drawn as
+    /// dots.
+    dots: [(u16, u16); 64],
+    dot_count: usize,
+    /// What was known about the page a pull is leaving: enough to carry on
+    /// redrawing only what changes, if that page comes back.
+    left_page: Page,
+    left_lines: Option<[status::Line; status::LINES]>,
+    left_keys: [Option<u32>; face::ELEMENTS],
+    left_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
+}
+
+impl Tracking {
+    const fn new() -> Self {
+        Self {
+            face_keys: [None; face::ELEMENTS],
+            face_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
+            lines: None,
+            damage: Damage::new(),
+            dots: [(0, 0); 64],
+            dot_count: 0,
+            left_page: Page::Face,
+            left_lines: None,
+            left_keys: [None; face::ELEMENTS],
+            left_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
+        }
+    }
 }
 
 /// The panel and what is currently shown on it.
@@ -733,30 +796,17 @@ struct Screen {
     last_button: &'static str,
     /// Where the glass was last touched, if that is newer than the button.
     last_touch: Option<(u16, u16)>,
-    /// Where the glass was touched, the latest 64 places; drawn as dots.
-    dots: [(u16, u16); 64],
-    dot_count: usize,
     /// Which page is shown.
     page: Page,
-    /// A page that was asked for and is not shown yet.
-    switch_to: Option<Page>,
-    /// A change of page that is under way.
-    slide: Option<Slide>,
-    finger_down: bool,
-    /// What every element of the watch face showed when it was last
-    /// looked at (`face::key`).
-    face_keys: [Option<u32>; face::ELEMENTS],
-    /// Where every element of the watch face was when it was last drawn.
-    face_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
+    /// A change of page under the finger or running out by itself.
+    pull: Option<Pull>,
+    /// The bulky part of what the screen keeps track of (see `Tracking`).
+    t: &'static mut Tracking,
     /// When the watch face is next looked at.
     next_frame: Instant,
     /// The second the clock showed last, and when it was seen to begin.
     clock_second: Option<u8>,
     second_began: Instant,
-    /// The lines as they were last composed.
-    lines: Option<[status::Line; status::LINES]>,
-    /// What has changed on the picture since each frame was drawn.
-    damage: Damage,
     /// Diagnosis: pictures drawn, time spent drawing and pixels repainted
     /// since the last log line, and when the next line is due.
     pictures: u32,
@@ -792,19 +842,12 @@ impl Screen {
             wear: WearView::new(),
             last_button: "no button yet",
             last_touch: None,
-            dots: [(0, 0); 64],
-            dot_count: 0,
             page: Page::Face,
-            switch_to: None,
-            slide: None,
-            finger_down: false,
-            face_keys: [None; face::ELEMENTS],
-            face_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
+            pull: None,
+            t: cortex_m::singleton!(: Tracking = Tracking::new()).expect("one screen"),
             next_frame: Instant::now(),
             clock_second: None,
             second_began: Instant::now(),
-            lines: None,
-            damage: Damage::new(),
             pictures: 0,
             drawing_us: 0,
             drawing_max_us: 0,
@@ -880,40 +923,69 @@ impl Screen {
     }
 
     /// A finger is on the glass: mark the place with a dot.
-    /// The finger left the glass.
-    fn lifted(&mut self) {
-        self.finger_down = false;
+    /// React to what the finger did.
+    ///
+    /// Dragging sideways pulls the next page in: to the left on the watch
+    /// face brings the status page, to the right on the status page
+    /// brings the face back. The pages follow the finger; letting go past
+    /// a third of the way, or with a flick, finishes the change, anything
+    /// less lets the page fall back. A tap on the status page leaves a
+    /// dot.
+    fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
+        let width = panel::WIDTH as i32;
+        match gesture {
+            Gesture::DragStart { dx, dy, .. } if self.pull.is_none() && dx.abs() >= dy.abs() => {
+                let (target, leftwards) = match (self.page, dx < 0) {
+                    (Page::Face, true) => (Page::Status, true),
+                    (Page::Status, false) => (Page::Face, false),
+                    _ => return, // nothing lies that way
+                };
+                self.pull = Some(Pull {
+                    target,
+                    leftwards,
+                    wanted: dx.unsigned_abs() as usize,
+                    shown: None,
+                    release: None,
+                    began: Instant::now(),
+                    prepared: Duration::from_ticks(0),
+                    pictures: 0,
+                    good: true,
+                });
+            }
+            Gesture::Drag { dx, .. } => {
+                if let Some(pull) = self.pull.as_mut() {
+                    let travel = if pull.leftwards { -dx } else { dx };
+                    pull.wanted = travel.clamp(0, width) as usize;
+                }
+            }
+            Gesture::DragEnd { dx, speed_x, .. } => {
+                if let Some(pull) = self.pull.as_mut() {
+                    let (travel, speed) = if pull.leftwards { (-dx, -speed_x) } else { (dx, speed_x) };
+                    pull.wanted = travel.clamp(0, width) as usize;
+                    pull.release = Some(travel > width / 3 || speed > FLICK);
+                    let _ = writeln!(log.stamp(), "touch: let go after {} px at {} px/s", travel, speed);
+                }
+            }
+            Gesture::Tap { x, y } if self.page == Page::Status => self.dot(x as u16, y as u16),
+            Gesture::LongPress { x, y } => {
+                let _ = writeln!(log.stamp(), "touch: long press at {}, {}", x, y);
+            }
+            _ => {}
+        }
     }
 
-    /// A finger is on the glass. A new touch on the watch face goes to the
-    /// status page, and one in the top quarter of the status page goes
-    /// back; any other touch on the status page leaves a dot.
-    fn touched(&mut self, x: u16, y: u16) {
-        let new_touch = !core::mem::replace(&mut self.finger_down, true);
-        let switch = match self.page {
-            Page::Face => new_touch,
-            Page::Status => new_touch && y < 110,
-        };
-        if switch {
-            // The change itself happens in `update`, as a slide.
-            if self.slide.is_none() {
-                self.switch_to = Some(if self.page == Page::Face { Page::Status } else { Page::Face });
-            }
-            return;
-        }
-        if self.page == Page::Face {
-            return;
-        }
+    /// Leave a dot on the status page.
+    fn dot(&mut self, x: u16, y: u16) {
         // Kept in a list, from which they are drawn. The oldest gives way
         // to the newest; both places have changed.
-        let slot = self.dot_count % self.dots.len();
-        if self.dot_count >= self.dots.len() {
-            let (old_x, old_y) = self.dots[slot];
-            self.damage.add(status::dot_rect(old_x, old_y));
+        let slot = self.t.dot_count % self.t.dots.len();
+        if self.t.dot_count >= self.t.dots.len() {
+            let (old_x, old_y) = self.t.dots[slot];
+            self.t.damage.add(status::dot_rect(old_x, old_y));
         }
-        self.dots[slot] = (x, y);
-        self.dot_count += 1;
-        self.damage.add(status::dot_rect(x, y));
+        self.t.dots[slot] = (x, y);
+        self.t.dot_count += 1;
+        self.t.damage.add(status::dot_rect(x, y));
         self.last_touch = Some((x, y));
         self.changed = true;
     }
@@ -952,8 +1024,8 @@ impl Screen {
         let uptime_s = now.as_secs();
         let new_second = self.drawn_for != Some(uptime_s);
         let back = self.panel.back_index();
-        if self.visible && (self.switch_to.is_some() || self.slide.is_some()) {
-            self.slide_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
+        if self.visible && self.pull.is_some() {
+            self.pull_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
             return;
         }
         // The watch face moves: it is looked at again every `FACE_PERIOD`.
@@ -961,7 +1033,7 @@ impl Screen {
         // On the status page a change is brought to the second frame at
         // once. The watch face is drawn again shortly anyway, and that
         // picture brings the second frame up to date as well.
-        let catch_up = self.page == Page::Status && self.damage.pending(back);
+        let catch_up = self.page == Page::Status && self.t.damage.pending(back);
         if !self.visible || !(new_second || self.changed || frame_due || catch_up) {
             return;
         }
@@ -1029,26 +1101,26 @@ impl Screen {
             let mut stage = cycles();
             for n in 0..face::ELEMENTS {
                 let key = Some(face::key(n, &state));
-                if self.face_keys[n] != key {
+                if self.t.face_keys[n] != key {
                     // Where it was and where it is now: an element may
                     // have moved.
                     let rect = face::rect(n, &state);
-                    let old = self.face_rects[n];
-                    if self.face_keys[n].is_some() && face::overlap(&old, &rect) {
+                    let old = self.t.face_rects[n];
+                    if self.t.face_keys[n].is_some() && face::overlap(&old, &rect) {
                         // Moved a little: one rectangle round both places
                         // is cheaper to repaint than two that overlap.
-                        self.damage.add(face::around(&old, &rect));
+                        self.t.damage.add(face::around(&old, &rect));
                     } else {
-                        if self.face_keys[n].is_some() {
-                            self.damage.add(old);
+                        if self.t.face_keys[n].is_some() {
+                            self.t.damage.add(old);
                         }
-                        self.damage.add(rect);
+                        self.t.damage.add(rect);
                     }
-                    self.face_keys[n] = key;
-                    self.face_rects[n] = rect;
+                    self.t.face_keys[n] = key;
+                    self.t.face_rects[n] = rect;
                 }
             }
-            let changes = self.damage.take(back);
+            let changes = self.t.damage.take(back);
             self.stages[0] += lap(&mut stage); // comparing, listing changes
             if changes.is_empty() {
                 return None;
@@ -1063,7 +1135,7 @@ impl Screen {
                 self.areas += 1;
                 self.stages[1] += lap(&mut stage); // background
                 for n in 0..face::ELEMENTS {
-                    if face::overlap(&self.face_rects[n], &area) {
+                    if face::overlap(&self.t.face_rects[n], &area) {
                         self.stages[2] += lap(&mut stage); // finding what overlaps
                         face::draw(clipped, &area, n, &state);
                         self.draws += 1;
@@ -1089,20 +1161,20 @@ impl Screen {
             last_touch: self.last_touch,
         });
         for row in 0..status::LINES {
-            if self.lines.map_or(true, |old| old[row] != lines[row]) {
-                self.damage.add(status::line_rect(row));
+            if self.t.lines.map_or(true, |old| old[row] != lines[row]) {
+                self.t.damage.add(status::line_rect(row));
             }
         }
-        self.lines = Some(lines);
+        self.t.lines = Some(lines);
 
-        let changes = self.damage.take(back);
+        let changes = self.t.damage.take(back);
         if changes.is_empty() {
             return None;
         }
         // Repaint each changed rectangle: background, then whatever
         // reaches into it, in the order it lies on the screen. Drawing is
         // cut off at the rectangle's edge.
-        let dots = &self.dots[..self.dot_count.min(self.dots.len())];
+        let dots = &self.t.dots[..self.t.dot_count.min(self.t.dots.len())];
         let mut canvas = self.panel.canvas();
         for area in changes.rects(status::whole()) {
             canvas.clip_to(&area);
@@ -1121,66 +1193,92 @@ impl Screen {
         Some((started, changes.area(status::whole())))
     }
 
-    /// Change the page with a slide.
+    /// Carry a change of page forward.
     ///
-    /// The picture on the screen is kept, the new page is drawn completely
-    /// (into the frame to draw into, which is not shown) and kept as well.
-    /// Then pictures put together from the two are presented, the old one
-    /// moving out and the new one following it in, until the new page is
-    /// all there. Putting a picture
-    /// together is two blitter copies, so this runs at the panel's own
-    /// rhythm.
+    /// On the first call the picture on the screen is kept, the page being
+    /// pulled in is drawn completely (into the frame to draw into, which is
+    /// not shown) and kept as well. From then on every picture is put
+    /// together from the two with two blitter copies: while the finger is
+    /// down, at wherever the finger is; once it has let go, in a short run
+    /// to the end or back to the start.
     #[allow(clippy::too_many_arguments)]
-    async fn slide_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
-        if let Some(page) = self.switch_to.take() {
-            let began = Instant::now();
-            let leftwards = page == Page::Status;
-            let mut good = self.panel.keep(0, false).await;
-            self.page = page;
-            // Nothing of the new page is on either frame.
-            self.damage = Damage::new();
-            self.lines = None;
-            self.face_keys = [None; face::ELEMENTS];
-            self.drawn_for = Some(now.as_secs());
-            let _ = self.draw(now, true, readings, lux, bluetooth_connected, measuring_heart, log);
-            good &= self.panel.keep(1, true).await;
-            self.slide = Some(Slide { step: 0, leftwards, began, prepared: began.elapsed(), longest: Duration::from_ticks(0), good });
-        }
-        let Some(mut slide) = self.slide.take() else {
+    async fn pull_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
+        let Some(mut pull) = self.pull.take() else {
             return;
         };
-        // All the pictures of the slide in one go, without going back to
-        // the rest of the firmware in between: that round trip takes
-        // longer than a picture (measured: 36 ms a picture with it, where
-        // the panel takes one every 17 ms).
-        loop {
-            slide.step += 1;
-            // Ease in and out: slow, fast, slow.
-            let t = slide.step as usize * 1024 / SLIDE_STEPS;
-            let offset = panel::WIDTH * (t * t / 1024 * (3 * 1024 - 2 * t) / 1024) / 1024;
-            let last = slide.step as usize >= SLIDE_STEPS;
-            let started = Instant::now();
-            slide.good &= self.panel.slide(if last { panel::WIDTH } else { offset }, slide.leftwards).await;
-            let status = self.panel.present().await;
-            slide.good &= status.in_step;
-            slide.longest = slide.longest.max(started.elapsed());
-            watchdog::feed();
-            if last {
-                break;
-            }
+        if pull.shown.is_none() {
+            let began = Instant::now();
+            pull.good &= self.panel.keep(0, false).await;
+            // What is known about the page being left, in case the finger
+            // lets it fall back. Copied field by field inside the screen's
+            // own memory: these are several kilobytes, and a value of that
+            // size passed around while a picture is being presented has to
+            // fit on the stack at every level of the call (the first
+            // version did that, and the firmware died at its first
+            // picture).
+            self.t.left_page = self.page;
+            self.t.left_lines = self.t.lines;
+            self.t.left_keys = self.t.face_keys;
+            self.t.left_rects = self.t.face_rects;
+            self.page = pull.target;
+            // Nothing of the new page is on either frame.
+            self.t.damage = Damage::new();
+            self.t.lines = None;
+            self.t.face_keys = [None; face::ELEMENTS];
+            self.drawn_for = Some(now.as_secs());
+            let _ = self.draw(now, true, readings, lux, bluetooth_connected, measuring_heart, log);
+            pull.good &= self.panel.keep(1, true).await;
+            pull.shown = Some(0);
+            pull.prepared = began.elapsed();
         }
-        // The frame shown is the new page. Bring the other one to the
-        // same picture, and both are as the page was drawn.
-        slide.good &= self.panel.slide(panel::WIDTH, slide.leftwards).await;
-        self.damage.clear();
+        let shown = pull.shown.unwrap_or(0);
+        let Some(finish) = pull.release else {
+            // Under the finger: one picture, where the finger is now.
+            if pull.wanted != shown {
+                pull.good &= self.panel.slide(pull.wanted, pull.leftwards).await;
+                pull.good &= self.panel.present().await.in_step;
+                pull.shown = Some(pull.wanted);
+                pull.pictures += 1;
+            }
+            self.pull = Some(pull);
+            return;
+        };
+        // Let go: run to the end or back to the start, in one go without
+        // going back to the rest of the firmware in between (that round
+        // trip takes longer than a picture).
+        let end = if finish { panel::WIDTH } else { 0 };
+        let distance = end.abs_diff(shown);
+        let steps = (distance * SLIDE_STEPS / panel::WIDTH).max(2);
+        let run_began = Instant::now();
+        for step in 1..=steps {
+            // Ease out: fast first, slowing into place.
+            let t = step * 1024 / steps;
+            let eased = 1024 - (1024 - t) * (1024 - t) / 1024;
+            let offset = if step == steps { end } else if finish { shown + distance * eased / 1024 } else { shown - distance * eased / 1024 };
+            pull.good &= self.panel.slide(offset, pull.leftwards).await;
+            pull.good &= self.panel.present().await.in_step;
+            watchdog::feed();
+        }
+        // The frame shown is right. Bring the other one to the same
+        // picture; then both are as the page was drawn.
+        pull.good &= self.panel.slide(end, pull.leftwards).await;
+        self.t.damage.clear();
+        if !finish {
+            self.page = self.t.left_page;
+            self.t.lines = self.t.left_lines;
+            self.t.face_keys = self.t.left_keys;
+            self.t.face_rects = self.t.left_rects;
+        }
         let _ = writeln!(
             log.stamp(),
-            "display: page change{}: {} ms to draw the new page, then {} pictures in {} ms, the slowest {} ms",
-            if slide.good { "" } else { " (with an ERROR or a missed pulse)" },
-            slide.prepared.as_millis(),
-            SLIDE_STEPS,
-            (slide.began.elapsed() - slide.prepared).as_millis(),
-            slide.longest.as_millis()
+            "display: page {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms",
+            if finish { "changed" } else { "fell back" },
+            if pull.good { "" } else { " (with an ERROR or a missed pulse)" },
+            pull.prepared.as_millis(),
+            pull.pictures,
+            (run_began - pull.began).as_millis().saturating_sub(pull.prepared.as_millis()),
+            steps,
+            run_began.elapsed().as_millis()
         );
     }
 
@@ -1224,6 +1322,10 @@ impl Screen {
                 self.areas / self.pictures.max(1),
                 self.draws / self.pictures.max(1)
             );
+            let _ = writeln!(log.stamp(), "stack: {} of {} bytes used at most", crate::boot::stack::most_used(), crate::boot::stack::SIZE);
+            if !crate::services::canvas::blitter_usable() {
+                let _ = writeln!(log.stamp(), "display: the blitter did NOT finish an operation once; the processor draws everything now");
+            }
             // Processor cycles at 120 a microsecond.
             let us = |cycles: u64| cycles / 120 / self.pictures.max(1) as u64;
             let _ = writeln!(
@@ -1349,6 +1451,7 @@ async fn main_loop(
     let mut log = Log::get();
     let mut last_save = Instant::now();
     let mut measuring_heart = false;
+    let mut gestures = Gestures::new();
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
         // pass - but not while a package is streaming in.
@@ -1391,10 +1494,8 @@ async fn main_loop(
             _ => None,
         };
         if let Some(screen) = screen.as_mut() {
-            match touched {
-                Some(TouchEvent::Down { x, y }) => screen.touched(x, y),
-                Some(TouchEvent::Up) => screen.lifted(),
-                None => {}
+            if let Some(gesture) = gestures.feed(touched, Instant::now()) {
+                screen.touch_gesture(gesture, &mut log);
             }
             if let Some(lux) = lux {
                 screen.ambient(lux);

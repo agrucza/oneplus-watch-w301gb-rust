@@ -96,6 +96,9 @@ pub struct Touch {
     _pins: [Output<'static>; 2],
     buffer: [u8; MAX_REPORT],
     touching: bool,
+    /// The finger lifted in the same call that reported its last place:
+    /// the lift is handed out by the next call.
+    lift_pending: bool,
     logged: u32,
     failures: u32,
 }
@@ -120,7 +123,7 @@ impl Touch {
         enable.set_high();
         Timer::after_millis(120).await;
 
-        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, logged: 0, failures: 0 };
+        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, lift_pending: false, logged: 0, failures: 0 };
         let _ = writeln!(log.stamp(), "touch: reset done, interrupt line is {}", if touch.irq.is_low() { "low" } else { "high" });
 
         // Whatever the chip has to say after its reset.
@@ -228,7 +231,15 @@ impl Touch {
 
     /// Fetch what the chip has waiting. Returns the latest finger event, if
     /// there was one. Call often; costs nothing while the line is high.
+    ///
+    /// A lift never swallows the place reported just before it: if both
+    /// come in one call, the place is returned now and the lift by the
+    /// next call. (Otherwise the last stretch of a quick swipe is lost,
+    /// and with it the speed the finger had.)
     pub fn poll(&mut self, log: &mut Log) -> Option<TouchEvent> {
+        if core::mem::take(&mut self.lift_pending) {
+            return Some(TouchEvent::Up);
+        }
         let mut event = None;
         // A few reports at most per call, so that a line stuck low cannot
         // hold up the caller.
@@ -260,6 +271,10 @@ impl Touch {
                         if self.touching {
                             self.touching = false;
                             let _ = writeln!(log.stamp(), "touch: finger lifted");
+                            if event.is_some() {
+                                self.lift_pending = true;
+                                break;
+                            }
                             event = Some(TouchEvent::Up);
                         }
                     } else {

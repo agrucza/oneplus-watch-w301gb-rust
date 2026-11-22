@@ -6,3 +6,4 @@ pub mod faults;
 pub mod flash;
 pub mod ticket;
 pub mod watchdog;
+pub mod stack;

@@ -51,19 +51,9 @@ pub trait Paint: DrawTarget<Color = Rgb565> {
     /// preview on the PC uses; the watch's `Canvas` has the blitter do the
     /// blending.
     fn glyph(&mut self, clip: &Rectangle, x: i32, y: i32, font: &Font, character: u8, color: Rgb565) {
-        let Some(coverage) = font.glyph(character) else {
-            return;
-        };
-        let area = font.rect(x, y, 1).intersection(clip);
-        for row in area.rows() {
-            for column in area.columns() {
-                let c = coverage[(row - y) as usize * font.width as usize + (column - x) as usize] as u32;
-                if c != 0 {
-                    let part = |channel: u8| ((channel as u32 * c + 127) / 255) as u8;
-                    let shade = Rgb565::new(part(color.r()), part(color.g()), part(color.b()));
-                    let _ = self.fill_solid(&Rectangle::new(Point::new(column, row), Size::new(1, 1)), shade);
-                }
-            }
+        if let Some(coverage) = font.glyph(character) {
+            let area = font.rect(x, y, 1).intersection(clip);
+            glyph_on_black(self, &area, x, y, font, coverage, color);
         }
     }
 
@@ -74,6 +64,23 @@ pub trait Paint: DrawTarget<Color = Rgb565> {
             // Characters wholly outside the clip cost nothing.
             if !font.rect(at, y, 1).intersection(clip).is_zero_sized() && character != b' ' {
                 self.glyph(clip, at, y, font, character, color);
+            }
+        }
+    }
+}
+
+/// Draw the part of a character that lies in `area`, by hand: each pixel
+/// gets the colour scaled by the character's coverage there, which is
+/// right on a black background. The character's top left corner is at
+/// (x, y).
+pub fn glyph_on_black<D: DrawTarget<Color = Rgb565> + ?Sized>(target: &mut D, area: &Rectangle, x: i32, y: i32, font: &Font, coverage: &[u8], color: Rgb565) {
+    for row in area.rows() {
+        for column in area.columns() {
+            let c = coverage[(row - y) as usize * font.width as usize + (column - x) as usize] as u32;
+            if c != 0 {
+                let part = |channel: u8| ((channel as u32 * c + 127) / 255) as u8;
+                let shade = Rgb565::new(part(color.r()), part(color.g()), part(color.b()));
+                let _ = target.fill_solid(&Rectangle::new(Point::new(column, row), Size::new(1, 1)), shade);
             }
         }
     }

@@ -16,7 +16,10 @@
 //! all, in which the processor fills some 260 pixels itself.
 
 use core::future::Future;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
+
+use embassy_time::{Duration, Instant};
 
 use embassy_stm32::dma2d::{AlphaMode, Buffer2D, BufferKind, ColorConfig, Dma2d, PixelFormat};
 use embassy_stm32::peripherals::DMA2D;
@@ -26,7 +29,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::drivers::panel::{Frame, HEIGHT, WIDTH};
-use crate::services::font::{Font, Paint};
+use crate::services::font::{self, Font, Paint};
 
 /// Rectangles of at least this many pixels are filled by the blitter.
 const BLITTER_FROM: u32 = 320;
@@ -72,6 +75,10 @@ impl Paint for Canvas<'_> {
         if area.is_zero_sized() {
             return;
         }
+        if !blitter_usable() {
+            // Without the blitter: the plain way, on black.
+            return font::glyph_on_black(self, &area, x, y, font, coverage, color);
+        }
         let (w, h) = (area.size.width as u16, area.size.height as u16);
         let glyph = Buffer2D::new(coverage.as_ptr() as *mut u8, PixelFormat::A8, font.width as u16, font.width as u16, font.height as u16);
         let from = glyph.region((area.top_left.x - x) as u16, (area.top_left.y - y) as u16, w, h);
@@ -81,7 +88,9 @@ impl Paint for Canvas<'_> {
         // The colour as the blitter takes it: eight bits each of red,
         // green and blue.
         let rgb = (color.r() as u32 * 255 / 31) << 16 | (color.g() as u32 * 255 / 63) << 8 | (color.b() as u32 * 255 / 31);
-        let _ = finish(self.blitter.blit_with(&from, &onto, &into, Some(rgb)));
+        if !matches!(finish(self.blitter.blit_with(&from, &onto, &into, Some(rgb))), Some(Ok(()))) {
+            font::glyph_on_black(self, &area, x, y, font, coverage, color);
+        }
     }
 }
 
@@ -99,12 +108,18 @@ impl Paint for Canvas<'_> {
 /// while the first one's "done" is already being reported. The processor
 /// then draws into an area the blitter is still filling. (Seen on the
 /// watch as pieces missing from what was drawn after a fill.)
-fn finish<F: Future>(operation: F) -> F::Output {
+///
+/// A blitter that has not finished after `BLITTER_PATIENCE` is given up
+/// on: the operation is aborted, `None` comes back, and from then on
+/// everything is drawn by the processor (`blitter_usable`). Every
+/// operation here finishes in well under a millisecond when all is well.
+fn finish<F: Future>(operation: F) -> Option<F::Output> {
     let mut operation = core::pin::pin!(operation);
     let mut context = Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + BLITTER_PATIENCE;
     loop {
         if let Poll::Ready(output) = operation.as_mut().poll(&mut context) {
-            return output;
+            return Some(output);
         }
         // Started. Wait for "transfer complete", "transfer error" or
         // "configuration error".
@@ -113,8 +128,24 @@ fn finish<F: Future>(operation: F) -> F::Output {
             if flags.tcif() || flags.teif() || flags.ceif() {
                 break;
             }
+            if Instant::now() > deadline {
+                // Stop it (control register bit 2, "abort") and do without.
+                embassy_stm32::pac::DMA2D.cr().modify(|w| w.0 |= 1 << 2);
+                BLITTER_GIVEN_UP.store(true, Ordering::Relaxed);
+                return None;
+            }
         }
     }
+}
+
+/// How long one blitter operation may take before it is given up on.
+const BLITTER_PATIENCE: Duration = Duration::from_millis(50);
+/// Set when the blitter once failed to finish; see `finish`.
+static BLITTER_GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
+/// False once the blitter has been given up on.
+pub fn blitter_usable() -> bool {
+    !BLITTER_GIVEN_UP.load(Ordering::Relaxed)
 }
 
 impl OriginDimensions for Canvas<'_> {
@@ -146,12 +177,13 @@ impl DrawTarget for Canvas<'_> {
         }
         let raw = RawU16::from(color).into_inner();
         let (x, w) = (area.top_left.x as usize, area.size.width as usize);
-        if area.size.width * area.size.height >= BLITTER_FROM {
+        if area.size.width * area.size.height >= BLITTER_FROM && blitter_usable() {
             let region = self.buffer().region(x as u16, area.top_left.y as u16, w as u16, area.size.height as u16);
-            if finish(self.blitter.fill(&region, raw as u32)).is_ok() {
+            if matches!(finish(self.blitter.fill(&region, raw as u32)), Some(Ok(()))) {
                 return Ok(());
             }
-            // The blitter reported an error: the processor does it.
+            // The blitter reported an error or did not finish: the
+            // processor does it.
         }
         for y in area.rows() {
             let start = y as usize * WIDTH + x;
