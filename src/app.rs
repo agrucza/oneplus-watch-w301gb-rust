@@ -20,7 +20,6 @@ use crate::services::update::server::{Activity, Server};
 use crate::services::brightness::AutoBrightness;
 use crate::services::damage::Damage;
 use crate::services::{bluetooth, clock, factory, storage};
-use embedded_graphics::prelude::*;
 
 /// Volume the update package and the installed image file live on.
 const IMAGE_VOLUME: usize = 1;
@@ -1058,14 +1057,15 @@ impl Screen {
             // element that reaches into it, cut off at its edge.
             let mut canvas = self.panel.canvas();
             for area in changes.rects(face::whole()) {
-                let mut clipped = canvas.clipped(&area);
-                status::background(&mut clipped, &area);
+                canvas.clip_to(&area);
+                let clipped = &mut canvas;
+                status::background(clipped, &area);
                 self.areas += 1;
                 self.stages[1] += lap(&mut stage); // background
                 for n in 0..face::ELEMENTS {
                     if face::overlap(&self.face_rects[n], &area) {
                         self.stages[2] += lap(&mut stage); // finding what overlaps
-                        face::draw(&mut clipped, &area, n, &state);
+                        face::draw(clipped, &area, n, &state);
                         self.draws += 1;
                         self.stages[3 + face::kind(n)] += lap(&mut stage);
                     }
@@ -1105,16 +1105,16 @@ impl Screen {
         let dots = &self.dots[..self.dot_count.min(self.dots.len())];
         let mut canvas = self.panel.canvas();
         for area in changes.rects(status::whole()) {
-            let mut clipped = canvas.clipped(&area);
-            status::background(&mut clipped, &area);
+            canvas.clip_to(&area);
+            status::background(&mut canvas, &area);
             for &(x, y) in dots {
-                if !status::dot_rect(x, y).intersection(&area).is_zero_sized() {
-                    status::dot(&mut clipped, x, y);
+                if face::overlap(&status::dot_rect(x, y), &area) {
+                    status::dot(&mut canvas, x, y);
                 }
             }
             for (row, line) in lines.iter().enumerate() {
-                if !status::line_rect(row).intersection(&area).is_zero_sized() {
-                    status::draw_line(&mut clipped, row, line);
+                if face::overlap(&status::line_rect(row), &area) {
+                    status::draw_line(&mut canvas, &area, row, line);
                 }
             }
         }

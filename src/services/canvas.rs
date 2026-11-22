@@ -3,6 +3,12 @@
 //! `Canvas` borrows a frame for as long as something is being drawn; the
 //! picture reaches the panel with the next `Panel::present`.
 //!
+//! Drawing can be limited to a rectangle (`clip_to`), which is how only
+//! the changed parts of a picture are repainted.
+//!
+//! Text from a `services::font::Font` is blended in by the blitter, one
+//! character an operation.
+//!
 //! Filled rectangles above a certain size go through the chip's hardware
 //! blitter (DMA2D), everything else is written by the processor. Measured
 //! on the watch: the blitter fills at about 22 ns a pixel against the
@@ -12,7 +18,7 @@
 use core::future::Future;
 use core::task::{Context, Poll, Waker};
 
-use embassy_stm32::dma2d::{Buffer2D, Dma2d, PixelFormat};
+use embassy_stm32::dma2d::{AlphaMode, Buffer2D, BufferKind, ColorConfig, Dma2d, PixelFormat};
 use embassy_stm32::peripherals::DMA2D;
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
@@ -20,6 +26,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::drivers::panel::{Frame, HEIGHT, WIDTH};
+use crate::services::font::{Font, Paint};
 
 /// Rectangles of at least this many pixels are filled by the blitter.
 const BLITTER_FROM: u32 = 320;
@@ -27,11 +34,54 @@ const BLITTER_FROM: u32 = 320;
 pub struct Canvas<'a> {
     frame: &'a mut Frame,
     blitter: &'a mut Dma2d<'static, DMA2D>,
+    /// Nothing is drawn outside this rectangle.
+    clip: Rectangle,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(frame: &'a mut Frame, blitter: &'a mut Dma2d<'static, DMA2D>) -> Self {
-        Self { frame, blitter }
+        // What the blitter writes is always a frame: 16 bits a pixel.
+        blitter.set_color_config(BufferKind::Output, &ColorConfig { pixel_format: PixelFormat::Rgb565, alpha_mode: AlphaMode::NoModify });
+        Self { frame, blitter, clip: whole() }
+    }
+
+    /// Draw only inside `area` from now on.
+    pub fn clip_to(&mut self, area: &Rectangle) {
+        self.clip = area.intersection(&whole());
+    }
+
+    /// The frame as the blitter wants it described.
+    fn buffer(&mut self) -> Buffer2D {
+        Buffer2D::new(self.frame.as_mut_ptr() as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, HEIGHT as u16)
+    }
+}
+
+fn whole() -> Rectangle {
+    Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32))
+}
+
+impl Paint for Canvas<'_> {
+    /// One character, blended into the frame by the blitter: the
+    /// character's coverage bitmap is the "how much" for every pixel, the
+    /// colour is fixed, and what is in the frame is the background.
+    fn glyph(&mut self, clip: &Rectangle, x: i32, y: i32, font: &Font, character: u8, color: Rgb565) {
+        let Some(coverage) = font.glyph(character) else {
+            return;
+        };
+        let area = font.rect(x, y, 1).intersection(clip).intersection(&self.clip);
+        if area.is_zero_sized() {
+            return;
+        }
+        let (w, h) = (area.size.width as u16, area.size.height as u16);
+        let glyph = Buffer2D::new(coverage.as_ptr() as *mut u8, PixelFormat::A8, font.width as u16, font.width as u16, font.height as u16);
+        let from = glyph.region((area.top_left.x - x) as u16, (area.top_left.y - y) as u16, w, h);
+        let buffer = self.buffer();
+        let onto = buffer.region(area.top_left.x as u16, area.top_left.y as u16, w, h);
+        let into = buffer.region(area.top_left.x as u16, area.top_left.y as u16, w, h);
+        // The colour as the blitter takes it: eight bits each of red,
+        // green and blue.
+        let rgb = (color.r() as u32 * 255 / 31) << 16 | (color.g() as u32 * 255 / 63) << 8 | (color.b() as u32 * 255 / 31);
+        let _ = finish(self.blitter.blit_with(&from, &onto, &into, Some(rgb)));
     }
 }
 
@@ -82,7 +132,7 @@ impl DrawTarget for Canvas<'_> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(point, color) in pixels {
-            if (0..WIDTH as i32).contains(&point.x) && (0..HEIGHT as i32).contains(&point.y) {
+            if self.clip.contains(point) {
                 self.frame[point.y as usize * WIDTH + point.x as usize] = RawU16::from(color).into_inner();
             }
         }
@@ -90,12 +140,14 @@ impl DrawTarget for Canvas<'_> {
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        let area = area.intersection(&self.bounding_box());
+        let area = area.intersection(&self.clip);
+        if area.is_zero_sized() {
+            return Ok(());
+        }
         let raw = RawU16::from(color).into_inner();
         let (x, w) = (area.top_left.x as usize, area.size.width as usize);
         if area.size.width * area.size.height >= BLITTER_FROM {
-            let buffer = Buffer2D::new(self.frame.as_mut_ptr() as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, HEIGHT as u16);
-            let region = buffer.region(x as u16, area.top_left.y as u16, w as u16, area.size.height as u16);
+            let region = self.buffer().region(x as u16, area.top_left.y as u16, w as u16, area.size.height as u16);
             if finish(self.blitter.fill(&region, raw as u32)).is_ok() {
                 return Ok(());
             }

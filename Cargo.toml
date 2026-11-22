@@ -26,7 +26,6 @@ embedded-sdmmc = { version = "0.10", default-features = false }
 defmt = "1"
 defmt-rtt = "1"
 embedded-graphics = "0.8"
-profont = "0.7"
 
 [profile.dev]
 opt-level = 1          # unoptimised embedded code is painfully big/slow

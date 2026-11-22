@@ -18,18 +18,17 @@
 
 use core::fmt::Write;
 
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
-use profont::{PROFONT_14_POINT, PROFONT_18_POINT};
+
+use crate::services::font::{Font, Paint};
+use crate::services::font_data::{MEDIUM as TEXT_MEDIUM, SMALL as TEXT_SMALL};
 
 /// The picture is `SIZE` x `SIZE`, round, centred on (`C`, `C`).
 pub const SIZE: i32 = 454;
 const C: i32 = SIZE / 2;
 
-const BLACK: Rgb565 = Rgb565::BLACK;
 const TEAL: Rgb565 = Rgb565::new(0, 56, 27);
 const TEAL_MID: Rgb565 = Rgb565::new(0, 34, 17);
 const TEAL_DIM: Rgb565 = Rgb565::new(0, 13, 7);
@@ -121,6 +120,9 @@ const BIG_X: [i32; 4] = [103, 161, 247, 305];
 const SMALL: Digit = Digit { w: 22, h: 40, t: 5 };
 const SMALL_Y: i32 = 282;
 const SMALL_X: [i32; 2] = [202, 230];
+/// Where the date and the status line have their top edge.
+const DATE_Y: i32 = 152;
+const STATUS_Y: i32 = 129;
 // The two dials.
 const DIAL_Y: i32 = 302;
 const DIAL_X: [i32; 2] = [140, 314];
@@ -204,8 +206,8 @@ pub fn rect(n: usize, s: &State) -> Rectangle {
         HOUR_TENS..=MINUTE_ONES => BIG.rect(BIG_X[n - HOUR_TENS], BIG_Y),
         COLON => Rectangle::new(Point::new(219, BIG_Y), Size::new(16, BIG.h as u32)),
         SECOND_TENS | SECOND_ONES => SMALL.rect(SMALL_X[n - SECOND_TENS], SMALL_Y),
-        DATE => text_rect(152, &PROFONT_18_POINT, 14),
-        STATUS => text_rect(128, &PROFONT_14_POINT, 18),
+        DATE => text_rect(DATE_Y, &TEXT_MEDIUM, 14),
+        STATUS => text_rect(STATUS_Y, &TEXT_SMALL, 18),
         BATTERY_DIAL | HEART_DIAL => Rectangle::with_center(Point::new(DIAL_X[n - BATTERY_DIAL], DIAL_Y), Size::new(53, 53)),
         BATTERY_MARK => segment_box(DIAL_X[0], DIAL_Y, MARK.0, MARK.1, battery_mark(s), battery_mark(s) + MARK_LENGTH),
         FIRST_HEART_MARK..BARS => {
@@ -269,7 +271,7 @@ fn spin(s: &State, period: u32) -> u32 {
 
 /// Draw element `n` as it shows `s`. Only pixels inside `clip` are worked
 /// out; the background there must already be black.
-pub fn draw<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
+pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
     let t = s.time;
     let digit = |value: Option<u8>, tens: bool| value.map(|v| if tens { v / 10 } else { v % 10 });
     match n {
@@ -332,7 +334,7 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, n: 
                     let _ = write!(text, "NO TIME SIGNAL");
                 }
             }
-            centred(target, text.as_str(), 152, &PROFONT_18_POINT, TEAL);
+            centred(target, clip, text.as_str(), C, DATE_Y, &TEXT_MEDIUM, TEAL);
         }
         STATUS => {
             let mut text = Label::new();
@@ -349,7 +351,7 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, n: 
             if let Some(temperature) = s.temperature {
                 let _ = write!(text, " : {}.{}C", temperature / 10, (temperature % 10).abs());
             }
-            centred(target, text.as_str(), 128, &PROFONT_14_POINT, ORANGE);
+            centred(target, clip, text.as_str(), C, STATUS_Y, &TEXT_SMALL, ORANGE);
         }
         BATTERY_DIAL => {
             let (x, y) = (DIAL_X[0], DIAL_Y);
@@ -371,7 +373,7 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, n: 
             // the marks circling outside touch the dial's rectangle at
             // its corners, never the number.
             if touches(clip, x, y) {
-                centred_at(target, text.as_str(), x, y - 8, &PROFONT_14_POINT, if low { RED } else { TEAL });
+                centred(target, clip, text.as_str(), x, y - 9, &TEXT_SMALL, if low { RED } else { TEAL });
             }
         }
         HEART_DIAL => {
@@ -387,7 +389,7 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, n: 
                 }
             }
             if touches(clip, x, y) {
-                centred_at(target, text.as_str(), x, y - 8, &PROFONT_14_POINT, ORANGE);
+                centred(target, clip, text.as_str(), x, y - 9, &TEXT_SMALL, ORANGE);
             }
         }
         BATTERY_MARK => {
@@ -667,21 +669,15 @@ fn touches(clip: &Rectangle, x: i32, y: i32) -> bool {
     overlap(&Rectangle::with_center(Point::new(x, y), Size::new(34, 20)), clip)
 }
 
-/// The rectangle a centred line of `chars` characters at height `y` covers.
-fn text_rect(y: i32, font: &MonoFont<'_>, chars: u32) -> Rectangle {
-    let w = (font.character_size.width + font.character_spacing) * chars;
-    Rectangle::new(Point::new(C - w as i32 / 2 - 1, y), Size::new(w + 2, font.character_size.height))
-}
-
-fn centred<D: DrawTarget<Color = Rgb565>>(target: &mut D, text: &str, y: i32, font: &MonoFont<'_>, color: Rgb565) {
-    centred_at(target, text, C, y, font, color);
+/// The rectangle a line of `chars` characters, centred on the middle of
+/// the face with its top at `y`, covers.
+fn text_rect(y: i32, font: &Font, chars: usize) -> Rectangle {
+    font.rect(C - font.width as i32 * chars as i32 / 2, y, chars)
 }
 
 /// Draw `text` centred on `x` with its top at `y`.
-fn centred_at<D: DrawTarget<Color = Rgb565>>(target: &mut D, text: &str, x: i32, y: i32, font: &MonoFont<'_>, color: Rgb565) {
-    let position = TextStyleBuilder::new().alignment(Alignment::Center).baseline(Baseline::Top).build();
-    let style = MonoTextStyleBuilder::new().font(font).text_color(color).background_color(BLACK).build();
-    let _ = Text::with_text_style(text, Point::new(x, y), style, position).draw(target);
+fn centred<D: Paint>(target: &mut D, clip: &Rectangle, text: &str, x: i32, y: i32, font: &Font, color: Rgb565) {
+    target.text(clip, x - font.width as i32 * text.len() as i32 / 2, y, font, text, color);
 }
 
 /// A short piece of text put together with `write!`.

@@ -6,6 +6,8 @@ pub mod canvas;
 pub mod clock;
 pub mod damage;
 pub mod factory;
+pub mod font;
+pub mod font_data;
 pub mod log;
 #[allow(dead_code)] // some read helpers have no caller at the moment
 pub mod storage;

@@ -10,16 +10,15 @@
 
 use core::fmt::{self, Write};
 
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
-use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
-use profont::{PROFONT_18_POINT, PROFONT_24_POINT};
 
 use crate::drivers::apollo::messages::Readings;
 use crate::drivers::panel::{HEIGHT, WIDTH};
 use crate::services::clock;
+use crate::services::font::{Font, Paint};
+use crate::services::font_data::{LARGE, MEDIUM};
 
 const BACKGROUND: Rgb565 = Rgb565::BLACK;
 const DIM: Rgb565 = Rgb565::new(15, 31, 15); // mid grey
@@ -110,11 +109,11 @@ const LAYOUT: [(i32, bool, usize); LINES] = [
     (396, false, 10),
 ];
 
-fn font(big: bool) -> &'static embedded_graphics::mono_font::MonoFont<'static> {
+fn font(big: bool) -> &'static Font {
     if big {
-        &PROFONT_24_POINT
+        &LARGE
     } else {
-        &PROFONT_18_POINT
+        &MEDIUM
     }
 }
 
@@ -127,8 +126,7 @@ pub fn whole() -> Rectangle {
 pub fn line_rect(row: usize) -> Rectangle {
     let (y, big, width) = LAYOUT[row];
     let f = font(big);
-    let w = (f.character_size.width + f.character_spacing) * width as u32;
-    Rectangle::new(Point::new(WIDTH as i32 / 2 - w as i32 / 2 - 1, y), Size::new(w + 2, f.character_size.height))
+    f.rect(WIDTH as i32 / 2 - f.width as i32 * width as i32 / 2, y, width)
 }
 
 /// The rectangle the dot for a touch at (x, y) covers.
@@ -148,12 +146,12 @@ pub fn dot<D: DrawTarget<Color = Rgb565>>(target: &mut D, x: u16, y: u16) {
         .draw(target);
 }
 
-/// Draw line `row`.
-pub fn draw_line<D: DrawTarget<Color = Rgb565>>(target: &mut D, row: usize, line: &Line) {
+/// Draw line `row`, inside `clip` only, over a background that is
+/// already painted.
+pub fn draw_line<D: Paint>(target: &mut D, clip: &Rectangle, row: usize, line: &Line) {
     let (y, big, _) = LAYOUT[row];
-    let centre = TextStyleBuilder::new().alignment(Alignment::Center).baseline(Baseline::Top).build();
-    let style = MonoTextStyleBuilder::new().font(font(big)).text_color(line.color).background_color(BACKGROUND).build();
-    let _ = Text::with_text_style(line.as_str(), Point::new(WIDTH as i32 / 2, y), style, centre).draw(target);
+    let position = line_rect(row).top_left;
+    target.text(clip, position.x, y, font(big), line.as_str(), line.color);
 }
 
 /// Work out the text of every line.
