@@ -1,5 +1,6 @@
 //! The application: bring the hardware up in a safe order, then run.
 
+mod face;
 mod status;
 
 use core::fmt::Write;
@@ -17,7 +18,10 @@ use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
 use crate::services::brightness::AutoBrightness;
+use crate::services::canvas::Canvas;
+use crate::services::damage::Damage;
 use crate::services::{bluetooth, clock, factory, storage};
+use embedded_graphics::prelude::*;
 
 /// Volume the update package and the installed image file live on.
 const IMAGE_VOLUME: usize = 1;
@@ -522,10 +526,6 @@ fn rotate_log(partition: storage::Partition) -> Option<Result<u32, u8>> {
     }))
 }
 
-/// Diagnosis: after the first picture, send this many frames in a row and
-/// time them; 0 = no timing.
-const DISPLAY_TIMED_FRAMES: u32 = 0;
-
 /// Diagnosis: write and read back the whole PSRAM at every start (about
 /// 4 s). On while the memory bus speed is being changed.
 const PSRAM_FULL_TEST: bool = false;
@@ -577,6 +577,39 @@ impl WearView {
     }
 }
 
+/// How often the watch face is looked at for something that moved: about
+/// 15 times a second.
+const FACE_PERIOD: Duration = Duration::from_millis(66);
+
+/// The processor's cycle counter, for timing short stretches of code.
+fn cycles() -> u32 {
+    cortex_m::peripheral::DWT::cycle_count()
+}
+
+/// Cycles since `*since`, which is moved on to now.
+fn lap(since: &mut u32) -> u64 {
+    let now = cycles();
+    let passed = now.wrapping_sub(*since);
+    *since = now;
+    passed as u64
+}
+
+/// Switch the cycle counter on.
+fn start_cycle_counter() {
+    // Safety: only these two debug registers are touched, and nothing else
+    // in this firmware uses them.
+    let mut core = unsafe { cortex_m::Peripherals::steal() };
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
+}
+
+/// What the screen shows: the watch face, or the page of status text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Face,
+    Status,
+}
+
 /// The panel and what is currently shown on it.
 struct Screen {
     panel: panel::Panel,
@@ -600,6 +633,35 @@ struct Screen {
     /// Where the glass was touched, the latest 64 places; drawn as dots.
     dots: [(u16, u16); 64],
     dot_count: usize,
+    /// Which page is shown.
+    page: Page,
+    finger_down: bool,
+    /// What every element of the watch face showed when it was last
+    /// looked at (`face::key`).
+    face_keys: [Option<u32>; face::ELEMENTS],
+    /// Where every element of the watch face was when it was last drawn.
+    face_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
+    /// When the watch face is next looked at.
+    next_frame: Instant,
+    /// The second the clock showed last, and when it was seen to begin.
+    clock_second: Option<u8>,
+    second_began: Instant,
+    /// The lines as they were last composed.
+    lines: Option<[status::Line; status::LINES]>,
+    /// What has changed on the picture since each frame was drawn.
+    damage: Damage,
+    /// Diagnosis: pictures drawn, time spent drawing and pixels repainted
+    /// since the last log line, and when the next line is due.
+    pictures: u32,
+    drawing_us: u64,
+    drawing_max_us: u64,
+    pixels: u64,
+    /// Rectangles repainted and elements drawn into them (watch face).
+    areas: u32,
+    draws: u32,
+    /// Processor cycles spent in each stage of drawing the watch face.
+    stages: [u64; 9],
+    stats_due: u64,
     /// The picture has changed since it was last sent to the panel.
     changed: bool,
     /// Uptime second the screen was last drawn for.
@@ -608,8 +670,8 @@ struct Screen {
 }
 
 impl Screen {
-    fn new(mut panel: panel::Panel) -> Self {
-        panel.both(status::clear);
+    fn new(panel: panel::Panel) -> Self {
+        start_cycle_counter();
         Self {
             panel,
             visible: true,
@@ -625,6 +687,23 @@ impl Screen {
             last_touch: None,
             dots: [(0, 0); 64],
             dot_count: 0,
+            page: Page::Face,
+            finger_down: false,
+            face_keys: [None; face::ELEMENTS],
+            face_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
+            next_frame: Instant::now(),
+            clock_second: None,
+            second_began: Instant::now(),
+            lines: None,
+            damage: Damage::new(),
+            pictures: 0,
+            drawing_us: 0,
+            drawing_max_us: 0,
+            pixels: 0,
+            areas: 0,
+            draws: 0,
+            stages: [0; 9],
+            stats_due: 30,
             changed: false,
             drawn_for: None,
             refresh_logged: false,
@@ -692,10 +771,42 @@ impl Screen {
     }
 
     /// A finger is on the glass: mark the place with a dot.
+    /// The finger left the glass.
+    fn lifted(&mut self) {
+        self.finger_down = false;
+    }
+
+    /// A finger is on the glass. A new touch on the watch face goes to the
+    /// status page, and one in the top quarter of the status page goes
+    /// back; any other touch on the status page leaves a dot.
     fn touched(&mut self, x: u16, y: u16) {
-        // Kept in a list, because every picture is drawn afresh.
-        self.dots[self.dot_count % self.dots.len()] = (x, y);
+        let new_touch = !core::mem::replace(&mut self.finger_down, true);
+        let switch = match self.page {
+            Page::Face => new_touch,
+            Page::Status => new_touch && y < 110,
+        };
+        if switch {
+            self.page = if self.page == Page::Face { Page::Status } else { Page::Face };
+            // Nothing of the other page is on either frame.
+            self.damage.add(face::whole());
+            self.lines = None;
+            self.face_keys = [None; face::ELEMENTS];
+            self.changed = true;
+            return;
+        }
+        if self.page == Page::Face {
+            return;
+        }
+        // Kept in a list, from which they are drawn. The oldest gives way
+        // to the newest; both places have changed.
+        let slot = self.dot_count % self.dots.len();
+        if self.dot_count >= self.dots.len() {
+            let (old_x, old_y) = self.dots[slot];
+            self.damage.add(status::dot_rect(old_x, old_y));
+        }
+        self.dots[slot] = (x, y);
         self.dot_count += 1;
+        self.damage.add(status::dot_rect(x, y));
         self.last_touch = Some((x, y));
         self.changed = true;
     }
@@ -720,8 +831,8 @@ impl Screen {
         }
     }
 
-    /// Send the picture if it changed; once a second, redraw the status
-    /// text first. Takes about 40 ms when it sends.
+    /// Bring the picture up to date and present it, if anything on it
+    /// changed. Only what changed is drawn (see `services::damage`).
     async fn update(
         &mut self,
         readings: Option<&Readings>,
@@ -730,82 +841,208 @@ impl Screen {
         measuring_heart: bool,
         log: &mut Log,
     ) {
-        let uptime_s = Instant::now().as_secs();
+        let now = Instant::now();
+        let uptime_s = now.as_secs();
         let new_second = self.drawn_for != Some(uptime_s);
-        if !self.visible || !(new_second || self.changed) {
+        let back = self.panel.back_index();
+        // The watch face moves: it is looked at again every `FACE_PERIOD`.
+        let frame_due = self.page == Page::Face && now >= self.next_frame;
+        // On the status page a change is brought to the second frame at
+        // once. The watch face is drawn again shortly anyway, and that
+        // picture brings the second frame up to date as well.
+        let catch_up = self.page == Page::Status && self.damage.pending(back);
+        if !self.visible || !(new_second || self.changed || frame_due || catch_up) {
             return;
         }
+        self.next_frame = now + FACE_PERIOD;
         self.changed = false;
-        // Always the whole picture: the frame drawn into is the one from
-        // two pictures ago.
-        self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
+        if new_second {
+            self.drawn_for = Some(uptime_s);
+            self.log_brightness(log);
+        }
+
+        let started = Instant::now();
+        let worn = self.wear.update(readings.and_then(|r| r.wear).map(|w| w.on_wrist), self.visible_since);
+        if self.page == Page::Face {
+            // What every element shows now; those whose key differs from
+            // what is on the screen have changed.
+            // The clock counts whole seconds; the part of a second comes
+            // from when it was last seen to step.
+            let time = clock::now();
+            let second = time.map(|t| t.second);
+            if second != self.clock_second {
+                self.clock_second = second;
+                self.second_began = now;
+            }
+            let state = face::State {
+                millis: now.duration_since(self.second_began).as_millis().min(999) as u16,
+                ticks: now.as_millis() as u32,
+                time: time.map(|t| face::Time {
+                    year: t.year,
+                    month: t.month,
+                    day: t.day,
+                    weekday: t.weekday,
+                    hour: t.hour,
+                    minute: t.minute,
+                    second: t.second,
+                }),
+                battery: readings.and_then(|r| r.battery).map(|(percent, _, power)| (percent.min(100) as u8, power)),
+                heart: readings.and_then(|r| r.heart_bpm).filter(|_| measuring_heart).map(|bpm| bpm.min(999) as u16),
+                measuring: measuring_heart,
+                bluetooth: bluetooth_connected,
+                worn,
+                temperature: readings.and_then(|r| r.temperatures).map(|t| (t[0] * 10.0) as i16),
+            };
+            let mut stage = cycles();
+            for n in 0..face::ELEMENTS {
+                let key = Some(face::key(n, &state));
+                if self.face_keys[n] != key {
+                    // Where it was and where it is now: an element may
+                    // have moved.
+                    if self.face_keys[n].is_some() {
+                        self.damage.add(self.face_rects[n]);
+                    }
+                    let rect = face::rect(n, &state);
+                    self.damage.add(rect);
+                    self.face_keys[n] = key;
+                    self.face_rects[n] = rect;
+                }
+            }
+            let changes = self.damage.take(back);
+            self.stages[0] += lap(&mut stage); // comparing, listing changes
+            if changes.is_empty() {
+                return;
+            }
+            // Repaint each changed rectangle: background, then every
+            // element that reaches into it, cut off at its edge.
+            let mut canvas = Canvas(self.panel.back());
+            for area in changes.rects(face::whole()) {
+                let mut clipped = canvas.clipped(&area);
+                status::background(&mut clipped, &area);
+                self.areas += 1;
+                self.stages[1] += lap(&mut stage); // background
+                for n in 0..face::ELEMENTS {
+                    if face::overlap(&self.face_rects[n], &area) {
+                        self.stages[2] += lap(&mut stage); // finding what overlaps
+                        face::draw(&mut clipped, &area, n, &state);
+                        self.draws += 1;
+                        self.stages[3 + face::kind(n)] += lap(&mut stage);
+                    }
+                }
+                self.stages[2] += lap(&mut stage);
+            }
+            self.present(started, changes.area(face::whole()), uptime_s, log).await;
+            return;
+        }
+        // The status page. What the lines say now; those that differ from
+        // what is on the screen have changed.
+        let lines = status::compose(&status::Status {
+            uptime_s,
+            readings,
+            lux,
+            bluetooth_connected,
+            worn,
+            measuring_heart,
+            brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
+            brightness: self.level,
+            last_button: self.last_button,
+            last_touch: self.last_touch,
+        });
+        for row in 0..status::LINES {
+            if self.lines.map_or(true, |old| old[row] != lines[row]) {
+                self.damage.add(status::line_rect(row));
+            }
+        }
+        self.lines = Some(lines);
+
+        let changes = self.damage.take(back);
+        if changes.is_empty() {
+            return;
+        }
+        // Repaint each changed rectangle: background, then whatever
+        // reaches into it, in the order it lies on the screen. Drawing is
+        // cut off at the rectangle's edge.
+        let dots = &self.dots[..self.dot_count.min(self.dots.len())];
+        let mut canvas = Canvas(self.panel.back());
+        for area in changes.rects(status::whole()) {
+            let mut clipped = canvas.clipped(&area);
+            status::background(&mut clipped, &area);
+            for &(x, y) in dots {
+                if !status::dot_rect(x, y).intersection(&area).is_zero_sized() {
+                    status::dot(&mut clipped, x, y);
+                }
+            }
+            for (row, line) in lines.iter().enumerate() {
+                if !status::line_rect(row).intersection(&area).is_zero_sized() {
+                    status::draw_line(&mut clipped, row, line);
+                }
+            }
+        }
+        self.present(started, changes.area(status::whole()), uptime_s, log).await;
+    }
+
+    /// Present the picture that was just drawn (drawing began at
+    /// `started` and repainted `pixels` pixels), and keep the statistics.
+    async fn present(&mut self, started: Instant, pixels: u32, uptime_s: u64, log: &mut Log) {
+        let drawing = started.elapsed();
+        self.pictures += 1;
+        self.drawing_us += drawing.as_micros();
+        self.drawing_max_us = self.drawing_max_us.max(drawing.as_micros());
+        self.pixels += pixels as u64;
+
         let started = Instant::now();
         let r = self.panel.present().await;
-        // The first refresh and every failed one go to the log.
-        if !r.done || !self.refresh_logged {
-            let first = !self.refresh_logged;
+        // The first picture and every failure go to the log.
+        if !r.done || !r.in_step || !self.refresh_logged {
             self.refresh_logged = true;
             let _ = writeln!(
                 log.stamp(),
-                "display: refresh {}{} after {} ms; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
-                if r.done { "done" } else { "NOT finished" },
-                if r.in_step { ", in step with the panel" } else { ", NO tearing-effect pulse" },
+                "display: picture presented after {} ms{}{}; WISR={:#010x} ISR0={:#010x} ISR1={:#010x} PSR={:#010x}",
                 started.elapsed().as_millis(),
+                if r.done { "" } else { ", the frame before had NOT gone out" },
+                if r.in_step { ", in step with the panel" } else { ", NO tearing-effect pulse" },
                 r.wisr,
                 r.isr0,
                 r.isr1,
                 r.psr
             );
-            if first && DISPLAY_TIMED_FRAMES != 0 {
-                // Diagnosis: the status screen drawn and sent again and
-                // again, to see how many frames a second drawing and the
-                // link manage together, and how long drawing alone takes.
-                // Measured: sending the same picture without drawing, 120
-                // frames in 2040 ms (58 a second). Drawing, then sending
-                // and waiting for it: 6112 ms (19 a second), drawing alone
-                // 27 ms a frame. Drawing the next picture while the frame
-                // travels: 4081 ms (29 a second), drawing 29 ms a frame.
-                // (Handing text to the frame a rectangle at a time instead
-                // of pixel by pixel made no difference: 31 ms a frame.)
-                let (mut in_step, mut finished) = (0u32, 0u32);
-                let mut drawing = Duration::from_ticks(0);
-                let started = Instant::now();
-                for _ in 0..DISPLAY_TIMED_FRAMES {
-                    let before = Instant::now();
-                    self.redraw(uptime_s, readings, lux, bluetooth_connected, measuring_heart, log);
-                    drawing += before.elapsed();
-                    let r = self.panel.present().await;
-                    in_step += r.in_step as u32;
-                    finished += r.done as u32;
-                    watchdog::feed();
-                }
-                let ms = started.elapsed().as_millis().max(1);
-                let _ = writeln!(
-                    log.stamp(),
-                    "display: {} frames drawn and presented in {} ms ({} a second), drawing alone {} ms a frame; {} in step with the panel, {} gone out before the next",
-                    DISPLAY_TIMED_FRAMES,
-                    ms,
-                    DISPLAY_TIMED_FRAMES as u64 * 1000 / ms,
-                    drawing.as_millis() / DISPLAY_TIMED_FRAMES as u64,
-                    in_step,
-                    finished
-                );
-            }
+        }
+        // Diagnosis: what drawing costs, twice a minute.
+        if uptime_s >= self.stats_due {
+            self.stats_due = uptime_s + 30;
+            let _ = writeln!(
+                log.stamp(),
+                "display: a picture every {} ms ({} in 30 s); {} us of each is drawing, {} us at most; a picture on average: {} pixels in {} rectangles, {} elements drawn",
+                30_000 / self.pictures.max(1),
+                self.pictures,
+                self.drawing_us / self.pictures.max(1) as u64,
+                self.drawing_max_us,
+                self.pixels / self.pictures.max(1) as u64,
+                self.areas / self.pictures.max(1),
+                self.draws / self.pictures.max(1)
+            );
+            // Processor cycles at 120 a microsecond.
+            let us = |cycles: u64| cycles / 120 / self.pictures.max(1) as u64;
+            let _ = writeln!(
+                log.stamp(),
+                "display: drawing by stage, us a picture: comparing {}, background {}, finding overlaps {}; drawing rings {}, digits {}, text {}, dials {}, marks {}, bars {}",
+                us(self.stages[0]),
+                us(self.stages[1]),
+                us(self.stages[2]),
+                us(self.stages[3]),
+                us(self.stages[4]),
+                us(self.stages[5]),
+                us(self.stages[6]),
+                us(self.stages[7]),
+                us(self.stages[8])
+            );
+            self.stages = [0; 9];
+            (self.pictures, self.drawing_us, self.drawing_max_us, self.pixels, self.areas, self.draws) = (0, 0, 0, 0, 0, 0);
         }
     }
 
-    /// Draw the status text for this second into the frame.
-    fn redraw(
-        &mut self,
-        uptime_s: u64,
-        readings: Option<&Readings>,
-        lux: Option<u32>,
-        bluetooth_connected: bool,
-        measuring_heart: bool,
-        log: &mut Log,
-    ) {
-        self.drawn_for = Some(uptime_s);
-        // Where automatic brightness has arrived, at most once a second.
+    /// Where automatic brightness has arrived, at most once a second.
+    fn log_brightness(&mut self, log: &mut Log) {
         if self.fixed.is_none() && self.level == self.auto.wanted() && self.level != self.level_logged {
             let _ = writeln!(
                 log.stamp(),
@@ -816,25 +1053,6 @@ impl Screen {
             );
             self.level_logged = self.level;
         }
-        let worn = self.wear.update(readings.and_then(|r| r.wear).map(|w| w.on_wrist), self.visible_since);
-        for &(x, y) in &self.dots[..self.dot_count.min(self.dots.len())] {
-            status::dot(self.panel.back(), x, y);
-        }
-        status::draw(
-            self.panel.back(),
-            &status::Status {
-                uptime_s,
-                readings,
-                lux,
-                bluetooth_connected,
-                worn,
-                measuring_heart,
-                brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
-                brightness: self.level,
-                last_button: self.last_button,
-                last_touch: self.last_touch,
-            },
-        );
     }
 }
 
@@ -970,8 +1188,10 @@ async fn main_loop(
             _ => None,
         };
         if let Some(screen) = screen.as_mut() {
-            if let Some(TouchEvent::Down { x, y }) = touched {
-                screen.touched(x, y);
+            match touched {
+                Some(TouchEvent::Down { x, y }) => screen.touched(x, y),
+                Some(TouchEvent::Up) => screen.lifted(),
+                None => {}
             }
             if let Some(lux) = lux {
                 screen.ambient(lux);

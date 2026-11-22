@@ -12,13 +12,6 @@ use crate::drivers::panel::{Frame, HEIGHT, WIDTH};
 
 pub struct Canvas<'a>(pub &'a mut Frame);
 
-impl Canvas<'_> {
-    /// Fill the whole frame with one colour.
-    pub fn clear_to(&mut self, color: Rgb565) {
-        self.0.fill(RawU16::from(color).into_inner());
-    }
-}
-
 impl OriginDimensions for Canvas<'_> {
     fn size(&self) -> Size {
         Size::new(WIDTH as u32, HEIGHT as u32)

@@ -164,7 +164,13 @@ impl Panel {
         self.frames[1 - self.shown]
     }
 
+    /// Which of the two frames `back` is: 0 or 1.
+    pub fn back_index(&self) -> usize {
+        1 - self.shown
+    }
+
     /// Run `f` on both frames (for clearing them).
+    #[allow(dead_code)]
     pub fn both(&mut self, mut f: impl FnMut(&mut Frame)) {
         f(self.frames[0]);
         f(self.frames[1]);
