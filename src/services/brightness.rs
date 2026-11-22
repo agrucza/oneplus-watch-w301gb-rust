@@ -1,51 +1,45 @@
 //! Automatic display brightness: from the ambient light in lux to the
 //! panel's brightness value.
 //!
-//! The curve is our own choice, not the stock firmware's (its table has not
-//! been looked for). It is anchored on the one known point: the stock app
-//! starts the panel at 0x85, and a desk under room light reads about 270 lux.
+//! The steps are the stock app's (`0x0804149A`, run once a second there):
+//! seven ranges of lux, each with a brightness value from the table in its
+//! initialised data (RAM 0x2002C0D9).
 //!
-//! Two things keep the display from flickering:
+//! Our own additions keep the display from flickering:
 //!   - the light readings are averaged (about one second at four readings a
 //!     second), so a hand passing over the watch does little;
-//!   - the wanted brightness only moves once the curve is `HYSTERESIS` away
-//!     from it, so light sitting at the edge between two values does not
-//!     make it step back and forth.
+//!   - a step is only left once the light is 10 % past its limit, so light
+//!     sitting right at a limit does not make the display step back and
+//!     forth.
 //!
 //! Moving the panel to the wanted value in small steps is the caller's job.
 
-/// (lux, panel brightness), ascending; straight lines in between.
-const CURVE: [(u32, u8); 6] = [(0, 0x10), (10, 0x28), (50, 0x50), (250, 0x85), (1000, 0xC0), (5000, 0xFF)];
-/// How far the curve must be from the wanted value before that follows.
-const HYSTERESIS: u8 = 10;
+/// (from this many lux, panel brightness), ascending. Stock: below 11 lux,
+/// 11-40, 41-360, 361-1200, 1201-5000, 5001-8000, above 8000.
+const STEPS: [(u32, u8); 7] = [(0, 0x39), (11, 0x50), (41, 0x6E), (361, 0x85), (1201, 0xAC), (5001, 0xC8), (8001, 0xD7)];
+/// How far past a limit the light must be before the step changes, in percent.
+const MARGIN_PERCENT: u32 = 10;
 /// Weight of a new reading in the average: 1 / this.
 const SMOOTHING: u32 = 4;
 
-/// The panel brightness the curve gives for `lux`.
-pub fn curve(lux: u32) -> u8 {
-    let mut below = CURVE[0];
-    for above in CURVE {
-        if lux < above.0 {
-            let span = above.0 - below.0;
-            let rise = (above.1 - below.1) as u32;
-            return below.1 + ((lux - below.0) * rise / span) as u8;
-        }
-        below = above;
-    }
-    below.1
+/// The step the stock app would choose for `lux`.
+fn step_for(lux: u32) -> usize {
+    STEPS.iter().rposition(|&(from, _)| lux >= from).unwrap_or(0)
 }
 
 pub struct AutoBrightness {
     /// Averaged light in 1/16 lux; `None` before the first reading.
     average: Option<u32>,
+    /// The current step; `None` before the first reading.
+    step: Option<usize>,
     wanted: u8,
 }
 
 impl AutoBrightness {
     /// `current` is what the panel is set to now; it stays the wanted value
-    /// until the light says otherwise.
+    /// until the first light reading.
     pub fn new(current: u8) -> Self {
-        Self { average: None, wanted: current }
+        Self { average: None, step: None, wanted: current }
     }
 
     /// The brightness the panel should have.
@@ -67,13 +61,24 @@ impl AutoBrightness {
             Some(a) => (a * (SMOOTHING - 1) + reading) / SMOOTHING,
         };
         self.average = Some(average);
-        let now = curve(average / 16);
-        // The ends of the curve are always reached, hysteresis or not.
-        let at_end = now == CURVE[0].1 || now == CURVE[CURVE.len() - 1].1;
-        if now.abs_diff(self.wanted) >= HYSTERESIS || (at_end && now != self.wanted) {
-            self.wanted = now;
-            return true;
-        }
-        false
+        let lux = average / 16;
+        let step = match self.step {
+            None => step_for(lux),
+            Some(mut step) => {
+                // Up while the light is clearly past the next limit, down
+                // while it is clearly below this step's own.
+                while step + 1 < STEPS.len() && lux * 100 >= STEPS[step + 1].0 * (100 + MARGIN_PERCENT) {
+                    step += 1;
+                }
+                while step > 0 && lux * 100 < STEPS[step].0 * (100 - MARGIN_PERCENT) {
+                    step -= 1;
+                }
+                step
+            }
+        };
+        let changed = self.step != Some(step);
+        self.step = Some(step);
+        self.wanted = STEPS[step].1;
+        changed
     }
 }

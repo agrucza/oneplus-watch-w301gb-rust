@@ -95,6 +95,22 @@ fn read_block(out: &mut [u8; BLOCK]) -> bool {
     false
 }
 
+/// Copy `out.len()` bytes from `offset` of the newest valid block. The
+/// block holds more than the update record: the stock app keeps device
+/// data in it too (see `services::factory`). False if there is no valid
+/// block or the range does not fit.
+pub fn read_record(offset: usize, out: &mut [u8]) -> bool {
+    let mut block = [0u8; BLOCK];
+    let Some(end) = offset.checked_add(out.len()).filter(|&end| end <= BLOCK) else {
+        return false;
+    };
+    if !read_block(&mut block) {
+        return false;
+    }
+    out.copy_from_slice(&block[offset..end]);
+    true
+}
+
 /// Same algorithm as the bootloader's `flash_write_balance`.
 fn write_block(block: &mut [u8; BLOCK]) -> Result<(), flash::Error> {
     block[0] = MAGIC;

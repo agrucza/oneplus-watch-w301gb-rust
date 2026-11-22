@@ -17,7 +17,7 @@ use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
 use crate::services::brightness::AutoBrightness;
-use crate::services::{bluetooth, clock, storage};
+use crate::services::{bluetooth, clock, factory, storage};
 
 /// Volume the update package and the installed image file live on.
 const IMAGE_VOLUME: usize = 1;
@@ -87,12 +87,17 @@ pub async fn run(board: Board) {
         // Sensor bus and light sensor. Nothing depends on them.
         let mut bus = board.sensor_bus.open();
         light::scan(&mut bus, &mut log);
-        let light = light::LightSensor::start(&mut bus, &mut log).await;
+        let factor = factory::light_calibration(&mut log).unwrap_or_else(|| {
+            let _ = writeln!(log.stamp(), "light sensor: using the stock default factor {}", light::DEFAULT_FACTOR);
+            light::DEFAULT_FACTOR
+        });
+        let light = light::LightSensor::start(&mut bus, factor, &mut log).await;
         let _ = log.flush();
         let sensors = Sensors {
             bus,
             light,
             last_raw: None,
+            last_lux: None,
             ready_at: Instant::now() + LIGHT_FIRST_READING,
             read_at: None,
             logged_for: None,
@@ -237,7 +242,7 @@ impl Screen {
     async fn update(
         &mut self,
         readings: Option<&Readings>,
-        light: Option<light::Raw>,
+        lux: Option<u32>,
         bluetooth_connected: bool,
         log: &mut Log,
     ) {
@@ -248,7 +253,7 @@ impl Screen {
         }
         self.changed = false;
         if new_second {
-            self.redraw(uptime_s, readings, light, bluetooth_connected, log);
+            self.redraw(uptime_s, readings, lux, bluetooth_connected, log);
         }
         let started = Instant::now();
         let r = self.panel.refresh().await;
@@ -273,7 +278,7 @@ impl Screen {
         &mut self,
         uptime_s: u64,
         readings: Option<&Readings>,
-        light: Option<light::Raw>,
+        lux: Option<u32>,
         bluetooth_connected: bool,
         log: &mut Log,
     ) {
@@ -294,7 +299,7 @@ impl Screen {
             &status::Status {
                 uptime_s,
                 readings,
-                light,
+                lux,
                 bluetooth_connected,
                 brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
                 brightness: self.level,
@@ -317,6 +322,8 @@ struct Sensors {
     bus: light::Bus,
     light: Option<light::LightSensor>,
     last_raw: Option<light::Raw>,
+    /// The last reading in lux.
+    last_lux: Option<u32>,
     /// From when the light sensor's values can be used.
     ready_at: Instant,
     /// When the light sensor was last read.
@@ -339,6 +346,7 @@ impl Sensors {
         }
         self.read_at = Some(Instant::now());
         self.last_raw = light.read(&mut self.bus);
+        self.last_lux = self.last_raw.map(|raw| light.lux(raw));
         let now = Instant::now().as_secs();
         if (self.logged < 5 || now % 10 == 0) && self.logged_for != Some(now) {
             self.logged_for = Some(now);
@@ -348,7 +356,7 @@ impl Sensors {
                     let _ = writeln!(
                         log.stamp(),
                         "light sensor: {} lux (raw {} / {})",
-                        light::LightSensor::lux(raw),
+                        light.lux(raw),
                         raw.light,
                         raw.second
                     );
@@ -366,13 +374,13 @@ impl Sensors {
                 let _ = writeln!(
                     log.stamp(),
                     "light sensor: new maximum, {} lux (raw {} / {})",
-                    light::LightSensor::lux(raw),
+                    light.lux(raw),
                     raw.light,
                     raw.second
                 );
             }
         }
-        self.last_raw.map(light::LightSensor::lux)
+        self.last_lux
     }
 }
 
@@ -424,7 +432,7 @@ async fn main_loop(
             }
             if !server.transferring() {
                 screen.fade(&mut log).await;
-                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_raw, server.connected, &mut log).await;
+                screen.update(apollo.as_ref().map(|a| &a.readings), sensors.last_lux, server.connected, &mut log).await;
             }
         }
 

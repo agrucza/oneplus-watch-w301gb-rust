@@ -30,7 +30,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
-| 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: approximate lux, automatic brightness |
+| 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: calibrated lux, automatic brightness as in the stock app |
 | 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
 | 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth, shown on screen |
@@ -163,47 +163,46 @@ Remaining:
 4. Larger fonts and a real watch face.
 5. Always-on mode (`lcd_alwayson` in the stock strings): later.
 
-### 3.4 Ambient light sensor (item 10) - done, refinements left
+### 3.4 Ambient light sensor (item 10) - done
 
 **Measured:** STK31800 on I2C2 at address 0x45, product ID 0x82. Register 2
 holds the light channel's gain (bits 5:4: x1, x4, x16, x64) and measurement
-time (bits 3:0); register 0x4E the second channel's gain (bits 5:4, plus a
-large step in bit 2). With the light channel at x64 and the second at x4,
-and the stock lux formula (`0x08077948`), an indoor desk reads about 270
-lux in the evening and 400 to 550 lux by day, steady within a few lux.
+time (bits 3:0); register 0x4E the second channel's gain.
 
-The stock driver's table of 14 register settings is in the app's compressed
-initial data and was not recovered; the gains above were found by
-experiment. The second channel's gain is inferred from the ratio bands of
-the stock formula, and the stock calibration offsets are not applied.
+**Settings:** the stock driver's table of 14 register settings, recovered
+from the app's packed start-up data by running its own unpacking routine
+(`0x081A8638`) in an emulator. It sets the light channel to x16 and the
+second channel to x1; what the other twelve registers do is not known. The
+sensor does not keep its settings across the switch from the stock
+firmware to ours (a register dump showed reset defaults).
 
-The stock app also carries a driver for a second part at 0x53; this watch
-has the STK.
+**Lux:** the stock formula (`0x08077948`) scales the light channel by 1.36,
+1.00, 0.78 or 0.63 depending on the ratio of the two channels, then
+multiplies by a calibration factor measured for each watch at the factory
+(`0x080779E8`; 1000 divided by the reading under a reference light). The
+factor is in the device block in internal flash at `0x08019000`, the block
+that also carries the bootloader's update record, in a checksummed record
+at offset 0x50; `services::factory` reads it. With it a desk in daylight
+reads about 20 to 30 lux, a phone torch at the glass about 3000.
 
-**Range (measured with a phone torch):** the light channel rises smoothly
-from about 400 counts (room) to 59,000 with the torch at the glass, without
-saturating; its 16-bit limit is 65,535, so direct sun will exceed it at this
-gain. The sensor reads 0 until its first measurement is finished (within
-270 ms of switching on). The display's own light does not reach the sensor:
-the reading is the same with the display dark and at full brightness.
+The formula jumps where the ratio crosses a limit: the same light read 18
+and 32 lux alternately with the ratio at 0.23. That is the stock
+behaviour.
 
-**The lux formula jumps:** it multiplies by 1.36, 1.00, 0.78 or 0.63
-depending on the ratio of the two channels. Where the ratio crosses a
-limit the lux value steps (seen with the torch: 8301 lux at 6104 counts,
-then 8136 lux at 8136 counts). On the other hand, two room readings with
-quite different raw values (403 / 83 and 878 / 329) both came out at about
-550 lux, so the formula does compensate for the kind of light.
+**Not taken over:** the stock app subtracts two offsets that it derives
+from what the display shows (`0x08077B58`), because the sensor sits under
+the display. Measured here, the display's light made no clear difference.
 
-**Automatic brightness** (`services::brightness`): four readings a second,
-averaged over about a second, mapped by our own curve (0 lux: 16, 250 lux:
-133, 5000 lux and above: 255), with hysteresis; the panel fades towards the
-result. The lower button steps through automatic and four fixed levels.
+**Automatic brightness** (`services::brightness`): the stock app's seven
+steps (`0x0804149A`): below 11 lux 57, 11-40 80, 41-360 110, 361-1200 133,
+1201-5000 172, 5001-8000 200, above 8000 215. Ours in addition: four
+readings a second averaged over about a second, a 10 % margin at each
+limit, and a fade between values. The lower button steps through automatic
+and four fixed levels.
 
 Remaining:
-1. Switch the gain down in very bright light, if lux above about 60,000
-   is ever needed (brightness is at its maximum long before).
-2. Recover the stock settings table (the app's data initialisation would
-   have to be unpacked) if exact lux ever matters.
+1. The display-dependent offsets, if the reading ever turns out to follow
+   the picture.
 
 ### 3.5 Apollo, remaining work (item 3 and items 15-24) - L
 
