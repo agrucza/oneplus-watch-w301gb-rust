@@ -33,7 +33,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: approximate lux, automatic brightness |
 | 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
-| 13 | Real-time clock, backup domain | internal, LSE crystal | none | left running, not used |
+| 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth, shown on screen |
 | 14 | Log UART | LPUART1 (PG7, PG8) | none | not used |
 
 ### Attached to the Apollo
@@ -324,11 +324,27 @@ Only worth it when file speed starts to matter (resources, audio).
    animation storage, framebuffer).
 2. Raise the bus clock when the system clock goes to 120 MHz.
 
-### 3.12 Real-time clock (item 13) - S
+### 3.12 Real-time clock (item 13) - done
 
-1. Read the time; use it for log timestamps and file times.
-2. Set the time over Bluetooth. The watch's clock is currently about a day
-   behind, because an early Rust image reset the backup domain.
+**Measured:** the STM32's clock runs from the 32.768 kHz crystal with the
+stock app's set-up (24-hour format, prescalers 127 / 255) and keeps the time
+through resets and firmware changes. It holds local time: the stock app
+adds the phone's time zone before setting it (`0x0802DEC0`), and keeps the
+last time and time zone (in minutes) in `0:rtcData.txt`.
+
+`hal::rtc` reads and sets the clock at register level without touching its
+set-up; the HAL's driver would stop the clock briefly on every boot.
+`services::clock` shows the time on the status screen, stamps files with it
+and sets it from `AT^W301TIME=YYYY-MM-DD HH:MM:SS`, which `tools/ota.sh
+time` sends with the PC's local time. Set and read back across a restart
+on the watch.
+
+Remaining:
+1. Time zone and daylight saving changes: the clock simply holds whatever
+   local time was sent.
+2. Alarm and wake-up timer, when low power is done.
+3. `0:rtcData.txt` is not written; the stock app restores a stale time
+   from it if the backup domain is ever lost.
 
 ### 3.13 Log UART (item 14) - S, optional
 
@@ -348,10 +364,10 @@ Would give a live log without Bluetooth.
 ## 5. Suggested order
 
 Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor and automatic brightness (3.4), touch (3.1).
+sensor and automatic brightness (3.4), touch (3.1), real-time clock (3.12).
 
-1. **Real-time clock and Bluetooth address from factory data** (3.12, 3.8
-   step 1): removes the two hard-coded values.
+1. **Bluetooth address from factory data** (3.8 step 1): removes the last
+   hard-coded value.
 2. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
 3. **Low power** (section 4): after that the watch can be worn.
 4. **Audio** (3.6).

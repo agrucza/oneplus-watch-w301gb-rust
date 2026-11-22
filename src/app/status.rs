@@ -18,6 +18,7 @@ use crate::drivers::apollo::messages::Readings;
 use crate::drivers::light;
 use crate::drivers::panel::{Frame, WIDTH};
 use crate::services::canvas::Canvas;
+use crate::services::clock;
 
 const BACKGROUND: Rgb565 = Rgb565::BLACK;
 const DIM: Rgb565 = Rgb565::new(15, 31, 15); // mid grey
@@ -97,13 +98,28 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
             .draw(&mut canvas);
     };
 
-    let mut line = Line::new();
-    let _ = write!(line, "W301 Rust");
-    put(52, false, DIM, 12, &mut line);
+    let now = clock::now();
 
     let mut line = Line::new();
-    let (h, m, sec) = (s.uptime_s / 3600, s.uptime_s / 60 % 60, s.uptime_s % 60);
-    let _ = write!(line, "up {:02}:{:02}:{:02}", h, m, sec);
+    match now {
+        Some(t) => {
+            let _ = write!(line, "{} {:04}-{:02}-{:02}", t.weekday_name(), t.year, t.month, t.day);
+        }
+        None => {
+            let _ = write!(line, "W301 Rust");
+        }
+    }
+    put(52, false, DIM, 14, &mut line);
+
+    let mut line = Line::new();
+    match now {
+        Some(t) => {
+            let _ = write!(line, "{:02}:{:02}:{:02}", t.hour, t.minute, t.second);
+        }
+        None => {
+            let _ = write!(line, "clock not set");
+        }
+    }
     put(92, true, Rgb565::WHITE, 14, &mut line);
 
     let mut line = Line::new();
@@ -172,7 +188,9 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
             let _ = write!(line, "light --");
         }
     }
-    put(368, false, Rgb565::WHITE, 20, &mut line);
+    let (h, m, sec) = (s.uptime_s / 3600, s.uptime_s / 60 % 60, s.uptime_s % 60);
+    let _ = write!(line, "  up {:02}:{:02}:{:02}", h, m, sec);
+    put(368, false, Rgb565::WHITE, 24, &mut line);
 
     let mut line = Line::new();
     match s.brightness_step {

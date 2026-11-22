@@ -6,6 +6,7 @@
 #   tools/ota.sh send       build + package + push + trigger install
 #   tools/ota.sh trigger    only trigger the install of an already pushed package
 #   tools/ota.sh stock      tell the running Rust app to return to the stock firmware
+#   tools/ota.sh time     set the watch's clock to this computer's local time (Rust app only)
 #   tools/ota.sh log        fetch 3:log/rust.log into target/rust.log and show its end
 #
 # `send` finds out which firmware is running. To the Rust app it sends a
@@ -73,6 +74,9 @@ log) # fetch the Rust app's log (works with either firmware) and show its end
     tail -n 40 target/rust.log
     echo
     echo "[ota.sh] last 40 lines shown; full log: $PWD/target/rust.log"
+    ;;
+time) # Rust app is running: set its clock to this computer's local time
+    python3 tools/settime.py
     ;;
 stock) # Rust app is running: ask it to hand back to the stock firmware
     bt cmd "AT^W301STOCK"

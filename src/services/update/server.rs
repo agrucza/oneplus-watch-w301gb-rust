@@ -44,6 +44,7 @@ use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::drivers::cypress::{self, Link};
+use crate::services::clock;
 use crate::services::log::Log;
 use crate::boot::ticket;
 use crate::services::update::package::{crc32_update, Package, PACKAGE_HEADER};
@@ -255,6 +256,8 @@ impl Server {
                 } else if text.contains("FI^OTAUPDATE") {
                     install = self.ready_image.is_some();
                     answer = if install { b"OK\r\n" } else { b"ERROR\r\n" };
+                } else if let Some((_, time)) = text.split_once("AT^W301TIME=") {
+                    answer = if clock::set_from_text(time.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if text.contains("AT^W301STOCK") {
                     to_stock = true;
                     answer = b"OK\r\n";

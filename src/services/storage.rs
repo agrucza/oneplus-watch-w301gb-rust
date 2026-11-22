@@ -17,7 +17,7 @@ use embedded_sdmmc::{
     TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
 
-use crate::hal::sdmmc;
+use crate::hal::{rtc, sdmmc};
 
 /// Block-device error: an eMMC driver error, or a refused write.
 #[derive(Debug, Clone, Copy)]
@@ -161,11 +161,23 @@ impl BlockDevice for Emmc {
 }
 
 /// File timestamps: fixed until the RTC is wired in.
-pub struct NoClock;
+pub struct FileClock;
 
-impl TimeSource for NoClock {
+impl TimeSource for FileClock {
+    /// The time written to files: the real-time clock's, or 2026-01-01 if
+    /// that was never set.
     fn get_timestamp(&self) -> Timestamp {
-        Timestamp { year_since_1970: 56, zero_indexed_month: 0, zero_indexed_day: 0, hours: 0, minutes: 0, seconds: 0 }
+        match rtc::now() {
+            Some(t) => Timestamp {
+                year_since_1970: (t.year - 1970) as u8,
+                zero_indexed_month: t.month - 1,
+                zero_indexed_day: t.day - 1,
+                hours: t.hour,
+                minutes: t.minute,
+                seconds: t.second,
+            },
+            None => Timestamp { year_since_1970: 56, zero_indexed_month: 0, zero_indexed_day: 0, hours: 0, minutes: 0, seconds: 0 },
+        }
     }
 }
 
@@ -182,7 +194,7 @@ pub fn read_file(partition: Partition, dir1: &str, dir2: &str, file: &str, buf: 
     fn at<T>(step: u8, r: Result<T, embedded_sdmmc::Error<DeviceError>>) -> Result<T, ReadError> {
         r.map_err(|e| ReadError { step, not_found: matches!(e, embedded_sdmmc::Error::NotFound) })
     }
-    let manager = VolumeManager::new(Emmc { partition, writable: false }, NoClock);
+    let manager = VolumeManager::new(Emmc { partition, writable: false }, FileClock);
     let volume = at(1, manager.open_volume(VolumeIdx(0)))?;
     let root = at(2, volume.open_root_dir())?;
     let d1 = at(3, root.open_dir(dir1))?;
@@ -195,7 +207,7 @@ pub fn read_file(partition: Partition, dir1: &str, dir2: &str, file: &str, buf: 
 /// On failure returns the step: 2 volume, 3 root, 4 directory, 5 open,
 /// 6 write, 7 close.
 pub fn append(partition: Partition, dir: &str, file: &str, data: &[u8]) -> Result<(), u8> {
-    let manager = VolumeManager::new(Emmc { partition, writable: true }, NoClock);
+    let manager = VolumeManager::new(Emmc { partition, writable: true }, FileClock);
     let volume = manager.open_volume(VolumeIdx(0)).map_err(|_| 2)?;
     let root = volume.open_root_dir().map_err(|_| 3)?;
     let d = root.open_dir(dir).map_err(|_| 4)?;
@@ -210,7 +222,7 @@ pub fn append(partition: Partition, dir: &str, file: &str, data: &[u8]) -> Resul
 /// Read the last `buf.len()` bytes (or all, if shorter) of `/dir/file`.
 /// Returns (file length, bytes read).
 pub fn read_tail(partition: Partition, dir: &str, file: &str, buf: &mut [u8]) -> Result<(u32, usize), u8> {
-    let manager = VolumeManager::new(Emmc { partition, writable: false }, NoClock);
+    let manager = VolumeManager::new(Emmc { partition, writable: false }, FileClock);
     let volume = manager.open_volume(VolumeIdx(0)).map_err(|_| 2)?;
     let root = volume.open_root_dir().map_err(|_| 3)?;
     let d = root.open_dir(dir).map_err(|_| 4)?;
@@ -226,7 +238,7 @@ pub fn read_tail(partition: Partition, dir: &str, file: &str, buf: &mut [u8]) ->
 /// receives at most `buf.len()` bytes of it.
 /// On failure returns the step: 2 volume, 3 root, 4 not found, 5 open, 6 read.
 pub fn read_root_file(partition: Partition, long_name: &str, buf: &mut [u8]) -> Result<usize, u8> {
-    let manager = VolumeManager::new(Emmc { partition, writable: false }, NoClock);
+    let manager = VolumeManager::new(Emmc { partition, writable: false }, FileClock);
     let volume = manager.open_volume(VolumeIdx(0)).map_err(|_| 2)?;
     let root = volume.open_root_dir().map_err(|_| 3)?;
 
@@ -265,7 +277,7 @@ pub fn read_root_file(partition: Partition, long_name: &str, buf: &mut [u8]) -> 
 /// The file must already exist: the filesystem crate cannot create long
 /// file names, and the bootloader looks for the long name.
 pub struct FileWriter {
-    manager: VolumeManager<Emmc, NoClock>,
+    manager: VolumeManager<Emmc, FileClock>,
     volume: RawVolume,
     file: RawFile,
 }
@@ -277,7 +289,7 @@ impl FileWriter {
     /// On failure returns the step: 2 volume, 3 root, 4 directory,
     /// 5 file not found, 6 open.
     pub fn rewrite(partition: Partition, dirs: &[&str], long_name: &str) -> Result<Self, u8> {
-        let manager = VolumeManager::new(Emmc { partition, writable: true }, NoClock);
+        let manager = VolumeManager::new(Emmc { partition, writable: true }, FileClock);
         let volume = manager.open_raw_volume(VolumeIdx(0)).map_err(|_| 2)?;
         let mut dir: RawDirectory = manager.open_root_dir(volume).map_err(|_| 3)?;
         for name in dirs {
@@ -322,7 +334,7 @@ impl FileWriter {
 /// without regard to case. Returns the entry's short name (which is what
 /// the filesystem crate opens things by) and whether it is a directory.
 fn lookup(
-    manager: &VolumeManager<Emmc, NoClock>,
+    manager: &VolumeManager<Emmc, FileClock>,
     dir: RawDirectory,
     name: &str,
 ) -> Result<Option<(ShortFileName, bool)>, ()> {
@@ -353,7 +365,7 @@ fn lookup(
 /// A file opened for reading from the start, kept open across many `read`
 /// calls (used for sending a file to the PC piece by piece).
 pub struct FileReader {
-    manager: VolumeManager<Emmc, NoClock>,
+    manager: VolumeManager<Emmc, FileClock>,
     volume: RawVolume,
     file: RawFile,
     len: u32,
@@ -364,7 +376,7 @@ impl FileReader {
     /// `partition`.
     /// On failure returns the step: 2 volume, 3 root, 4 not found, 5 open.
     pub fn open(partition: Partition, path: &str) -> Result<Self, u8> {
-        let manager = VolumeManager::new(Emmc { partition, writable: false }, NoClock);
+        let manager = VolumeManager::new(Emmc { partition, writable: false }, FileClock);
         let volume = manager.open_raw_volume(VolumeIdx(0)).map_err(|_| 2)?;
         let mut dir = manager.open_root_dir(volume).map_err(|_| 3)?;
         let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();

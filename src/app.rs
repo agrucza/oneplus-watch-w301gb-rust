@@ -17,7 +17,7 @@ use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
 use crate::services::brightness::AutoBrightness;
-use crate::services::{bluetooth, storage};
+use crate::services::{bluetooth, clock, storage};
 
 /// Volume the update package and the installed image file live on.
 const IMAGE_VOLUME: usize = 1;
@@ -44,6 +44,7 @@ pub async fn run(board: Board) {
     let _ = writeln!(log.stamp(), "--- w301 rust app: ota server ---");
     faults::write_reset_cause(log.stamp());
     clocks::log_state(&mut log);
+    clock::start(&mut log);
     if let Err(step) = log.flush() {
         let _ = ticket::report(ticket::STAGE_LOG, step);
         return;
