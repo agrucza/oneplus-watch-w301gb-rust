@@ -141,7 +141,8 @@ pub async fn run(board: Board) {
             let frames = unsafe {
                 [&mut *(psram::FRAMEBUFFER as *mut panel::Frame), &mut *(psram::FRAMEBUFFER_2 as *mut panel::Frame)]
             };
-            let mut panel = panel::Panel::start(board.display, frames, &mut log).await;
+            let spare = unsafe { psram::SPARE_FRAMES.map(|address| &mut *(address as *mut panel::Frame)) };
+            let mut panel = panel::Panel::start(board.display, frames, spare, &mut log).await;
             if let (true, Some(panel)) = (BLITTER_TIMING, panel.as_mut()) {
                 time_blitter(panel, &mut log).await;
                 let _ = log.flush();
@@ -689,6 +690,23 @@ fn start_cycle_counter() {
     core.DWT.enable_cycle_counter();
 }
 
+/// Pictures a change of page takes.
+const SLIDE_STEPS: usize = 14;
+
+/// A change of page under way: one page slides out, the other in.
+struct Slide {
+    /// Pictures presented so far.
+    step: u32,
+    leftwards: bool,
+    began: Instant,
+    /// How long keeping the old picture and drawing the new page took.
+    prepared: Duration,
+    /// The longest a picture took to put together and present.
+    longest: Duration,
+    /// No blitter error and no missed pulse so far.
+    good: bool,
+}
+
 /// What the screen shows: the watch face, or the page of status text.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -721,6 +739,10 @@ struct Screen {
     dot_count: usize,
     /// Which page is shown.
     page: Page,
+    /// A page that was asked for and is not shown yet.
+    switch_to: Option<Page>,
+    /// A change of page that is under way.
+    slide: Option<Slide>,
     finger_down: bool,
     /// What every element of the watch face showed when it was last
     /// looked at (`face::key`).
@@ -774,6 +796,8 @@ impl Screen {
             dots: [(0, 0); 64],
             dot_count: 0,
             page: Page::Face,
+            switch_to: None,
+            slide: None,
             finger_down: false,
             face_keys: [None; face::ELEMENTS],
             face_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
@@ -872,12 +896,10 @@ impl Screen {
             Page::Status => new_touch && y < 110,
         };
         if switch {
-            self.page = if self.page == Page::Face { Page::Status } else { Page::Face };
-            // Nothing of the other page is on either frame.
-            self.damage.add(face::whole());
-            self.lines = None;
-            self.face_keys = [None; face::ELEMENTS];
-            self.changed = true;
+            // The change itself happens in `update`, as a slide.
+            if self.slide.is_none() {
+                self.switch_to = Some(if self.page == Page::Face { Page::Status } else { Page::Face });
+            }
             return;
         }
         if self.page == Page::Face {
@@ -931,6 +953,10 @@ impl Screen {
         let uptime_s = now.as_secs();
         let new_second = self.drawn_for != Some(uptime_s);
         let back = self.panel.back_index();
+        if self.visible && (self.switch_to.is_some() || self.slide.is_some()) {
+            self.slide_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
+            return;
+        }
         // The watch face moves: it is looked at again every `FACE_PERIOD`.
         let frame_due = self.page == Page::Face && now >= self.next_frame;
         // On the status page a change is brought to the second frame at
@@ -941,6 +967,28 @@ impl Screen {
             return;
         }
         self.next_frame = now + FACE_PERIOD;
+        if let Some((started, pixels)) = self.draw(now, new_second, readings, lux, bluetooth_connected, measuring_heart, log) {
+            self.present(started, pixels, uptime_s, log).await;
+        }
+    }
+
+    /// Draw what changed on the current page into the frame to draw into.
+    /// Returns when drawing began and how many pixels were repainted, or
+    /// `None` if nothing had changed.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &mut self,
+        now: Instant,
+        new_second: bool,
+        readings: Option<&Readings>,
+        lux: Option<u32>,
+        bluetooth_connected: bool,
+        measuring_heart: bool,
+        log: &mut Log,
+    ) -> Option<(Instant, u32)> {
+        let uptime_s = now.as_secs();
+        let back = self.panel.back_index();
+
         self.changed = false;
         if new_second {
             self.drawn_for = Some(uptime_s);
@@ -1004,7 +1052,7 @@ impl Screen {
             let changes = self.damage.take(back);
             self.stages[0] += lap(&mut stage); // comparing, listing changes
             if changes.is_empty() {
-                return;
+                return None;
             }
             // Repaint each changed rectangle: background, then every
             // element that reaches into it, cut off at its edge.
@@ -1024,8 +1072,7 @@ impl Screen {
                 }
                 self.stages[2] += lap(&mut stage);
             }
-            self.present(started, changes.area(face::whole()), uptime_s, log).await;
-            return;
+            return Some((started, changes.area(face::whole())));
         }
         // The status page. What the lines say now; those that differ from
         // what is on the screen have changed.
@@ -1050,7 +1097,7 @@ impl Screen {
 
         let changes = self.damage.take(back);
         if changes.is_empty() {
-            return;
+            return None;
         }
         // Repaint each changed rectangle: background, then whatever
         // reaches into it, in the order it lies on the screen. Drawing is
@@ -1071,7 +1118,70 @@ impl Screen {
                 }
             }
         }
-        self.present(started, changes.area(status::whole()), uptime_s, log).await;
+        Some((started, changes.area(status::whole())))
+    }
+
+    /// Change the page with a slide.
+    ///
+    /// The picture on the screen is kept, the new page is drawn completely
+    /// (into the frame to draw into, which is not shown) and kept as well.
+    /// Then pictures put together from the two are presented, the old one
+    /// moving out and the new one following it in, until the new page is
+    /// all there. Putting a picture
+    /// together is two blitter copies, so this runs at the panel's own
+    /// rhythm.
+    #[allow(clippy::too_many_arguments)]
+    async fn slide_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
+        if let Some(page) = self.switch_to.take() {
+            let began = Instant::now();
+            let leftwards = page == Page::Status;
+            let mut good = self.panel.keep(0, false).await;
+            self.page = page;
+            // Nothing of the new page is on either frame.
+            self.damage = Damage::new();
+            self.lines = None;
+            self.face_keys = [None; face::ELEMENTS];
+            self.drawn_for = Some(now.as_secs());
+            let _ = self.draw(now, true, readings, lux, bluetooth_connected, measuring_heart, log);
+            good &= self.panel.keep(1, true).await;
+            self.slide = Some(Slide { step: 0, leftwards, began, prepared: began.elapsed(), longest: Duration::from_ticks(0), good });
+        }
+        let Some(mut slide) = self.slide.take() else {
+            return;
+        };
+        // All the pictures of the slide in one go, without going back to
+        // the rest of the firmware in between: that round trip takes
+        // longer than a picture (measured: 36 ms a picture with it, where
+        // the panel takes one every 17 ms).
+        loop {
+            slide.step += 1;
+            // Ease in and out: slow, fast, slow.
+            let t = slide.step as usize * 1024 / SLIDE_STEPS;
+            let offset = panel::WIDTH * (t * t / 1024 * (3 * 1024 - 2 * t) / 1024) / 1024;
+            let last = slide.step as usize >= SLIDE_STEPS;
+            let started = Instant::now();
+            slide.good &= self.panel.slide(if last { panel::WIDTH } else { offset }, slide.leftwards).await;
+            let status = self.panel.present().await;
+            slide.good &= status.in_step;
+            slide.longest = slide.longest.max(started.elapsed());
+            watchdog::feed();
+            if last {
+                break;
+            }
+        }
+        // The frame shown is the new page. Bring the other one to the
+        // same picture, and both are as the page was drawn.
+        slide.good &= self.panel.slide(panel::WIDTH, slide.leftwards).await;
+        self.damage.clear();
+        let _ = writeln!(
+            log.stamp(),
+            "display: page change{}: {} ms to draw the new page, then {} pictures in {} ms, the slowest {} ms",
+            if slide.good { "" } else { " (with an ERROR or a missed pulse)" },
+            slide.prepared.as_millis(),
+            SLIDE_STEPS,
+            (slide.began.elapsed() - slide.prepared).as_millis(),
+            slide.longest.as_millis()
+        );
     }
 
     /// Present the picture that was just drawn (drawing began at

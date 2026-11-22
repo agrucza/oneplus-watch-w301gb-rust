@@ -94,6 +94,8 @@ pub struct Panel {
     frames: [&'static mut Frame; 2],
     /// Which of the two the panel was sent last.
     shown: usize,
+    /// Two frames that are never shown: kept pictures (see `slide`).
+    spare: [&'static mut Frame; 2],
     blitter: Dma2d<'static, peripherals::DMA2D>,
     _pins: [Output<'static>; 4],
 }
@@ -102,7 +104,7 @@ impl Panel {
     /// Power the panel, set up LTDC and DSI with `frame` as the picture
     /// source, switch the panel on. Every stage is logged; `None` if one of
     /// them does not complete.
-    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
+    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], spare: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
         // Power-up, as in the stock app.
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
@@ -159,7 +161,7 @@ impl Panel {
         dsi::enable();
         let _ = writeln!(log.stamp(), "display: panel switched on");
         let blitter = Dma2d::new(r.blitter, Irqs);
-        Some(Self { frames, shown: 0, blitter, _pins: [pg5, pf12, power, reset] })
+        Some(Self { frames, shown: 0, spare, blitter, _pins: [pg5, pf12, power, reset] })
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
@@ -206,6 +208,43 @@ impl Panel {
     /// True if the two frames hold the same picture.
     pub fn frames_equal(&self) -> bool {
         self.frames[0][..] == self.frames[1][..]
+    }
+
+    /// Copy the columns `from_x .. from_x + width` of one frame, top to
+    /// bottom, to the columns starting at `to_x` of another, with the
+    /// blitter. False if it reported an error.
+    async fn copy_columns(&mut self, from: *const Frame, from_x: usize, to: *mut Frame, to_x: usize, width: usize) -> bool {
+        if width == 0 {
+            return true;
+        }
+        let source = Buffer2D::new(unsafe { (from as *mut u16).add(from_x) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, width as u16, HEIGHT as u16);
+        let target = Buffer2D::new(unsafe { (to as *mut u16).add(to_x) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, width as u16, HEIGHT as u16);
+        self.blitter.copy(&source, &target).await.is_ok()
+    }
+
+    /// Keep a copy of a picture in spare frame `slot`: of the frame the
+    /// panel was sent last (`of_back` false) or of the frame that has just
+    /// been drawn into (`of_back` true).
+    pub async fn keep(&mut self, slot: usize, of_back: bool) -> bool {
+        let from: *const Frame = self.frames[if of_back { 1 - self.shown } else { self.shown }];
+        let to: *mut Frame = self.spare[slot];
+        self.copy_columns(from, 0, to, 0, WIDTH).await
+    }
+
+    /// Put together, in the frame to draw into, a picture of two kept
+    /// ones side by side: kept picture 0 moved `offset` pixels out to the
+    /// left (`leftwards`) or right, and kept picture 1 following it in
+    /// from the other side. `offset` 0 is all of picture 0, `WIDTH` all of
+    /// picture 1. Two blitter copies, together one frame's worth.
+    pub async fn slide(&mut self, offset: usize, leftwards: bool) -> bool {
+        let offset = offset.min(WIDTH);
+        let (old, new): (*const Frame, *const Frame) = (self.spare[0], self.spare[1]);
+        let back: *mut Frame = self.frames[1 - self.shown];
+        if leftwards {
+            self.copy_columns(old, offset, back, 0, WIDTH - offset).await && self.copy_columns(new, 0, back, WIDTH - offset, offset).await
+        } else {
+            self.copy_columns(old, 0, back, offset, WIDTH - offset).await && self.copy_columns(new, WIDTH - offset, back, 0, offset).await
+        }
     }
 
     /// The frame to draw into, as a target for `embedded-graphics`.

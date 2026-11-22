@@ -88,6 +88,11 @@ impl Damage {
         }
     }
 
+    /// Both frames now hold the picture as it should be.
+    pub fn clear(&mut self) {
+        self.pending = [Changes::nothing(); 2];
+    }
+
     /// True if `frame` has something to repaint.
     pub fn pending(&self, frame: usize) -> bool {
         !self.pending[frame].is_empty()
