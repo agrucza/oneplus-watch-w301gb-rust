@@ -1,6 +1,6 @@
 # W301 hardware bring-up plan
 
-Written 2026-11-21, updated as chips come up. The aim is every feature of every chip; a chip is not finished while its section lists open items, from the firmware files in the watch dump
+Written 2026-11-21, updated as chips come up. Addresses in the stock app are from the factory copy B.66 unless marked B.70; the watch runs B.70 (schema and data tables are identical in both, checked). The aim is every feature of every chip; a chip is not finished while its section lists open items, from the firmware files in the watch dump
 (`~/opwatch/work/dump/mirror`), the stock bootloader and app disassembly, and
 what the Rust firmware has measured on the watch so far.
 
@@ -86,7 +86,8 @@ Other pins the stock app sets up:
 | PG2 | interrupt on rising edge, pull-down | unknown (not the touch interrupt) |
 | PA4, PB3 | outputs, driven low at start | unknown |
 | PB0 | analog input, ADC1 channel 15 | board revision (**from stock code**) |
-| PB1 | output | for this board's revision (3) the stock app drives PB1 and PA12 high after the revision measurement (`0x0805C958`), and switches PB1 off and on in its display and touch power sequence (`0x0805D566`). Probably a supply enable. **We do not drive PB1**; display and touch work anyway |
+| PB1 | output | audio codec supply enable on board revisions 1 and 3 (**from stock code**, running build B.70): the stock app drives it high at start (`0x0805CA2C`), low when it puts the codec to sleep and high when it wakes it (`0x080A9B88` and the function before it, which also stop and start SPI2 and SAI1). We hold it low until there is a codec driver |
+| PG6, PB6, PG10 | outputs | switched in the same codec sleep and wake functions; roles not read yet |
 | PB6, PB12 and two pins in a group of 6 and 10 | outputs | unknown |
 
 Cross-check: the stock app's clock selections name exactly USART3, LPUART1,
@@ -256,12 +257,108 @@ and around it; the Apollo's own log texts name the inputs):
   algo off"), heart-rate result sending and reminders.
 
 Done and measured: setup status, detection of putting on (about 4 s) and
-taking off, full decoding of the report (`messages::Wear`).
+taking off, full decoding of the report (`messages::Wear`), screen status.
+
+**The infrared check** (the Apollo's "OPPO_Wrist_algo", 0x3B23C in its
+image): the infrared reflection is averaged over a number of samples and
+compared with a fixed limit, 20001; at or above it is "near". Measured:
+while the wearer moves the arm, the report flips to "not on the wrist:
+infrared sees no skin" and back within a few seconds; while sitting still
+it is stable. More exactly (measured over some 25 cycles): 1 to 5 s after
+the arm is let hang the report goes to "not on the wrist", and about 1.5 s
+(once 4.5 s) after the arm is raised it returns. This happens with the
+display on as well as off, so it is the arm's posture and not the screen
+status; nothing in the code ties the check to the screen status either.
+The Apollo's own log shows the numbers (2026-11-22): its wear check
+samples the infrared reflection about six times a second at LED level 10,
+which puts the limit at 200,000. Arm raised: 350,000 to 550,000. Arm
+hanging: the reading slides down over 5 to 8 s to 120,000 to 165,000 and
+crosses the limit ("ir far"). The capacitive sensor says "near" throughout;
+infrared alone decides.
+
+**The stock firmware behaves the same.** Measured the same day with the
+stock firmware (B.70) running and the Apollo log recorded by stock
+(`AT^LOGSETPARA=APOLLO=0x1801CF04`, file `3:log/apollo/log_ap*.log`): same
+LED level, same slide, six "ir far" in 160 s of raising and lowering the
+arm. So this is not caused by anything this firmware sends or leaves out.
+The stock log's old counters (14 wear changes for 7,000 raises in 2022)
+were written under other wearing conditions.
+
+**What the stock app does with a wear report** (handler 0x0806CC70,
+B.66 addresses; read, not all of it followed to the end):
+
+| Step | Stock | Here |
+|---|---|---|
+| Count "put on" and "taken off" (0x08033566) | `wear_cts`, `unwear_cts` in its log | done (`link.rs`, minute summary) |
+| Add up the worn time (0x08034816) | yes | done |
+| Not worn and screen off: 5 s one-shot timer, then event 0x10 to a service task (0x08033552) | yes; the task's reaction is not read (the nearby text is `service_screen_change_lock_create`, so probably the screen lock) | open, needs the lock first |
+| Tell other tasks (message 0x58, 0x08052C74; sport module 0x080A71E0) | yes | open, no such features yet |
+| Automatic do-not-disturb: not worn and a setting set starts a 10-minute timer (30 with an argument), worn cancels it (0x08034644, 0x08034724) | yes | open, no do-not-disturb yet |
+| Hide short drops from the user | it never shows the wear state | `app::WearView`, 3 s hold |
+
+No place was found where the stock app (B.70) sends the off-wrist timeout
+(kind 11). Checked: a search of the whole image for code that loads the
+constant 11 and stores it as a 16-bit value (eight hits, none of them a
+message to the Apollo), and the kinds set at all 52 direct calls of the
+two send routines. Not ruled out: a sender that gets its kind from a table
+or a parameter. The stock app does receive the Apollo's off-wrist
+notification (text `offWrist=%d`). The encoder here exists and stays
+unused.
+
+In the Apollo (read in its image): an arriving kind 11 with field 1 = 0 is
+logged as `argOffWrist set <minutes>` (0x10CF4), then stored by its main
+event loop (0x1554E; the minutes end up at RAM 0x10030370) and
+acknowledged. That store is the only write to the value found; its start
+value is 0. `lcAlgoOnOffControl` uses it (0x372B8): with 0 minutes the
+"off the wrist for long" check never fires; otherwise it fires once the
+time since the watch left the wrist reaches minutes x 60 s, and the
+notification (kind 11, field 1 = 1) is only sent while the minutes are not
+0 (0x37310). So with the start value the Apollo never sends the
+notification. Not ruled out: the value being restored from the Apollo's
+own flash by a block copy.
+
+The stock app's table of handlers for incoming messages is at 0x081B67D8
+(B.66), one pointer per kind. Its entry for kind 11 is 0x0806D466, and
+that routine only writes `offWrist=%d` to the log and returns. So the
+stock app does nothing with the notification; the feature is unused there.
+
+Both stock send routines (B.66: 0x0806C35C, 0x0806C40A) start with a gate:
+while the byte at RAM 0x2009152C is not 0, only the kinds 3, 6 to 8, 20,
+47, 50 to 52, 101, 102 and 130 are sent and every other message is
+dropped. The byte is an "update running" flag (writers read in B.66): set
+to 1 when the update task starts unpacking an update package (0x08045356)
+and when it starts updating the touch controller's firmware (0x08046722);
+cleared when either ends, in success or failure (0x08045494, 0x0804676C,
+0x080467C0, 0x080467E8), and at start (0x0804380E). In normal operation it
+is 0 and every message goes out.
+
+The Apollo log can be had under this firmware too: message kind 100
+(`messages::log_setting`), text arrives in blocks starting with 0x7F
+(`link.rs`, `APOLLO_LOG_WINDOW`). `app::WearView` can hold a "not worn"
+back on the status screen for 3 s. The log window is off (`None`) in the
+normal image. Whether
+the stock firmware sees the same cannot be checked (it does not log wear
+changes).
+
+**Screen status and wrist gestures** (measured): the Apollo starts with
+"screen off". Told "off", it sends almost nothing but wear changes; told
+"on", it releases its held-back records and the live reports return.
+Its wrist-raise algorithm runs on every motion sample with the screen
+state: "lowered" (kind 41, value 2) is always reported, "raised" (value 1)
+only while its algorithm 13 is on, which the raise-to-wake setting (kind
+121: on, daily window, start state off) switches. The firmware now sends
+that setting and shows the display on "raised"; on "lowered" it blanks
+the display only if a raise had shown it (the stock app's own condition
+is a setting not read yet).
 
 Open:
-1. Screen status (kind 130; the stock app sends it with its settings and
-   on every change): not sent. Until then the off-wrist timeout cannot
-   work; the timeout message is written and switched off.
+1. Screen status (kind 130: field 2 = 1 on, 0 off; the stock app sends
+   it when the backlight is set, when the screen goes off, and once after
+   the Apollo's start). The Apollo starts with "off". It holds its cached
+   health data back while the screen is off, makes its sport module
+   report on "on", feeds the state to its motion algorithm and daily
+   module, and only counts the off-wrist timeout while off. Written,
+   switched off; next single test. The off-wrist timeout comes after it.
 2. The other two ways the stock app can switch the capacitive sensor:
    kind 120 with sensor 5, and "power control" (sensor 7). The stock app
    uses them only in a timed test mode (`0x080A7290`); not read further.

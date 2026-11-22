@@ -29,6 +29,9 @@ pub struct Status<'a> {
     /// Ambient light in lux.
     pub lux: Option<u32>,
     pub bluetooth_connected: bool,
+    /// Whether the watch is on the wrist, as it should be shown (see
+    /// `app::WearView`).
+    pub worn: Option<bool>,
     /// A heart-rate measurement is running.
     pub measuring_heart: bool,
     /// Fixed brightness step, 1-based, and the number of steps; `None`
@@ -161,7 +164,7 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
     put(246, true, Rgb565::WHITE, 22, &mut line);
 
     let mut line = Line::new();
-    let worn = match s.readings.and_then(|r| r.wear).map(|w| w.on_wrist) {
+    let worn = match s.worn {
         Some(true) => "worn",
         Some(false) => "not worn",
         None => "wear --",

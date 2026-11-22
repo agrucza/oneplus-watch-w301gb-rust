@@ -64,6 +64,15 @@ const SETUP_RETRY: Duration = Duration::from_secs(3);
 
 /// Time (kind 5) and version text (kind 6) after the Apollo's announcement.
 const SEND_TIME_AND_VERSION: bool = false;
+/// The screen status (kind 130) after the setup status and on every change.
+const SEND_SCREEN_STATUS: bool = true;
+/// Wrist-raise detection (kind 121) switched on after the screen status.
+const SEND_RAISE_TO_WAKE: bool = true;
+/// Diagnosis: have the Apollo send its own log text during this window of
+/// seconds after start, with its start level and module mask.
+const APOLLO_LOG_WINDOW: Option<(u64, u64)> = None;
+const APOLLO_LOG_LEVEL: u8 = 4;
+const APOLLO_LOG_MODULES: u32 = 0x0018_01CF;
 /// Do-not-disturb and sedentary settings after the setup status.
 const SEND_SETTINGS: bool = false;
 /// The answer to the Apollo's question for the board revision.
@@ -145,6 +154,22 @@ pub struct Apollo {
     setup_tries: u32,
     setup_acknowledged: bool,
     settings_sent: bool,
+    /// The screen state the Apollo should know, and the one it was last
+    /// told (`None`: not told since its start).
+    screen_on: bool,
+    screen_told: Option<bool>,
+    raise_to_wake_sent: bool,
+    /// Wear statistics, kept as the stock app keeps them (0x08033566,
+    /// 0x08034816): how often the watch was put on and taken off since
+    /// start, since when it has been worn, and the worn time so far.
+    pub put_on_count: u32,
+    pub taken_off_count: u32,
+    worn_since: Option<Instant>,
+    worn_total: Duration,
+    /// 0 = Apollo log not asked for yet, 1 = on, 2 = switched off again.
+    apollo_log: u8,
+    /// The latest wrist gesture not yet taken by `take_gesture`.
+    gesture_pending: Option<messages::WristGesture>,
     /// Frames to acknowledge: (sequence, kind).
     acks: [(u32, u32); 8],
     acks_pending: usize,
@@ -209,6 +234,15 @@ impl Apollo {
             setup_tries: 0,
             setup_acknowledged: false,
             settings_sent: false,
+            screen_on: true,
+            screen_told: None,
+            raise_to_wake_sent: false,
+            put_on_count: 0,
+            taken_off_count: 0,
+            worn_since: None,
+            worn_total: Duration::from_secs(0),
+            apollo_log: 0,
+            gesture_pending: None,
             acks: [(0, 0); 8],
             acks_pending: 0,
             blocks_received: 0,
@@ -413,6 +447,31 @@ impl Apollo {
                 let _ = writeln!(log.stamp(), "apollo: setup status never acknowledged; wear detection will stay off");
             }
         }
+        // The screen state: once after the setup status (the stock app
+        // sends it last of its settings), then whenever it changes.
+        if SEND_SCREEN_STATUS && self.setup_acknowledged && self.screen_told != Some(self.screen_on) {
+            let on = self.screen_on;
+            if self.send(messages::SCREEN, messages::screen_status(on).as_bytes(), log).await {
+                self.screen_told = Some(on);
+            }
+        }
+        // Wrist-raise detection, all day: without it the Apollo reports
+        // "lowered" but never "raised".
+        if SEND_RAISE_TO_WAKE && self.screen_told.is_some() && !self.raise_to_wake_sent {
+            self.raise_to_wake_sent = self.send(messages::RAISE_TO_WAKE, messages::raise_to_wake(true, (0, 1439)).as_bytes(), log).await;
+        }
+        if let Some((from, to)) = APOLLO_LOG_WINDOW {
+            let now = Instant::now().as_secs();
+            if self.apollo_log == 0 && now >= from && self.setup_acknowledged {
+                if self.send(messages::LOG_SETTING, messages::log_setting(true, APOLLO_LOG_LEVEL, APOLLO_LOG_MODULES).as_bytes(), log).await {
+                    self.apollo_log = 1;
+                }
+            } else if self.apollo_log == 1 && now >= to {
+                if self.send(messages::LOG_SETTING, messages::log_setting(false, 0, 0).as_bytes(), log).await {
+                    self.apollo_log = 2;
+                }
+            }
+        }
         // The settings follow the setup status, as in the stock app. Until
         // this firmware has settings of its own: everything off.
         if SEND_SETTINGS && self.setup_acknowledged && !self.settings_sent {
@@ -431,6 +490,13 @@ impl Apollo {
                     }
                 }
                 let _ = writeln!(log);
+                let _ = writeln!(
+                    log.stamp(),
+                    "apollo: put on {} times, taken off {} times, worn for {} s since start",
+                    self.put_on_count,
+                    self.taken_off_count,
+                    self.worn_time().as_secs()
+                );
             }
             self.log_readings(log);
         }
@@ -468,6 +534,22 @@ impl Apollo {
     /// Vibrate: `count` pulses of `on_ms`, `off_ms` apart.
     pub async fn vibrate(&mut self, on_ms: u16, off_ms: u16, count: u8, log: &mut Log) -> bool {
         self.send(messages::MOTOR, messages::motor_pulses(on_ms, off_ms, count).as_bytes(), log).await
+    }
+
+    /// How long the watch has been on the wrist since start.
+    pub fn worn_time(&self) -> Duration {
+        self.worn_total + self.worn_since.map_or(Duration::from_secs(0), |since| since.elapsed())
+    }
+
+    /// The latest wrist gesture since the last call.
+    pub fn take_gesture(&mut self) -> Option<messages::WristGesture> {
+        self.gesture_pending.take()
+    }
+
+    /// Tell the driver whether the screen is on; the Apollo is told on the
+    /// next `service`.
+    pub fn set_screen(&mut self, on: bool) {
+        self.screen_on = on;
     }
 
     /// Tell the driver the board revision, for the Apollo's question.
@@ -520,6 +602,24 @@ impl Apollo {
         let block: &[u8; BLOCK] = self.rx;
         let mut frames = 0;
         let mut i = 0;
+        // A block of the Apollo's log text: 0x7F, type, length, text.
+        if block[0] == 0x7F && block[1] <= 1 && block[2] < 0xFE {
+            let text = &block[3..3 + (block[2] as usize).min(BLOCK - 3)];
+            let _ = log.write_str("A| ");
+            for chunk in text.chunks(32) {
+                let mut out = [b'.'; 32];
+                for (o, &b) in out.iter_mut().zip(chunk) {
+                    if b == b'\n' || (0x20..0x7F).contains(&b) {
+                        *o = b;
+                    }
+                }
+                let _ = log.write_str(core::str::from_utf8(&out[..chunk.len()]).unwrap_or(""));
+            }
+            if text.last() != Some(&b'\n') {
+                let _ = log.write_str("\n");
+            }
+            return;
+        }
         while i + 13 <= BLOCK {
             if block[i] != 0x7E || block[i + 1] != 0 {
                 i += 1;
@@ -583,6 +683,15 @@ impl Apollo {
             if kind == Some(messages::WEAR) {
                 // Rare (only when the state changes), so every one is logged.
                 if let Some(wear) = self.readings.wear {
+                    if wear.on_wrist {
+                        self.put_on_count += 1;
+                        self.worn_since = Some(Instant::now());
+                    } else {
+                        self.taken_off_count += 1;
+                        if let Some(since) = self.worn_since.take() {
+                            self.worn_total += since.elapsed();
+                        }
+                    }
                     let _ = writeln!(
                         log.stamp(),
                         "apollo: {}: {} (capacitive status {:#08x})",
@@ -591,6 +700,37 @@ impl Apollo {
                         wear.capacitive_status
                     );
                 }
+            }
+            if kind == Some(messages::APOLLO_LOG) {
+                // The Apollo's own log text, up to 200 bytes a message.
+                let number = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+                let _ = writeln!(log.stamp(), "apollo log ({} {} {}):", number(1), number(2), number(3));
+                if let Some((_, Value::Bytes(text))) = Fields(payload).find(|&(tag, _)| tag == 4) {
+                    let end = text.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                    for chunk in text[..end].chunks(32) {
+                        let mut out = [b'.'; 32];
+                        for (o, &b) in out.iter_mut().zip(chunk) {
+                            if b == b'\n' || (0x20..0x7F).contains(&b) {
+                                *o = b;
+                            }
+                        }
+                        let _ = log.write_str(core::str::from_utf8(&out[..chunk.len()]).unwrap_or(""));
+                    }
+                    let _ = log.write_str("\n");
+                }
+            }
+            if kind == Some(messages::WRIST_GESTURE) {
+                let gesture = messages::wrist_gesture(payload);
+                self.gesture_pending = Some(gesture);
+                let _ = writeln!(
+                    log.stamp(),
+                    "apollo: wrist {}",
+                    match gesture {
+                        messages::WristGesture::Raised => "raised",
+                        messages::WristGesture::Lowered => "lowered",
+                        messages::WristGesture::Other(_) => "gesture with an unknown value",
+                    }
+                );
             }
             if kind == Some(messages::OFF_WRIST) {
                 if let Some(long) = self.readings.off_wrist_long {

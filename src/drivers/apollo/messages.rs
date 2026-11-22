@@ -12,6 +12,7 @@
 //! |     4 | 200-byte data block (dump?)     | 1, 2 counters, 4 bytes                        |
 //! |     7 | not known                       | 1..4 numbers                                  |
 //! |    20 | heartbeat                       | 2 = 0xA5A5A5A5 from the Apollo                |
+//! |    41 | wrist gesture (raise to wake)   | see `WristGesture`                            |
 //! |    43 | barometer ("BAR")               | 1 time ms, 2 pressure Pa, 3 altitude m        |
 //! |    44 | heart rate, SpO2, stress        | 1 time ms, 2 bpm, 5 SpO2, 7 stress, 8 type, 25 status |
 //! |    11 | off-wrist timeout and notification | see `off_wrist_timeout`                    |
@@ -24,7 +25,9 @@
 //! |    59 | Apollo's own reset info         | 1 shutdown type, 2 reset reason               |
 //! |    80 | 180-byte record, type 19        | 1 time s, 2 type, 3 bytes                     |
 //! |    84 | vibration motor (to the Apollo) | see `motor_pulses`                            |
+//! |   121 | raise to wake on/off (to the Apollo) | see `raise_to_wake`                      |
 //! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
+//! |   130 | screen status (to the Apollo)   | see `screen_status`                           |
 //! |   140 | setup status (to the Apollo)    | see `setup_finished`                          |
 //! |    81 | daily-activity record, type 42  | 1 time s, 2 type, 3 bytes                     |
 //!
@@ -32,11 +35,14 @@
 
 pub const ACK: u32 = 3;
 pub const HEARTBEAT: u32 = 20;
+/// The Apollo's own log text (field 4, up to 200 bytes).
+pub const APOLLO_LOG: u32 = 4;
 pub const TIME: u32 = 5;
 pub const OFF_WRIST: u32 = 11;
 pub const PIN: u32 = 7;
 pub const VERSION: u32 = 6;
 pub const SENSOR_NAMES: u32 = 52;
+pub const WRIST_GESTURE: u32 = 41;
 pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
 pub const BATTERY: u32 = 47;
@@ -47,7 +53,10 @@ pub const MOTOR: u32 = 84;
 pub const HEART: u32 = 44;
 pub const HEART_RATE_SET: u32 = 123;
 pub const SETUP_STATUS: u32 = 140;
+pub const SCREEN: u32 = 130;
+pub const RAISE_TO_WAKE: u32 = 121;
 pub const DO_NOT_DISTURB: u32 = 122;
+pub const LOG_SETTING: u32 = 100;
 pub const SEDENTARY: u32 = 125;
 
 /// Builds a sub-message field by field. Fields with the value zero are
@@ -441,6 +450,95 @@ impl WearReason {
             WearReason::Other(_) => "unknown reason",
         }
     }
+}
+
+/// Switch the Apollo's wrist-raise detection on or off, with the daily
+/// time window in which it is active.
+///
+/// Stock sender 0x0806D6A0 (B.70: 0x0806D7F4), called from 0x08033C64:
+/// field 1 = on, field 2 = start and field 3 = end of the window in
+/// minutes of the day (the stock app always sends 0 and 1439), field 4 = a
+/// byte from its settings that must be 0 for the Apollo to act.
+///
+/// In the Apollo (handler 0x146C8, then 0x12F5C, in its image) this
+/// switches its algorithm 13, the wrist-raise algorithm, on while the
+/// time of day is inside the window. Its start state is off. The
+/// algorithm's two results are treated differently (0x23F7A): "lowered"
+/// is always reported, "raised" only while algorithm 13 is on. Both
+/// arrive as `WristGesture`.
+pub fn raise_to_wake(on: bool, window: (Minutes, Minutes)) -> Encoder {
+    Encoder::new().number(1, on as u32).number(2, window.0 as u32).number(3, window.1 as u32)
+}
+
+/// What the Apollo's wrist-raise algorithm saw (kind `WRIST_GESTURE`,
+/// field 2). The Apollo runs it on every motion sample together with the
+/// screen state it was told (`screen_status`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WristGesture {
+    /// The wrist was raised and turned towards the wearer (value 1). The
+    /// stock app turns the screen on (0x08041210).
+    Raised,
+    /// The wrist was lowered or turned away (value 2). The stock app turns
+    /// the screen off if the screen is on and one of its settings has the
+    /// value 2; which setting is not read yet.
+    Lowered,
+    Other(u32),
+}
+
+/// Decode a `WRIST_GESTURE` sub-message.
+pub fn wrist_gesture(payload: &[u8]) -> WristGesture {
+    match Fields(payload).find(|&(tag, _)| tag == 2).and_then(|(_, v)| v.as_u32()).unwrap_or(0) {
+        1 => WristGesture::Raised,
+        2 => WristGesture::Lowered,
+        other => WristGesture::Other(other),
+    }
+}
+
+/// Tell the Apollo where its own log text goes and what it contains.
+///
+/// Stock: the command `AT^LOGSETPARA=APOLLO=0x...` (0x0809D238 in B.70;
+/// low 4 bits = level, bits 8 and up = module mask) ends in the sender
+/// 0x0806D774: field 1 = 2, field 2 = level, field 3 = module mask.
+///
+/// In the Apollo (`lcLogEventParse`, 0x408B0 in its image): with level and
+/// mask both non-zero, field 1 becomes the output mode and the level and
+/// mask are stored; otherwise the mode goes back to 1. In mode 2 the log
+/// text is sent to the STM32 in blocks that start with 0x7F, a type byte
+/// and a length (0x1CFF6). The Apollo's start values are mode 1, level 4,
+/// mask 0x001801CF. How the message gets from the Apollo's dispatcher to
+/// that routine has not been read.
+pub fn log_setting(to_stm32: bool, level: u8, modules: u32) -> Encoder {
+    if to_stm32 {
+        Encoder::new().number(1, 2).number(2, level as u32).number(3, modules)
+    } else {
+        Encoder::new()
+    }
+}
+
+/// Tell the Apollo whether the screen is on.
+///
+/// Stock sender 0x0806D92E: field 1 = 0, field 2 = 1 for on, 0 for off. It
+/// is sent when the backlight is set (on, 0x08040AD2), when the screen
+/// goes off (0x08040F76), and once with the current state after the
+/// Apollo's start, as the last of the settings (0x08033D68).
+///
+/// What the Apollo does with it (`lcSensorScreenStatusSet`, 0x14D14 in its
+/// image, and the readers of the stored value); its start value is "off":
+///
+///   - It holds its cached health data back while the screen is off and
+///     sends it when the screen is on (`lcDataCachePop`).
+///   - On "on" it makes the sport module send a fresh report.
+///   - It hands the state to its wrist-raise algorithm with every motion
+///     sample (`lcSensorAlgoInput`, which logs "raise"); when that
+///     algorithm fires, the Apollo sends kind 41 (`WRIST_GESTURE`, field
+///     2 = the algorithm's result) from 0x12908. The stock app turns the
+///     screen on or off from it.
+///   - When the screen goes off and no sport is running, it stretches the
+///     barometer's sampling interval to ten minutes (0x14E06, 0x343DA).
+///   - The off-wrist timeout only counts while the screen is off
+///     (`off_wrist_timeout`).
+pub fn screen_status(on: bool) -> Encoder {
+    Encoder::new().number(2, on as u32)
 }
 
 /// Set after how many minutes off the wrist the Apollo sends its off-wrist

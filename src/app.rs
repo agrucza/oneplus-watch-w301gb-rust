@@ -8,7 +8,7 @@ use embassy_time::{Duration, Instant};
 
 use crate::board::Board;
 use crate::boot::{faults, ticket, watchdog};
-use crate::drivers::apollo::messages::{KeyEvent, Readings};
+use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
 use crate::drivers::touch::TouchEvent;
@@ -71,6 +71,9 @@ pub async fn run(board: Board) {
         let _ = log.flush();
         let (revision, reading) = board.revision.measure();
         let _ = writeln!(log.stamp(), "board revision {} (reading {} of 4095, {} mV)", revision, reading, reading as u32 * 1800 / 4096);
+        if board.codec_supply.off(revision) {
+            let _ = writeln!(log.stamp(), "audio codec supply (PB1) held off");
+        }
         let _ = log.flush();
         let mut apollo = apollo::Apollo::start(board.apollo).await;
         if let Some(apollo) = apollo.as_mut() {
@@ -145,6 +148,53 @@ const CLICK_MS: u64 = 800;
 const FADE_STEP: u8 = 4;
 const FADE_INTERVAL: Duration = Duration::from_millis(30);
 
+/// How long a "not on the wrist" report has to stand, with the display on,
+/// before the status screen shows it.
+const NOT_WORN_HOLD: Duration = Duration::from_secs(3);
+
+/// The wear state as the status screen shows it.
+///
+/// The Apollo's report is taken as it is everywhere else. On the screen a
+/// "not on the wrist" is held back for a moment, because of how the
+/// Apollo's check behaves (measured): while the arm hangs down, its
+/// infrared check loses the skin and it reports "not on the wrist"; about
+/// 1.5 s after the arm is raised it finds the skin again. Without the hold
+/// the display, switched on by that same raise, would always come up
+/// reading "not worn".
+struct WearView {
+    /// The Apollo's latest report and when the display side first saw it.
+    reported: Option<bool>,
+    since: Instant,
+    shown: Option<bool>,
+}
+
+impl WearView {
+    fn new() -> Self {
+        Self { reported: None, since: Instant::now(), shown: None }
+    }
+
+    /// The state to show, given the Apollo's report and since when the
+    /// display has been on.
+    fn update(&mut self, reported: Option<bool>, display_on_since: Instant) -> Option<bool> {
+        if reported != self.reported {
+            self.reported = reported;
+            self.since = Instant::now();
+        }
+        match reported {
+            Some(false) => {
+                // Counted from the report or from the display coming on,
+                // whichever is later.
+                let standing = self.since.max(display_on_since).elapsed();
+                if self.shown.is_none() || standing >= NOT_WORN_HOLD {
+                    self.shown = Some(false);
+                }
+            }
+            other => self.shown = other,
+        }
+        self.shown
+    }
+}
+
 /// The panel and what is currently shown on it.
 struct Screen {
     panel: panel::Panel,
@@ -157,6 +207,11 @@ struct Screen {
     /// The last level written to the log.
     level_logged: u8,
     faded_at: Instant,
+    /// The display was shown by a wrist raise, not by the button.
+    shown_by_raise: bool,
+    /// Since when the display has been on.
+    visible_since: Instant,
+    wear: WearView,
     last_button: &'static str,
     /// Where the glass was last touched, if that is newer than the button.
     last_touch: Option<(u16, u16)>,
@@ -178,6 +233,9 @@ impl Screen {
             level: START_BRIGHTNESS,
             level_logged: START_BRIGHTNESS,
             faded_at: Instant::now(),
+            shown_by_raise: false,
+            visible_since: Instant::now(),
+            wear: WearView::new(),
             last_button: "no button yet",
             last_touch: None,
             changed: false,
@@ -191,6 +249,8 @@ impl Screen {
     async fn click(&mut self, upper: bool, log: &mut Log) {
         let taken = if upper {
             self.visible = !self.visible;
+            self.visible_since = Instant::now();
+            self.shown_by_raise = false;
             self.last_button = "upper: click";
             let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
             self.panel.set_visible(self.visible).await
@@ -219,6 +279,29 @@ impl Screen {
         }
         self.last_touch = None;
         self.drawn_for = None; // show the change at once
+    }
+
+    /// React to a wrist gesture from the Apollo. Raising the wrist shows a
+    /// blanked display, as in the stock app. Lowering it blanks the
+    /// display again only if it was a raise that showed it: the stock
+    /// app's own condition for that is a setting not read yet, and a
+    /// display switched on by hand should not go dark on every movement.
+    /// Returns true if the display changed.
+    async fn gesture(&mut self, gesture: WristGesture, log: &mut Log) -> bool {
+        let show = match gesture {
+            WristGesture::Raised if !self.visible => true,
+            WristGesture::Lowered if self.visible && self.shown_by_raise => false,
+            _ => return false,
+        };
+        self.visible = show;
+        self.visible_since = Instant::now();
+        self.shown_by_raise = show;
+        let _ = writeln!(log.stamp(), "display: {} by wrist gesture", if show { "shown" } else { "blanked" });
+        if !self.panel.set_visible(show).await {
+            let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+        }
+        self.drawn_for = None;
+        true
     }
 
     /// A finger is on the glass: mark the place with a dot.
@@ -307,6 +390,7 @@ impl Screen {
             );
             self.level_logged = self.level;
         }
+        let worn = self.wear.update(readings.and_then(|r| r.wear).map(|w| w.on_wrist), self.visible_since);
         status::draw(
             self.panel.frame,
             &status::Status {
@@ -314,6 +398,7 @@ impl Screen {
                 readings,
                 lux,
                 bluetooth_connected,
+                worn,
                 measuring_heart,
                 brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
                 brightness: self.level,
@@ -459,9 +544,19 @@ async fn main_loop(
             }
             if upper_click {
                 screen.click(true, &mut log).await;
+                if let Some(apollo) = apollo.as_mut() {
+                    apollo.set_screen(screen.visible);
+                }
             }
             if lower_click {
                 screen.click(false, &mut log).await;
+            }
+            if let Some(gesture) = apollo.as_mut().and_then(|a| a.take_gesture()) {
+                if screen.gesture(gesture, &mut log).await {
+                    if let Some(apollo) = apollo.as_mut() {
+                        apollo.set_screen(screen.visible);
+                    }
+                }
             }
             if !server.transferring() {
                 screen.fade(&mut log).await;

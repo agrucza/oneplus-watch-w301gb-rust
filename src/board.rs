@@ -16,6 +16,7 @@
 //! | Touch controller | I2C3: PC0 clock, PB4 data (external pull-ups), address 0x24; PF13 reset, PF4 enable, PA0 interrupt | `drivers::touch` |
 //! | Upper button | PC13 | `drivers::buttons` |
 //! | Board revision | ADC1 channel 15 on PB0 (a resistor divider) | `RevisionPin` |
+//! | Audio codec supply | PB1, on board revisions 1 and 3 only | `CodecSupply` |
 //! | Crystals | PH0, PH1 (24 MHz); PC14, PC15 (32.768 kHz) | `hal::clocks` |
 //!
 //! The lower button is on the Apollo. See `docs/hardware-plan.md` for the
@@ -39,6 +40,7 @@ pub struct Board {
     pub sensor_bus: SensorBus,
     pub touch: touch::Resources,
     pub revision: RevisionPin,
+    pub codec_supply: CodecSupply,
 }
 
 /// The enables the bootloader's `bsp_gpio_power_init` sets. Which of them
@@ -90,7 +92,36 @@ impl Board {
             upper_button: p.PC13,
             sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
             revision: RevisionPin { adc: p.ADC1, pin: p.PB0 },
+            codec_supply: CodecSupply { pb1: p.PB1 },
             touch: touch::Resources { i2c: p.I2C3, scl: p.PC0, sda: p.PB4, reset: p.PF13, enable: p.PF4, irq: p.PA0 },
+        }
+    }
+}
+
+/// The audio codec's supply enable.
+///
+/// On board revisions 1 and 3 the stock app switches PB1 together with the
+/// codec: high when it wakes the codec, low when it puts it to sleep (its
+/// `BSP_GPIO_Audio_Codec_Exit_Slp` and the matching entry function, in the
+/// running build B.70 at 0x080A9B88 and before it; they also start and
+/// stop SPI2 and SAI1). At start it drives PB1 high for every revision
+/// but 0 and 2 (0x0805CA2C in B.70). On revisions 0 and 2 it never
+/// touches the pin.
+pub struct CodecSupply {
+    pb1: Peri<'static, peripherals::PB1>,
+}
+
+impl CodecSupply {
+    /// Leave the codec without supply, as the stock app does while the
+    /// codec sleeps. There is no codec driver yet; until there is, the
+    /// pin is held low instead of floating. Does nothing on revisions
+    /// where the stock app leaves the pin alone.
+    pub fn off(self, revision: u8) -> bool {
+        if revision == 1 || revision == 3 {
+            core::mem::forget(Output::new(self.pb1, Level::Low, Speed::Low));
+            true
+        } else {
+            false
         }
     }
 }
