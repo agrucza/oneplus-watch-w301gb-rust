@@ -155,6 +155,15 @@ pub fn overlap(a: &Rectangle, b: &Rectangle) -> bool {
         && b.top_left.y < a.top_left.y + a.size.height as i32
 }
 
+/// The smallest rectangle that holds both `a` and `b`.
+pub fn around(a: &Rectangle, b: &Rectangle) -> Rectangle {
+    let left = a.top_left.x.min(b.top_left.x);
+    let top = a.top_left.y.min(b.top_left.y);
+    let right = (a.top_left.x + a.size.width as i32).max(b.top_left.x + b.size.width as i32);
+    let bottom = (a.top_left.y + a.size.height as i32).max(b.top_left.y + b.size.height as i32);
+    Rectangle::new(Point::new(left, top), Size::new((right - left) as u32, (bottom - top) as u32))
+}
+
 /// The whole picture.
 pub fn whole() -> Rectangle {
     Rectangle::new(Point::zero(), Size::new(SIZE as u32, SIZE as u32))
@@ -461,6 +470,11 @@ fn segment_box(cx: i32, cy: i32, inner: i32, outer: i32, from: i32, to: i32) -> 
 /// inside `clip` are looked at, and of those only the ones each row has
 /// inside the ring. It goes out as runs of pixels along each row, which
 /// is the cheapest thing to hand to the frame.
+///
+/// The edges are softened: a pixel the edge passes through gets the
+/// colour in proportion to how much of it lies inside, in sixteen steps,
+/// on the black background. Without that, curved and slanted edges show
+/// as stairs.
 #[allow(clippy::too_many_arguments)]
 fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, cx: i32, cy: i32, inner: i32, outer: i32, from: i32, to: i32, color: Rgb565) {
     if to <= from {
@@ -476,6 +490,12 @@ fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle,
     let wide = !full && to - from > 1800;
     let (first, second) = if wide { (direction(to), direction(from)) } else { (direction(from), direction(to)) };
     let (inner2, outer2) = (inner * inner, outer * outer);
+    // The softened edge reaches one pixel beyond the ring on either side.
+    let (far, near) = (outer + 1, (inner - 1).max(0));
+    let (far2, near2) = (far * far, near * near);
+    // Inside these the ring's own edges are too far away to matter.
+    let (solid_from, solid_to) = ((inner + 1) * (inner + 1), (outer - 1).max(0) * (outer - 1).max(0));
+    let shades = shades(color);
     let (x0, x1) = (area.top_left.x, area.top_left.x + area.size.width as i32 - 1);
     // How far the ring reaches along a row, and how wide its hole is there.
     // Both change by little from one row to the next, so after the first
@@ -483,12 +503,12 @@ fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle,
     let (mut reach, mut hole) = (-1, -1);
     for y in area.rows() {
         let dy = y - cy;
-        if dy * dy > outer2 {
+        if dy * dy > far2 {
             continue;
         }
         // Where this row crosses the ring: from -reach to +reach, less
         // the hole from -hole to +hole in the middle.
-        let limit = outer2 - dy * dy;
+        let limit = far2 - dy * dy;
         if reach < 0 {
             reach = root(limit);
         }
@@ -498,7 +518,7 @@ fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle,
         while (reach + 1) * (reach + 1) <= limit {
             reach += 1;
         }
-        let limit = inner2 - dy * dy;
+        let limit = near2 - dy * dy;
         if limit <= 0 {
             hole = 0;
         } else {
@@ -515,25 +535,51 @@ fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle,
         let pieces = if hole == 0 { [(-reach, reach), (1, 0)] } else { [(-reach, -hole), (hole, reach)] };
         for (from_dx, to_dx) in pieces {
             let (first_x, last_x) = ((cx + from_dx).max(x0), (cx + to_dx).min(x1));
-            let mut run: Option<i32> = None;
+            // A run of pixels that get the same shade: where it began and
+            // which shade (0 = nothing, 16 = the full colour).
+            let mut run: (i32, i32) = (first_x, 0);
             for x in first_x..=last_x + 1 {
                 let dx = x - cx;
-                let inside = x <= last_x && (full || {
-                    let after_first = first.0 * dy - first.1 * dx >= 0;
-                    let before_second = dx * second.1 - dy * second.0 >= 0;
-                    (after_first && before_second) != wide
-                });
-                match (inside, run) {
-                    (true, None) => run = Some(x),
-                    (false, Some(start)) => {
-                        let _ = target.fill_solid(&Rectangle::new(Point::new(start, y), Size::new((x - start) as u32, 1)), color);
-                        run = None;
+                let shade = if x > last_x {
+                    0
+                } else {
+                    // How much of the pixel lies inside, by each edge, in
+                    // sixteenths; the scarcest one counts.
+                    let d2 = dx * dx + dy * dy;
+                    let mut inside = 16;
+                    if d2 > solid_to {
+                        inside = inside.min(8 - (d2 - outer2) * 8 / outer.max(1));
                     }
-                    _ => {}
+                    if inner > 0 && d2 < solid_from {
+                        inside = inside.min(8 + (d2 - inner2) * 8 / inner);
+                    }
+                    if !full {
+                        let by_first = 8 + ((first.0 * dy - first.1 * dx) >> 10);
+                        let by_second = 8 + ((dx * second.1 - dy * second.0) >> 10);
+                        let between = by_first.min(by_second).clamp(0, 16);
+                        inside = inside.min(if wide { 16 - between } else { between });
+                    }
+                    inside.clamp(0, 16)
+                };
+                if shade != run.1 {
+                    if run.1 != 0 && x > run.0 {
+                        let _ = target.fill_solid(&Rectangle::new(Point::new(run.0, y), Size::new((x - run.0) as u32, 1)), shades[run.1 as usize]);
+                    }
+                    run = (x, shade);
                 }
             }
         }
     }
+}
+
+/// `color` in seventeen strengths, from nothing (black) to all of it.
+fn shades(color: Rgb565) -> [Rgb565; 17] {
+    let mut out = [Rgb565::BLACK; 17];
+    for (step, shade) in out.iter_mut().enumerate() {
+        let part = |channel: u8| (channel as u32 * step as u32 + 8) / 16;
+        *shade = Rgb565::new(part(color.r()) as u8, part(color.g()) as u8, part(color.b()) as u8);
+    }
+    out
 }
 
 /// The square root of `v`, rounded down.

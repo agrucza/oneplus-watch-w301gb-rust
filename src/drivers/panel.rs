@@ -20,12 +20,18 @@
 
 use core::fmt::Write;
 
+use embassy_stm32::dma2d::{self, Buffer2D, Dma2d, PixelFormat};
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::{peripherals, Peri};
+use embassy_stm32::{bind_interrupts, peripherals, Peri};
 use embassy_time::Timer;
 
 use crate::hal::dsi;
+use crate::services::canvas::Canvas;
 use crate::services::log::Log;
+
+bind_interrupts!(struct Irqs {
+    DMA2D => dma2d::InterruptHandler<peripherals::DMA2D>;
+});
 
 pub const WIDTH: usize = 454;
 pub const HEIGHT: usize = 454;
@@ -77,6 +83,9 @@ pub struct Resources {
     pub _te: Peri<'static, peripherals::PF11>,
     pub _ltdc: Peri<'static, peripherals::LTDC>,
     pub _dsi: Peri<'static, peripherals::DSIHOST>,
+    /// The chip's hardware blitter (DMA2D), which the stock app draws
+    /// with (its base address is referenced at 0x0808EE14 in B.70).
+    pub blitter: Peri<'static, peripherals::DMA2D>,
 }
 
 pub struct Panel {
@@ -85,6 +94,7 @@ pub struct Panel {
     frames: [&'static mut Frame; 2],
     /// Which of the two the panel was sent last.
     shown: usize,
+    blitter: Dma2d<'static, peripherals::DMA2D>,
     _pins: [Output<'static>; 4],
 }
 
@@ -148,7 +158,8 @@ impl Panel {
         }
         dsi::enable();
         let _ = writeln!(log.stamp(), "display: panel switched on");
-        Some(Self { frames, shown: 0, _pins: [pg5, pf12, power, reset] })
+        let blitter = Dma2d::new(r.blitter, Irqs);
+        Some(Self { frames, shown: 0, blitter, _pins: [pg5, pf12, power, reset] })
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
@@ -162,6 +173,44 @@ impl Panel {
     /// two pictures ago, so a picture has to be drawn completely.
     pub fn back(&mut self) -> &mut Frame {
         self.frames[1 - self.shown]
+    }
+
+    /// `frame` (0 or 1) as the blitter wants it described.
+    fn blitter_buffer(&mut self, frame: usize) -> Buffer2D {
+        Buffer2D::new(self.frames[frame].as_mut_ptr() as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, HEIGHT as u16)
+    }
+
+    /// Fill a rectangle of the frame to draw into with one colour, using
+    /// the hardware blitter. False if the blitter reported an error.
+    pub async fn blitter_fill(&mut self, x: u16, y: u16, w: u16, h: u16, color: u16) -> bool {
+        let back = 1 - self.shown;
+        let region = self.blitter_buffer(back).region(x, y, w, h);
+        self.blitter.fill(&region, color as u32).await.is_ok()
+    }
+
+    /// Copy the frame the panel was sent last into the frame to draw into,
+    /// using the hardware blitter. False if the blitter reported an error.
+    pub async fn blitter_copy(&mut self) -> bool {
+        let (from, to) = (self.blitter_buffer(self.shown), self.blitter_buffer(1 - self.shown));
+        self.blitter.copy(&from, &to).await.is_ok()
+    }
+
+    /// The opposite copy, done by the processor: the frame to draw into
+    /// is copied over the frame the panel was sent last. For timing only.
+    pub fn processor_copy_back_to_shown(&mut self) {
+        let (first, second) = self.frames.split_at_mut(1);
+        let (from, to) = if self.shown == 0 { (&*second[0], &mut *first[0]) } else { (&*first[0], &mut *second[0]) };
+        to.copy_from_slice(from);
+    }
+
+    /// True if the two frames hold the same picture.
+    pub fn frames_equal(&self) -> bool {
+        self.frames[0][..] == self.frames[1][..]
+    }
+
+    /// The frame to draw into, as a target for `embedded-graphics`.
+    pub fn canvas(&mut self) -> Canvas<'_> {
+        Canvas::new(self.frames[1 - self.shown], &mut self.blitter)
     }
 
     /// Which of the two frames `back` is: 0 or 1.

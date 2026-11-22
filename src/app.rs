@@ -18,7 +18,6 @@ use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
 use crate::services::brightness::AutoBrightness;
-use crate::services::canvas::Canvas;
 use crate::services::damage::Damage;
 use crate::services::{bluetooth, clock, factory, storage};
 use embedded_graphics::prelude::*;
@@ -142,7 +141,12 @@ pub async fn run(board: Board) {
             let frames = unsafe {
                 [&mut *(psram::FRAMEBUFFER as *mut panel::Frame), &mut *(psram::FRAMEBUFFER_2 as *mut panel::Frame)]
             };
-            screen = panel::Panel::start(board.display, frames, &mut log).await.map(Screen::new);
+            let mut panel = panel::Panel::start(board.display, frames, &mut log).await;
+            if let (true, Some(panel)) = (BLITTER_TIMING, panel.as_mut()) {
+                time_blitter(panel, &mut log).await;
+                let _ = log.flush();
+            }
+            screen = panel.map(Screen::new);
         } else {
             let _ = writeln!(log.stamp(), "display: not started, no memory for the picture");
         }
@@ -581,6 +585,88 @@ impl WearView {
 /// 15 times a second.
 const FACE_PERIOD: Duration = Duration::from_millis(66);
 
+/// Diagnosis: at start, fill and copy a frame with the processor and with
+/// the hardware blitter, and log the times. Measured: a whole frame filled in
+/// 23.8 ms by the processor and 4.6 ms by the blitter; copied in 50.5 ms
+/// and 10.1 ms; 100 rectangles of 32 x 32 filled in 10.2 ms and 3.0 ms.
+const BLITTER_TIMING: bool = false;
+
+/// Diagnosis: what filling and copying cost, done by the processor and
+/// done by the hardware blitter. Runs before the first picture; both
+/// frames are left with rubbish in them, which the first two pictures
+/// paint over completely.
+async fn time_blitter(panel: &mut panel::Panel, log: &mut Log) {
+    use crate::drivers::panel::{HEIGHT, WIDTH};
+    start_cycle_counter();
+    let us = |cycles: u64| cycles / 120;
+    let (w, h) = (WIDTH as u16, HEIGHT as u16);
+    let mut stage = cycles();
+
+    // A whole frame filled.
+    panel.back().fill(0x1234);
+    let processor_fill = lap(&mut stage);
+    let filled = panel.blitter_fill(0, 0, w, h, 0x07E0).await;
+    let blitter_fill = lap(&mut stage);
+    let back = panel.back();
+    let fill_right = back[0] == 0x07E0 && back[WIDTH * HEIGHT / 2 + 7] == 0x07E0 && back[WIDTH * HEIGHT - 1] == 0x07E0;
+
+    // A whole frame copied: the other frame gets a pattern first.
+    for (i, pixel) in panel.back().iter_mut().enumerate() {
+        *pixel = (i as u32).wrapping_mul(40503) as u16;
+    }
+    watchdog::feed();
+    // Make that frame the "shown" one by copying it across with the
+    // processor (timed), then wipe the target and copy with the blitter.
+    panel.processor_copy_back_to_shown();
+    let processor_copy = lap(&mut stage);
+    panel.back().fill(0);
+    lap(&mut stage);
+    let copied = panel.blitter_copy().await;
+    let blitter_copy = lap(&mut stage);
+    let same = panel.frames_equal();
+    watchdog::feed();
+
+    // A hundred small rectangles, 32 x 32, filled.
+    lap(&mut stage);
+    for n in 0..100usize {
+        let (x, y) = (n % 10 * 40 + 20, n / 10 * 40 + 20);
+        let frame = panel.back();
+        for row in 0..32 {
+            frame[(y + row) * WIDTH + x..][..32].fill(0xF800);
+        }
+    }
+    let processor_small = lap(&mut stage);
+    let mut small_ok = true;
+    for n in 0..100u16 {
+        small_ok &= panel.blitter_fill(n % 10 * 40 + 20, n / 10 * 40 + 20, 32, 32, 0x001F).await;
+    }
+    let blitter_small = lap(&mut stage);
+
+    let _ = writeln!(
+        log.stamp(),
+        "blitter: whole frame filled: processor {} us, blitter {} us ({}{})",
+        us(processor_fill),
+        us(blitter_fill),
+        if filled { "no error" } else { "ERROR" },
+        if fill_right { ", pixels right" } else { ", pixels WRONG" }
+    );
+    let _ = writeln!(
+        log.stamp(),
+        "blitter: whole frame copied: processor {} us, blitter {} us ({}{})",
+        us(processor_copy),
+        us(blitter_copy),
+        if copied { "no error" } else { "ERROR" },
+        if same { ", copy identical" } else { ", copy DIFFERENT" }
+    );
+    let _ = writeln!(
+        log.stamp(),
+        "blitter: 100 rectangles of 32 x 32 filled: processor {} us, blitter {} us ({})",
+        us(processor_small),
+        us(blitter_small),
+        if small_ok { "no error" } else { "ERROR" }
+    );
+}
+
 /// The processor's cycle counter, for timing short stretches of code.
 fn cycles() -> u32 {
     cortex_m::peripheral::DWT::cycle_count()
@@ -899,11 +985,18 @@ impl Screen {
                 if self.face_keys[n] != key {
                     // Where it was and where it is now: an element may
                     // have moved.
-                    if self.face_keys[n].is_some() {
-                        self.damage.add(self.face_rects[n]);
-                    }
                     let rect = face::rect(n, &state);
-                    self.damage.add(rect);
+                    let old = self.face_rects[n];
+                    if self.face_keys[n].is_some() && face::overlap(&old, &rect) {
+                        // Moved a little: one rectangle round both places
+                        // is cheaper to repaint than two that overlap.
+                        self.damage.add(face::around(&old, &rect));
+                    } else {
+                        if self.face_keys[n].is_some() {
+                            self.damage.add(old);
+                        }
+                        self.damage.add(rect);
+                    }
                     self.face_keys[n] = key;
                     self.face_rects[n] = rect;
                 }
@@ -915,7 +1008,7 @@ impl Screen {
             }
             // Repaint each changed rectangle: background, then every
             // element that reaches into it, cut off at its edge.
-            let mut canvas = Canvas(self.panel.back());
+            let mut canvas = self.panel.canvas();
             for area in changes.rects(face::whole()) {
                 let mut clipped = canvas.clipped(&area);
                 status::background(&mut clipped, &area);
@@ -963,7 +1056,7 @@ impl Screen {
         // reaches into it, in the order it lies on the screen. Drawing is
         // cut off at the rectangle's edge.
         let dots = &self.dots[..self.dot_count.min(self.dots.len())];
-        let mut canvas = Canvas(self.panel.back());
+        let mut canvas = self.panel.canvas();
         for area in changes.rects(status::whole()) {
             let mut clipped = canvas.clipped(&area);
             status::background(&mut clipped, &area);

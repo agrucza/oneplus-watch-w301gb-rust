@@ -88,6 +88,7 @@ impl Board {
                 _te: p.PF11,
                 _ltdc: p.LTDC,
                 _dsi: p.DSIHOST,
+                blitter: p.DMA2D,
             },
             upper_button: p.PC13,
             sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
