@@ -468,7 +468,7 @@ Steps:
    minutes.
 3. Firmware update path: leave alone.
 
-### 3.10 eMMC (item 1) - at the stock bus settings; one item left
+### 3.10 eMMC (item 1) - done; card power-down belongs to low power
 
 The HAL has no driver for this chip's card controller (also not in the
 pinned upstream commit: its chip data lists SDMMC1 without registers), so
@@ -508,14 +508,15 @@ Tried and dropped: keeping the last allocation-table sector in memory. It
 made no measurable difference (386 ms against 335 ms, one run each); the
 table is only read once per cluster.
 
-Remaining:
-1. The power-off notice the stock app gives the card: CMD6 `0x03220100`
-   ("powered on") at the end of its start-up (`0x0804D8AA`), CMD6
-   `0x03220200` ("about to be switched off") in its shutdown routine
-   (`0x0804DB62`), which then cuts the card's supply through three pins.
-   This firmware never cuts the supply; it resets and the bootloader
-   starts the card again while it is powered. Not to be sent before it is
-   read when the stock app shuts the card down and what those pins do.
+Remaining, with low power (section 4):
+1. Switching the card off and on around the processor's stop mode. The
+   stock app's card shutdown routine (`0x0804DB62` in B.70: CMD6
+   `0x03220200` "about to be switched off", controller off, supply cut
+   through pins on port G) has one caller, `0x080245CA`, in the routine
+   that prepares the low-power state; its start-up gives the matching
+   "powered on" notice (CMD6 `0x03220100`, `0x0804D8AA`). So the notice
+   is not something to send before a reset: this firmware resets with
+   the card powered, and the bootloader starts the card again itself.
 
 ### 3.11 PSRAM, remaining work (item 5) - S
 
@@ -578,8 +579,7 @@ before adding new chips.
 
 1. **Full speed underneath:** 120 MHz system clock (section 4), PSRAM
    timing (3.11), eMMC at 48 MHz on four data lines with multi-sector
-   reads and writes (3.10): done. Left there: the card's power-off
-   notice.
+   reads and writes (3.10): done.
 2. **Display pipeline** (3.3): regional updates, second frame buffer.
 3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
    press (3.2), clock backup file (3.12).
