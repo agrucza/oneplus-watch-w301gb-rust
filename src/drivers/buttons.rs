@@ -27,7 +27,7 @@ impl Buttons {
     pub fn start(pc13: Peri<'static, peripherals::PC13>) -> Self {
         let upper = Input::new(pc13, Pull::Up);
         // Let the pull-up bring the line up before the first sample.
-        cortex_m::asm::delay(96_000);
+        cortex_m::asm::delay(120_000); // about a millisecond
         let low = upper.is_low();
         Self { upper, pressed: low, last_sample: low, since: Instant::now() }
     }

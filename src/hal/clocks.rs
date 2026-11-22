@@ -9,10 +9,12 @@
 //! crystal-trimmed MSI, using TIM17's internal HSE/32 input), and boost mode
 //! is still active when the bootloader hands over (PWR_CR5 = 0).
 //!
-//! This app uses the same crystal and PLL, but multiplies by 24 for 96 MHz:
-//! the HAL (embassy-stm32 0.6) only sets flash latencies up to 4, which is
-//! valid up to 100 MHz, so 120 MHz needs clock code of our own. 96 MHz also
-//! divides exactly to the Bluetooth UART's 3,000,000 baud.
+//! This app runs the same: 120 MHz, all bus dividers 1. The HAL sets the
+//! flash latency (5), boost mode and the bus-divider step that the chip
+//! requires for a switch above 80 MHz; that needs the HAL from upstream
+//! commit e1b23ae or newer (see `Cargo.toml`), the 0.6.0 release stops at
+//! latency 4, which is only valid up to 100 MHz. 120 MHz divides exactly
+//! to the Bluetooth UART's 3,000,000 baud (by 40).
 
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
@@ -46,32 +48,32 @@ pub fn configure(config: &mut Config) {
 
     config.rcc.hse = Some(Hse { freq: Hertz(CRYSTAL_HZ), mode: HseMode::Oscillator });
     config.rcc.pll = Some(Pll {
-        source: PllSource::HSE,
-        prediv: PllPreDiv::DIV3, // 8 MHz into the PLL
-        mul: PllMul::MUL24,      // 192 MHz
+        source: PllSource::Hse,
+        prediv: PllPreDiv::Div3, // 8 MHz into the PLL
+        mul: PllMul::Mul30,      // 240 MHz
         divp: None,
         divq: None,
-        divr: Some(PllRDiv::DIV2), // 96 MHz system clock
+        divr: Some(PllRDiv::Div2), // 120 MHz system clock
     });
-    config.rcc.sys = Sysclk::PLL1_R;
+    config.rcc.sys = Sysclk::Pll1R;
     // Display pixel clock, as in the stock app: PLLSAI2 = HSE / 3 * 10 / 2 =
     // 40 MHz, which the LTDC divides by 2.
     config.rcc.pllsai2 = Some(Pll {
-        source: PllSource::HSE,
-        prediv: PllPreDiv::DIV3,
-        mul: PllMul::MUL10,
+        source: PllSource::Hse,
+        prediv: PllPreDiv::Div3,
+        mul: PllMul::Mul10,
         divp: None,
         divq: None,
-        divr: Some(PllRDiv::DIV2),
+        divr: Some(PllRDiv::Div2),
     });
     // MSI stays on at 48 MHz as the 48 MHz peripheral clock (SDMMC1), as in
     // the stock firmware (CLK48SEL = MSI).
-    config.rcc.msi = Some(MSIRange::RANGE48M);
-    config.rcc.mux.clk48sel = Clk48sel::MSI;
+    config.rcc.msi = Some(MSIRange::Range48m);
+    config.rcc.mux.clk48sel = Clk48sel::Msi;
     // The converter's clock is the system clock, as in the stock firmware
     // (its peripheral clock set-up at 0x0804DF40 selects SYSCLK for the
     // ADC); it is divided at the converter, see `board::RevisionPin`.
-    config.rcc.mux.adcsel = Adcsel::SYS;
+    config.rcc.mux.adcsel = Adcsel::Sys;
 }
 
 /// Log the clock registers as they are now.
@@ -116,9 +118,9 @@ pub fn adopt_low_speed_clocks() -> LsConfig {
     };
     let rtc_enabled = bdcr & (1 << 15) != 0;
     let rtc = match (bdcr >> 8) & 0b11 {
-        1 if rtc_enabled && lse_on => RtcClockSource::LSE,
-        2 if rtc_enabled => RtcClockSource::LSI,
-        _ => RtcClockSource::DISABLE,
+        1 if rtc_enabled && lse_on => RtcClockSource::Lse,
+        2 if rtc_enabled => RtcClockSource::Lsi,
+        _ => RtcClockSource::Disable,
     };
     LsConfig {
         rtc,

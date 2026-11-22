@@ -12,10 +12,11 @@
 //!
 //! The bus itself (pins, bank registers) is in `hal::fmc`; PE2 is the
 //! memory's CRE pin, a plain output.
-//! FMC clock = system clock / 2 (stock: 60 MHz; here 48 MHz).
+//! FMC clock = system clock / 2 = 60 MHz, as in the stock app.
 //!
-//! Measured on the watch at a 48 MHz bus clock: all 16 MB written and read
-//! back correctly, 3.7 s for the full pass.
+//! Measured on the watch: all 16 MB written and read back correctly, in
+//! 3.2 s at the 60 MHz bus clock (3.7 s at 48 MHz, when the system clock
+//! was 96 MHz).
 //!
 //! Memory map: the stock app keeps its framebuffer in the 2 MB at
 //! 0x60C0_0000, and so do we.

@@ -162,7 +162,7 @@ impl RevisionPin {
         }
         let mut samples = [0u16; 5];
         for sample in samples.iter_mut() {
-            *sample = adc.blocking_read(&mut self.pin, SampleTime::CYCLES2_5);
+            *sample = adc.blocking_read(&mut self.pin, SampleTime::Cycles25);
         }
         let sum: u32 = samples.iter().map(|&s| s as u32).sum();
         let lowest = *samples.iter().min().unwrap_or(&0) as u32;

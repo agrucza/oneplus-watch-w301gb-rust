@@ -23,8 +23,8 @@ runs its own stack. Each chip below hangs off one of them.
 |---|---|---|---|---|
 | 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works (1-bit, 12 MHz) |
 | 2 | Cypress CYW20721 Bluetooth | USART3 3 Mbaud (PC4, PC5, PB13, PB14), PB2, PC6, PB9, PC7 | `cypress/appdriver.bin`, `minidriver.bin` | works for existing pairings |
-| 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works, few messages understood |
-| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking |
+| 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
+| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
 | 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | works: finger position and events |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
@@ -33,7 +33,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: calibrated lux, automatic brightness as in the stock app |
 | 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
-| 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth, shown on screen |
+| 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth with time zone, shown on screen |
 | 14 | Log UART | LPUART1 (PG7, PG8) | none | not used |
 
 ### Attached to the Apollo
@@ -44,14 +44,14 @@ The Apollo names them itself in message kind 52 (**measured**).
 
 | # | Chip | Function | State in Rust |
 |---|---|---|---|
-| 15 | LSM6DSO (firmware also carries BMI270 and ICM-40608 drivers) | accelerometer and gyroscope | nothing decoded |
+| 15 | LSM6DSO (firmware also carries BMI270 and ICM-40608 drivers) | accelerometer and gyroscope | raw data not decoded; the Apollo's wrist gestures from it are used (raise-to-wake) |
 | 16 | MMC5603 | magnetometer | nothing decoded |
 | 17 | ICP-101xx | barometer | decoded: pressure, altitude |
-| 18 | MediaTek MT6670 | heart rate and SpO2 optical front end | nothing decoded |
-| 19 | SX932x | capacitive wear detection | decoded: worn / not worn |
+| 18 | MediaTek MT6670 | heart rate and SpO2 optical front end | single heart-rate measurement works; its infrared check is one input of wear detection |
+| 19 | SX932x | capacitive wear detection | decoded: worn / not worn with reason |
 | 20 | BQ25618 | battery charger | partly: USB power flag |
 | 21 | CW2015 | fuel gauge | decoded: percent, millivolts |
-| 22 | AW8695 | haptic motor driver | nothing |
+| 22 | AW8695 | haptic motor driver | pulses work; effects not done |
 | 23 | AG3335 | GPS, position data side | nothing decoded |
 | 24 | NTC thermistors | three temperatures | decoded |
 
@@ -226,7 +226,7 @@ names as text, which makes it readable as the other half of every message.
 | Time | stock sends kind 5: GMT seconds and time zone in minutes | done and measured (2026-11-22): the Apollo logged `Time set:UTC=1795365228 timeZone=60` and `Time set:2026-11-22 17:33:48 7 is OK!`; its clock had read 2026-11-21 12:54 before. It sets its running clock and its clock chip, stores the zone and tells its daily algorithms the time is valid (0x4010C in its image). The time zone comes from RTC backup register 3, where the stock app keeps it (`hal::rtc::time_zone`); `tools/ota.sh time` sets it. Sent again when the clock is set while running (`clock::take_changed`); that path is not tested yet |
 | Version | stock sends kind 6: its version text | done and measured (2026-11-22): the Apollo keeps the text, logged `st version:W301_RUST` and answered with its own, `CONBINE_LTAQ4002_0704_202112141814` (0x3F27A in its image) |
 | Setup status | stock sends kind 140 = 3 when first-time setup is over; the Apollo then switches its capacitive wear detection on (`lcAlgoOOBEStatusSet`) | sent on the announcement, repeated until acknowledged; **measured: acknowledged, capacitive sensor on, wrist detected about 4 s after putting the watch on** |
-| Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), a daily time window for the Apollo's algorithm 13, probably raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), kind 130 | do-not-disturb and sedentary are read through on both sides, written and switched off; **the others are identified but not read through**; none can be changed yet because the firmware has no settings of its own |
+| Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), screen status (130) | **done and measured:** raise-to-wake (on, all day) and screen status. Do-not-disturb and sedentary are read through on both sides, written and switched off. **Not read through:** heart-rate monitoring, stress, kind 142, SpO2. None can be changed yet because the firmware has no settings of its own |
 | Board revision | Apollo asks "get pin 11" (kind 7) once after its start; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`) | **measured: reading 3411 of 4095 (1.50 V), revision 3, which the Apollo calls B281_DVT.** Answered with the stock app's bytes. The Apollo's handler (`0x3F020`) takes an answer with field 4 = 2 and field 2 = 0, stores field 3 and sends nothing back, so the watch cannot show that it was taken. For revision 3 it only prints its banner; revision 1 would reconfigure two of its pins, revision 0 changes a pull on its link pin 9 |
 | Battery identification | kept inside the Apollo (its stored item 0x25); together with its revision question it sends the value to the STM32 (kind 7, field 2 = 0x25, field 4 = 2; measured: value 0) and it can be set or read with kind 24 | the value is logged; nothing else done with it |
 | Sensor switches | stock switches sensors with kind 120 (field 1: 0 compass, 1 barometer, 2 battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 power control; field 2 on/off; field 3 interval) | **not done** |
@@ -352,19 +352,13 @@ the display only if a raise had shown it (the stock app's own condition
 is a setting not read yet).
 
 Open:
-1. Screen status (kind 130: field 2 = 1 on, 0 off; the stock app sends
-   it when the backlight is set, when the screen goes off, and once after
-   the Apollo's start). The Apollo starts with "off". It holds its cached
-   health data back while the screen is off, makes its sport module
-   report on "on", feeds the state to its motion algorithm and daily
-   module, and only counts the off-wrist timeout while off. Written,
-   switched off; next single test. The off-wrist timeout comes after it.
-2. The other two ways the stock app can switch the capacitive sensor:
+1. The other two ways the stock app can switch the capacitive sensor:
    kind 120 with sensor 5, and "power control" (sensor 7). The stock app
    uses them only in a timed test mode (`0x080A7290`); not read further.
-3. What the stock app does on a wear change besides logging it (its
-   handler at `0x0806CC70` calls six functions): not read.
-4. Reason 2 has not been seen on the watch yet.
+2. Reason 2 (capacitive far) has not been seen on the watch yet.
+3. The stock app's reactions to a wear change that need features this
+   firmware does not have yet (see the table above): the 5 s timer, the
+   messages to other tasks, automatic do-not-disturb.
 
 **Heart rate:** command kind 123 (field 8 = mode: 3 single measurement, 2
 with the stress measurement, 0xFF test), results kind 44 (field 2 = beats
@@ -385,8 +379,9 @@ by number), stop, the stock app's table of about 30 effects
 (`0x081C54C0`), motor calibration.
 
 Steps:
-1. Finish the start-up exchange above, in the stock order.
-2. Battery identification with the ADC.
+1. Finish the start-up exchange above, in the stock order: do-not-disturb,
+   sedentary, heart-rate monitoring, stress, kind 142, SpO2.
+2. Sensor switches (kind 120).
 3. Name the rest of the schema (about 80 kinds; see
    `src/drivers/apollo/messages.rs` for those known).
 4. Motion data (LSM6DSO), compass (MMC5603): switches, rates, reports.
@@ -485,7 +480,9 @@ Only worth it when file speed starts to matter (resources, audio).
 
 1. A simple allocator or fixed map for the 16 MB (stock map: resources,
    animation storage, framebuffer).
-2. Raise the bus clock when the system clock goes to 120 MHz.
+2. Bus clock: done. It is the system clock / 2 = 60 MHz, as in the stock
+   app, with the stock timing values. Measured: all 16 MB written and read
+   back correctly in 3.2 s.
 
 ### 3.12 Real-time clock (item 13) - done
 
@@ -502,9 +499,11 @@ and sets it from `AT^W301TIME=YYYY-MM-DD HH:MM:SS`, which `tools/ota.sh
 time` sends with the PC's local time. Set and read back across a restart
 on the watch.
 
+The time zone is kept in backup register 3 as signed minutes, as the
+stock app keeps it; `AT^W301TIME` takes an optional zone (`+0100`).
+
 Remaining:
-1. Time zone and daylight saving changes: the clock simply holds whatever
-   local time was sent.
+1. Daylight saving changes: nothing switches the zone by itself.
 2. Alarm and wake-up timer, when low power is done.
 3. `0:rtcData.txt` is not written; the stock app restores a stale time
    from it if the backup domain is ever lost.
@@ -519,7 +518,7 @@ Would give a live log without Bluetooth.
 | Topic | Why it matters | Effort |
 |---|---|---|
 | Low power (sleep, stop) | The Rust app runs flat out; the battery lasts hours | L |
-| 120 MHz system clock | Needs our own flash-latency handling; the HAL stops at 100 MHz | S |
+| 120 MHz system clock | **done and measured (2026-11-22):** 120 MHz with all bus dividers 1, as in the stock app; flash latency 5 and boost mode read back in the log. The embassy crates are pinned to upstream commit e1b23ae for this (see `Cargo.toml`): the 0.6.0 release sets at most latency 4 | done |
 | Resource files `stm32_res1.bin` (279 MB), `stm32_res2.bin` | Stock fonts and images; format unknown | M |
 | Robust update path | Today a broken image falls back to stock; a second slot (`packetB`) could hold a known-good Rust image | M |
 | Factory data file | Address and serial are in `0:flash_device.txt`; never write to volume 0 | S |
@@ -527,19 +526,32 @@ Would give a live log without Bluetooth.
 ## 5. Suggested order
 
 Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor and automatic brightness (3.4), touch (3.1), real-time clock (3.12), Bluetooth address from factory data (3.8).
+sensor and automatic brightness (3.4), touch positions (3.1), real-time
+clock with time zone (3.12), Bluetooth address from factory data (3.8),
+Apollo start-up through time, name, setup status, screen status and
+raise-to-wake, wear detection, single heart-rate measurement, vibration
+pulses (3.5).
 
-1. **Apollo: sending, haptics, heart rate** (3.5 steps 2-5).
-2. **Low power** (section 4): after that the watch can be worn.
-3. **Audio** (3.6).
-4. **GPS, pairing, BLE, NFC** as wanted.
+Decided 2026-11-22: bring what works up to the stock firmware's level
+before adding new chips.
+
+1. **Full speed underneath:** 120 MHz system clock (section 4) and PSRAM
+   timing (3.11): done. Left: eMMC with four data lines at 48 MHz and
+   multi-block transfers (3.10).
+2. **Display pipeline** (3.3): regional updates, second frame buffer.
+3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
+   press (3.2), clock backup file (3.12).
+4. **Low power** (section 4): after that the watch can be worn.
+5. Alongside: the remaining Apollo settings (3.5).
+6. Then: audio (3.6), GPS, pairing, BLE, NFC.
 
 ## 6. Open questions
 
 - What PF4 feeds (switched together with the touch reset).
 - Why the lower button's first press after a display command once came
   without a "clicked" message from the Apollo.
-- What SPI2 and the outputs PA4, PB3, PB1 are used for.
+- What SPI2 and the outputs PA4 and PB3 are used for (PB1 is the audio
+  codec's supply enable on board revisions 1 and 3).
 - Whether the device at 0x36 on I2C2 is the speaker amplifier, and which
   pins power or enable it and the NFC controller (neither answers on the
   bus as things are).

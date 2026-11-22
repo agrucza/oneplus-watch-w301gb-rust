@@ -89,6 +89,11 @@ pub async fn run(board: Board) {
         let _ = log.flush();
         let mut screen = None;
         psram::init().await;
+        if PSRAM_FULL_TEST {
+            // Before the display uses the memory: the test overwrites it all.
+            psram::full_test(&mut log);
+            let _ = log.flush();
+        }
         if psram::quick_check(&mut log) {
             let _ = writeln!(log.stamp(), "psram: ready");
             // The 2 MB at FRAMEBUFFER belong to the display alone.
@@ -147,6 +152,10 @@ const CLICK_MS: u64 = 800;
 /// `FADE_INTERVAL`: from darkest to brightest in about two seconds.
 const FADE_STEP: u8 = 4;
 const FADE_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Diagnosis: write and read back the whole PSRAM at every start (about
+/// 4 s). On while the memory bus speed is being changed.
+const PSRAM_FULL_TEST: bool = false;
 
 /// How long a "not on the wrist" report has to stand, with the display on,
 /// before the status screen shows it.
