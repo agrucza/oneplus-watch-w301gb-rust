@@ -67,7 +67,7 @@ const SEND_TIME_AND_VERSION: bool = false;
 /// Do-not-disturb and sedentary settings after the setup status.
 const SEND_SETTINGS: bool = false;
 /// The answer to the Apollo's question for the board revision.
-const ANSWER_REVISION: bool = false;
+const ANSWER_REVISION: bool = true;
 /// How this firmware names itself to the Apollo.
 const VERSION_TEXT: &str = "W301_RUST";
 /// The stock app's own heartbeat period.
@@ -136,6 +136,7 @@ pub struct Apollo {
     revision: u8,
     revision_asked: bool,
     revision_answers: u32,
+    pin_logged: u32,
     /// Setup status: when to send it next, the sequence number it went
     /// out with, how often it was tried, and whether the Apollo has
     /// acknowledged it.
@@ -202,6 +203,7 @@ impl Apollo {
             revision: 0,
             revision_asked: false,
             revision_answers: 0,
+            pin_logged: 0,
             setup_due: None,
             setup_sequence: 0,
             setup_tries: 0,
@@ -469,7 +471,6 @@ impl Apollo {
     }
 
     /// Tell the driver the board revision, for the Apollo's question.
-    #[allow(dead_code)] // unused while `ANSWER_REVISION` is off
     pub fn set_revision(&mut self, revision: u8) {
         self.revision = revision;
     }
@@ -507,8 +508,8 @@ impl Apollo {
         if let Some((pascal, metres)) = r.barometer {
             let _ = write!(log, ", pressure {:.1} hPa (altitude {:.0} m)", pascal / 100.0, metres);
         }
-        if let Some(worn) = r.worn {
-            let _ = write!(log, ", {}", if worn { "worn" } else { "not worn" });
+        if let Some(wear) = r.wear {
+            let _ = write!(log, ", {}", if wear.on_wrist { "worn" } else { "not worn" });
         }
         let _ = writeln!(log);
     }
@@ -559,8 +560,20 @@ impl Apollo {
                     let _ = writeln!(log.stamp(), "button lower: {} (Apollo time {} ms)", event.name(), at);
                 }
             }
-            if kind == Some(messages::PIN) && messages::asks_for_revision(payload) {
-                self.revision_asked = true;
+            if kind == Some(messages::PIN) {
+                if messages::asks_for_revision(payload) {
+                    self.revision_asked = true;
+                } else if self.pin_logged < 10 {
+                    // Anything else of this kind is rare and worth a line.
+                    self.pin_logged += 1;
+                    let _ = write!(log.stamp(), "apollo: kind 7:");
+                    for (tag, value) in Fields(payload) {
+                        if let Some(v) = value.as_u32() {
+                            let _ = write!(log, " {}={}", tag, v);
+                        }
+                    }
+                    let _ = writeln!(log);
+                }
             }
             if kind == Some(messages::SENSOR_NAMES) && self.setup_due.is_none() {
                 // The Apollo has announced itself: the stock app's moment
@@ -569,14 +582,20 @@ impl Apollo {
             }
             if kind == Some(messages::WEAR) {
                 // Rare (only when the state changes), so every one is logged.
-                let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
-                let _ = writeln!(
-                    log.stamp(),
-                    "apollo: wear state {} ({}), reason {}",
-                    field(2),
-                    if field(2) == 2 { "on the wrist" } else { "not on the wrist" },
-                    field(3)
-                );
+                if let Some(wear) = self.readings.wear {
+                    let _ = writeln!(
+                        log.stamp(),
+                        "apollo: {}: {} (capacitive status {:#08x})",
+                        if wear.on_wrist { "on the wrist" } else { "not on the wrist" },
+                        wear.reason.name(),
+                        wear.capacitive_status
+                    );
+                }
+            }
+            if kind == Some(messages::OFF_WRIST) {
+                if let Some(long) = self.readings.off_wrist_long {
+                    let _ = writeln!(log.stamp(), "apollo: off the wrist for longer than the timeout: {}", long);
+                }
             }
             if kind == Some(messages::HEART) && self.heart_logged < 300 {
                 // Every report in full while this is new, to learn the fields.

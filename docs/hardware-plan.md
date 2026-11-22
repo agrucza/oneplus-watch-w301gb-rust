@@ -86,7 +86,7 @@ Other pins the stock app sets up:
 | PG2 | interrupt on rising edge, pull-down | unknown (not the touch interrupt) |
 | PA4, PB3 | outputs, driven low at start | unknown |
 | PB0 | analog input, ADC1 channel 15 | board revision (**from stock code**) |
-| PB1 | output | unknown; set by the stock app after the revision measurement (`0x0805C958`), depending on the revision |
+| PB1 | output | for this board's revision (3) the stock app drives PB1 and PA12 high after the revision measurement (`0x0805C958`), and switches PB1 off and on in its display and touch power sequence (`0x0805D566`). Probably a supply enable. **We do not drive PB1**; display and touch work anyway |
 | PB6, PB12 and two pins in a group of 6 and 10 | outputs | unknown |
 
 Cross-check: the stock app's clock selections name exactly USART3, LPUART1,
@@ -226,17 +226,48 @@ names as text, which makes it readable as the other half of every message.
 | Version | stock sends kind 6: its version text | written, switched off: the Apollo's side is not read yet |
 | Setup status | stock sends kind 140 = 3 when first-time setup is over; the Apollo then switches its capacitive wear detection on (`lcAlgoOOBEStatusSet`) | sent on the announcement, repeated until acknowledged; **measured: acknowledged, capacitive sensor on, wrist detected about 4 s after putting the watch on** |
 | Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), a daily time window for the Apollo's algorithm 13, probably raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), kind 130 | do-not-disturb and sedentary are read through on both sides, written and switched off; **the others are identified but not read through**; none can be changed yet because the firmware has no settings of its own |
-| Board revision | Apollo asks "get pin 11" (kind 7) and repeats it until answered; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`); the Apollo names the revisions B280_DVT, B280_PVT, B281_DVT and stores the answer | measurement and answer written, switched off: untested, and what the Apollo does per revision is not read yet |
-| Battery identification | kept inside the Apollo (its stored item 0x25); it tells the STM32 the value (kind 7, field 2 = 0x25) and can be set or read with kind 24 | not handled; the STM32 has no part in measuring it |
+| Board revision | Apollo asks "get pin 11" (kind 7) once after its start; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`) | **measured: reading 3411 of 4095 (1.50 V), revision 3, which the Apollo calls B281_DVT.** Answered with the stock app's bytes. The Apollo's handler (`0x3F020`) takes an answer with field 4 = 2 and field 2 = 0, stores field 3 and sends nothing back, so the watch cannot show that it was taken. For revision 3 it only prints its banner; revision 1 would reconfigure two of its pins, revision 0 changes a pull on its link pin 9 |
+| Battery identification | kept inside the Apollo (its stored item 0x25); together with its revision question it sends the value to the STM32 (kind 7, field 2 = 0x25, field 4 = 2; measured: value 0) and it can be set or read with kind 24 | the value is logged; nothing else done with it |
 | Sensor switches | stock switches sensors with kind 120 (field 1: 0 compass, 1 barometer, 2 battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 power control; field 2 on/off; field 3 interval) | **not done** |
 
-**Wear detection:** the Apollo's wear message (kind 45) carries 2 for "on
-the wrist" and 1 for "not" (`lcAlgo_send_offbody_reminder`; the stock log
-line is "isWear, offbodyReason, offbodyData"). Until the setup status was sent it was always 1 and the Apollo's status
-message (kind 54: compass, barometer, motion, gyroscope, GPS, capacitive,
-optical) showed the capacitive sensor off; our earlier decoding ("worn")
-was wrong. With the setup status it works: field 3 gives the reason (seen:
-4 when put on, 1 when taken off).
+**Wear detection** (read through in the Apollo's `lcAlgoWearWristCheckExe`
+and around it; the Apollo's own log texts name the inputs):
+
+- Inputs: the capacitive sensor ("cap near" / "cap far") and the optical
+  sensor's infrared check ("ir near" / "ir far").
+- Put on: both near, each for at least one second. Report: on the wrist,
+  reason 4.
+- Taken off: infrared far (reason 1), or capacitive far confirmed by a
+  second check (reason 2; the report then carries three status bytes of
+  the capacitive sensor in field 4).
+- Inside the Apollo the state is 8 (worn) or 3 (not worn); these are the
+  only two values its code sets. The report (kind 45) carries 2 or 1 in
+  field 2, the reason in field 3. It is sent on a change that lasted half
+  a second, and once after start (reason 0).
+- Enabled by: the setup status (kind 140 = 3), which switches the
+  capacitive sensor on. The Apollo's status message (kind 54: compass,
+  barometer, motion, gyroscope, GPS, capacitive, optical) shows the switch.
+- Off-wrist timeout: kind 11 from the STM32 (field 1 = 0, field 2 =
+  minutes, 0 = off) sets it; the Apollo answers with kind 11 (field 1 = 1,
+  field 2 = reached or not) once the watch has been off the wrist that
+  long. It only counts while it has been told that the screen is off.
+- What depends on the wear state in the Apollo: the heart-rate sensor
+  (`lcAlgoHeartRateEnable`), the sedentary reminder ("offbody, sedentary
+  algo off"), heart-rate result sending and reminders.
+
+Done and measured: setup status, detection of putting on (about 4 s) and
+taking off, full decoding of the report (`messages::Wear`).
+
+Open:
+1. Screen status (kind 130; the stock app sends it with its settings and
+   on every change): not sent. Until then the off-wrist timeout cannot
+   work; the timeout message is written and switched off.
+2. The other two ways the stock app can switch the capacitive sensor:
+   kind 120 with sensor 5, and "power control" (sensor 7). The stock app
+   uses them only in a timed test mode (`0x080A7290`); not read further.
+3. What the stock app does on a wear change besides logging it (its
+   handler at `0x0806CC70` calls six functions): not read.
+4. Reason 2 has not been seen on the watch yet.
 
 **Heart rate:** command kind 123 (field 8 = mode: 3 single measurement, 2
 with the stress measurement, 0xFF test), results kind 44 (field 2 = beats

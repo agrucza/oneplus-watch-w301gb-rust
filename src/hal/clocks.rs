@@ -17,7 +17,7 @@
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
 
-use embassy_stm32::rcc::mux::Clk48sel;
+use embassy_stm32::rcc::mux::{Adcsel, Clk48sel};
 use embassy_stm32::rcc::{LsConfig, LseConfig, LseDrive, LseMode, RtcClockSource};
 use embassy_stm32::rcc::{Hse, HseMode, MSIRange, Pll, PllMul, PllPreDiv, PllRDiv, PllSource, Sysclk};
 use embassy_stm32::time::Hertz;
@@ -68,6 +68,10 @@ pub fn configure(config: &mut Config) {
     // the stock firmware (CLK48SEL = MSI).
     config.rcc.msi = Some(MSIRange::RANGE48M);
     config.rcc.mux.clk48sel = Clk48sel::MSI;
+    // The converter's clock is the system clock, as in the stock firmware
+    // (its peripheral clock set-up at 0x0804DF40 selects SYSCLK for the
+    // ADC); it is divided at the converter, see `board::RevisionPin`.
+    config.rcc.mux.adcsel = Adcsel::SYS;
 }
 
 /// Log the clock registers as they are now.

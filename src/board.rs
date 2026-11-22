@@ -96,13 +96,11 @@ impl Board {
 }
 
 /// The board revision, coded as a voltage on PB0.
-#[allow(dead_code)] // not measured yet, see `app::run`
 pub struct RevisionPin {
     adc: Peri<'static, peripherals::ADC1>,
     pin: Peri<'static, peripherals::PB0>,
 }
 
-#[allow(dead_code)] // not measured yet, see `app::run`
 impl RevisionPin {
     /// Measure the voltage and return the revision number the stock app
     /// derives from it, with the average reading for the log.
@@ -116,13 +114,14 @@ impl RevisionPin {
     /// number after it has started and names the revisions B280_DVT (0),
     /// B280_PVT (1) and B281_DVT (2).
     ///
-    /// Before this is used, the converter's clock source has to be chosen
-    /// in `hal::clocks` (`config.rcc.mux.adcsel`); it is left alone for now.
+    /// The converter is set up as in the stock app (0x0808F224): clocked
+    /// from the system clock divided by 128, 12 bits, channel 15, the
+    /// shortest sampling time.
     pub fn measure(mut self) -> (u8, u16) {
         let mut adc = Adc::new(self.adc);
         // The HAL calibrates at the full system clock, which is above the
         // converter's limit. Divide the clock by 128 as the stock app does
-        // (its ADC set-up at 0x0808F224) and calibrate again.
+        // and calibrate again.
         embassy_stm32::pac::ADC1_COMMON.ccr().modify(|w| w.0 = (w.0 & !(0xF << 18)) | 0b1010 << 18);
         embassy_stm32::pac::ADC1.cr().modify(|w| w.0 = (w.0 & 0x3000_0000) | 1 << 31); // start calibration
         for _ in 0..2_000_000 {

@@ -161,7 +161,7 @@ pub fn draw(frame: &mut Frame, s: &Status<'_>) {
     put(246, true, Rgb565::WHITE, 22, &mut line);
 
     let mut line = Line::new();
-    let worn = match s.readings.and_then(|r| r.worn) {
+    let worn = match s.readings.and_then(|r| r.wear).map(|w| w.on_wrist) {
         Some(true) => "worn",
         Some(false) => "not worn",
         None => "wear --",

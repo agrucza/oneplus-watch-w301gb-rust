@@ -14,7 +14,8 @@
 //! |    20 | heartbeat                       | 2 = 0xA5A5A5A5 from the Apollo                |
 //! |    43 | barometer ("BAR")               | 1 time ms, 2 pressure Pa, 3 altitude m        |
 //! |    44 | heart rate, SpO2, stress        | 1 time ms, 2 bpm, 5 SpO2, 7 stress, 8 type, 25 status |
-//! |    45 | wear detection                  | 1 time ms, 2 state (2 = on the wrist, 1 = not), 3 reason |
+//! |    11 | off-wrist timeout and notification | see `off_wrist_timeout`                    |
+//! |    45 | wear detection                  | see `Wear`                                    |
 //! |    47 | battery ("Bat Receive")         | 1 time ms, 2 usb, 3 percent, 5 millivolts     |
 //! |    50 | temperatures ("NTC msg")        | 1 time ms, 2..4 degrees Celsius               |
 //! |    51 | lower button                    | 2 event (see `KeyEvent`), 3 Apollo uptime ms  |
@@ -32,6 +33,7 @@
 pub const ACK: u32 = 3;
 pub const HEARTBEAT: u32 = 20;
 pub const TIME: u32 = 5;
+pub const OFF_WRIST: u32 = 11;
 pub const PIN: u32 = 7;
 pub const VERSION: u32 = 6;
 pub const SENSOR_NAMES: u32 = 52;
@@ -113,10 +115,18 @@ pub fn time(unix_seconds: u32) -> Encoder {
 /// Answer to the Apollo's question for the board revision.
 ///
 /// After its start the Apollo sends kind 7 with field 1 = 11 and field
-/// 4 = 1 ("get", from its main task near 0x3FDB8) and repeats it until it
-/// is answered. The stock app answers with kind 7, field 3 = the revision
-/// and field 4 = 2 (0x0805C654); the Apollo then stores the revision
-/// (its handler at 0x3F1BA; it logs "HardWareVer get report ok").
+/// 4 = 1 ("get", from its main task near 0x3FDB8), once. The stock app answers with kind 7, field 3 = the revision
+/// and field 4 = 2 (0x0805C654).
+///
+/// What the Apollo does with the answer (0x3F08E to 0x3F1C4, 0xFDE6): it
+/// names the revision in its log (0 B280_DVT, 1 B280_PVT, 2 B281_EVT,
+/// anything else B281_DVT) and stores it; its start value is -1. For
+/// every value but 2 it prints its start-up banner; for 1 it also
+/// reconfigures two of its pins (45, 47). The only other reader is the
+/// link's pin set-up (0x54248), which gives its pin 9 a pull for revision
+/// 0 only. It accepts the answer only with field 2 = 0 (0x3F036) and
+/// sends nothing back. Together with its question it sends another kind
+/// 7 (field 2 = 0x25, field 4 = 2): its stored battery identification.
 pub fn revision_answer(revision: u8) -> Encoder {
     Encoder::new().number(3, revision as u32).number(4, 2)
 }
@@ -306,7 +316,12 @@ pub struct Readings {
     pub temperatures: Option<[f32; 3]>,
     /// Pascal, metres.
     pub barometer: Option<(f32, f32)>,
-    pub worn: Option<bool>,
+    /// The latest wear report.
+    pub wear: Option<Wear>,
+    /// The Apollo's off-wrist notification (kind `OFF_WRIST`, field 2):
+    /// true once the watch has been off the wrist for longer than the
+    /// timeout set with `off_wrist_timeout`.
+    pub off_wrist_long: Option<bool>,
     /// The Apollo's reported (shutdown type, reset reason).
     pub apollo_reset: Option<(u32, u32)>,
     /// Heart rate in beats per minute from the latest heart report (kind
@@ -341,10 +356,25 @@ impl Readings {
                 }
             }
             WEAR => {
-                // The Apollo sends 2 when its wear state is "on the wrist"
-                // and 1 otherwise (`lcAlgo_send_offbody_reminder`, 0x32E78
-                // in its image).
-                self.worn = Some(field(2).and_then(|v| v.as_u32()) == Some(2));
+                let n = |i| field(i).and_then(|v| v.as_u32()).unwrap_or(0);
+                self.wear = Some(Wear {
+                    on_wrist: n(2) == 2,
+                    reason: match n(3) {
+                        0 => WearReason::Start,
+                        1 => WearReason::InfraredFar,
+                        2 => WearReason::CapacitiveFar,
+                        4 => WearReason::PutOn,
+                        other => WearReason::Other(other),
+                    },
+                    capacitive_status: n(4),
+                });
+            }
+            OFF_WRIST => {
+                // Only the Apollo's notification (field 1 = 1); the same
+                // kind with field 1 = 0 is our own setting.
+                if field(1).and_then(|v| v.as_u32()) == Some(1) {
+                    self.off_wrist_long = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0) != 0);
+                }
             }
             HEART => {
                 self.heart_bpm = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0));
@@ -356,6 +386,76 @@ impl Readings {
             _ => {}
         }
     }
+}
+
+/// A wear report (kind `WEAR`).
+///
+/// How the Apollo decides (`lcAlgoWearWristCheckExe`, 0x3282C in its image;
+/// its own log texts name the inputs "cap" and "ir"):
+///
+///   - Two sensors feed it: the capacitive sensor (near / far) and the
+///     optical sensor's infrared check (near / far).
+///   - Not worn becomes worn when both have reported "near" and each has
+///     done so for at least a second. Reason: `PutOn`.
+///   - Worn becomes not worn when the infrared check reports "far"
+///     (`InfraredFar`), or when the capacitive sensor reported "far" and a
+///     second check confirmed it (`CapacitiveFar`).
+///   - Inside the Apollo the state is 8 for worn and 3 for not worn; the
+///     message carries 2 and 1.
+///
+/// The Apollo sends a report when the state has changed and stayed changed
+/// for half a second, and once after its start (`Start`). Its capacitive
+/// sensor is only on after the setup status (`setup_finished`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Wear {
+    pub on_wrist: bool,
+    pub reason: WearReason,
+    /// Field 4: three status bytes of the capacitive sensor at the moment
+    /// of a `CapacitiveFar` removal (`lcAlgoSetCapSensorResult`), 0
+    /// otherwise. The stock app only logs it ("offbodyData").
+    pub capacitive_status: u32,
+}
+
+/// Why the wear state is what it is (field 3 of the report).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WearReason {
+    /// The first report after the Apollo's start.
+    Start,
+    /// Taken off: the infrared check no longer sees skin.
+    InfraredFar,
+    /// Taken off: the capacitive sensor no longer senses the arm.
+    CapacitiveFar,
+    /// Put on.
+    PutOn,
+    /// A value the Apollo's code does not set.
+    Other(u32),
+}
+
+impl WearReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            WearReason::Start => "first report",
+            WearReason::InfraredFar => "infrared sees no skin",
+            WearReason::CapacitiveFar => "capacitive sensor senses no arm",
+            WearReason::PutOn => "put on",
+            WearReason::Other(_) => "unknown reason",
+        }
+    }
+}
+
+/// Set after how many minutes off the wrist the Apollo sends its off-wrist
+/// notification; 0 switches the notification off.
+///
+/// Kind 11 goes both ways. From the STM32 with field 1 = 0 it sets the
+/// timeout (field 2, minutes; the Apollo's dispatcher at 0x10CF4 logs it
+/// as "argOffWrist"). From the Apollo with field 1 = 1 it reports in field
+/// 2 whether the watch has been off the wrist for that long (0x372B8,
+/// 0x37310); see `Readings::off_wrist_long`. The Apollo only counts while
+/// it has been told that the screen is off (kind 130, not sent yet), so
+/// this is not switched on yet.
+#[allow(dead_code)] // waits for the screen status message
+pub fn off_wrist_timeout(minutes: u8) -> Encoder {
+    Encoder::new().number(2, minutes as u32)
 }
 
 /// What the lower side button did. It is wired to the Apollo, which reports

@@ -66,11 +66,16 @@ pub async fn run(board: Board) {
         // again, and by then the PC must be able to reach the watch.
         // The board revision, measured once as in the stock app; the Apollo
         // asks for it.
-        // The board revision is not measured yet (`board.revision`): the
-        // measurement is written but untested, and what the Apollo does
-        // with the answer has not been read through.
-        let _ = &board.revision;
-        let apollo = apollo::Apollo::start(board.apollo).await;
+        // The board revision, measured as the stock app does; the Apollo
+        // asks for it after its start.
+        let _ = log.flush();
+        let (revision, reading) = board.revision.measure();
+        let _ = writeln!(log.stamp(), "board revision {} (reading {} of 4095, {} mV)", revision, reading, reading as u32 * 1800 / 4096);
+        let _ = log.flush();
+        let mut apollo = apollo::Apollo::start(board.apollo).await;
+        if let Some(apollo) = apollo.as_mut() {
+            apollo.set_revision(revision);
+        }
         let _ = writeln!(log.stamp(), "apollo: {}", if apollo.is_some() { "released from reset" } else { "not started" });
 
         // External memory, then the display with its framebuffer in it.
