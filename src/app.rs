@@ -512,6 +512,11 @@ async fn main_loop(
 
         // Buttons: the upper one is ours, the lower one comes through the Apollo.
         let upper_click = matches!(buttons.poll(&mut log), Some(ButtonEvent::Released { held_ms }) if held_ms < CLICK_MS);
+        if clock::take_changed() {
+            if let Some(apollo) = apollo.as_mut() {
+                apollo.time_changed();
+            }
+        }
         let lower = apollo.as_mut().and_then(|a| a.take_key());
         let lower_click = lower == Some(KeyEvent::Clicked);
         // Feedback through the vibration motor: one short pulse for a

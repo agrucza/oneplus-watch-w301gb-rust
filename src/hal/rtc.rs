@@ -22,6 +22,9 @@ const RTC_ISR: *mut u32 = 0x4000_280C as *mut u32;
 const RTC_PRER: *mut u32 = 0x4000_2810 as *mut u32;
 const RTC_WPR: *mut u32 = 0x4000_2824 as *mut u32;
 const RTC_SSR: *mut u32 = 0x4000_2828 as *mut u32;
+/// Backup register 3: the stock app keeps the time zone here (see
+/// `time_zone`).
+const RTC_BKP3R: *mut u32 = 0x4000_285C as *mut u32;
 const PWR_CR1: *mut u32 = 0x4000_7000 as *mut u32;
 
 const APB1ENR1_RTCAPBEN: u32 = 1 << 10;
@@ -122,6 +125,32 @@ pub fn now() -> Option<DateTime> {
             minute: bcd((tr >> 8) & 0x7F),
             second: bcd(tr & 0x7F),
         })
+    }
+}
+
+/// The time zone: minutes that local time is ahead of GMT.
+///
+/// The stock app keeps it in backup register 3 as a signed 16-bit number
+/// (read at 0x0802E146, written at 0x0802DD1A and 0x0802DEE2) and works
+/// out GMT as local time minus this (0x0802E1F4). The register keeps its
+/// value as long as the clock does, so both firmwares see the same zone.
+pub fn time_zone() -> i16 {
+    unsafe { read_volatile(RTC_BKP3R) as u16 as i16 }
+}
+
+/// Seconds since 1970 in GMT and the time zone in minutes; `None` if the
+/// clock was never set.
+pub fn gmt_and_zone() -> Option<(u32, i16)> {
+    let zone = time_zone();
+    let local = now()?.unix_seconds() as i64;
+    Some(((local - zone as i64 * 60) as u32, zone))
+}
+
+/// Store the time zone (see `time_zone`).
+pub fn set_time_zone(minutes: i16) {
+    unsafe {
+        modify(PWR_CR1, 0, PWR_CR1_DBP); // allow writes to the backup domain
+        write_volatile(RTC_BKP3R, minutes as u16 as u32);
     }
 }
 

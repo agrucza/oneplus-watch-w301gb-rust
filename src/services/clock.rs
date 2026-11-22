@@ -2,13 +2,18 @@
 //!
 //! The clock holds local time, as under the stock firmware (see
 //! `hal::rtc`). It is set from the PC with `tools/ota.sh time`, which sends
-//! `AT^W301TIME=YYYY-MM-DD HH:MM:SS`.
+//! `AT^W301TIME=YYYY-MM-DD HH:MM:SS +HHMM`; the last part is the time zone
+//! and may be left out, the zone then stays as it is.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hal::rtc;
 pub use crate::hal::rtc::DateTime;
 use crate::services::log::Log;
+
+/// Set when the clock or the time zone was changed; see `take_changed`.
+static CHANGED: AtomicBool = AtomicBool::new(false);
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -37,7 +42,29 @@ pub fn start(log: &mut Log) {
             let _ = write!(log.stamp(), "clock: not set");
         }
     }
+    let _ = write!(log, ", zone {} min", rtc::time_zone());
     let _ = writeln!(log, " (RTC_CR={:#010x} ISR={:#010x} PRER={:#010x})", state.cr, state.isr, state.prer);
+}
+
+/// True once after the clock or the time zone was set: whoever keeps a
+/// copy of the time (the Apollo) has to be told.
+pub fn take_changed() -> bool {
+    CHANGED.swap(false, Ordering::Relaxed)
+}
+
+/// "+HHMM" or "-HHMM" as minutes; at most 14 hours either way.
+fn parse_zone(text: &str) -> Option<i16> {
+    let b = text.as_bytes();
+    if b.len() != 5 || !b[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let sign = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = (text[1..3].parse::<i16>().ok()?, text[3..5].parse::<i16>().ok()?);
+    (hours <= 14 && minutes < 60).then_some(sign * (hours * 60 + minutes))
 }
 
 /// The current local date and time; `None` if the clock was never set.
@@ -88,12 +115,29 @@ pub fn parse(text: &str) -> Option<DateTime> {
 /// Set the clock from "YYYY-MM-DD HH:MM:SS" (local time). False if the text
 /// is not a valid time or the clock did not take it.
 pub fn set_from_text(text: &str, log: &mut Log) -> bool {
+    // An optional time zone follows the time: " +0100", " -0530".
+    let (text, zone) = match text.get(19..) {
+        Some(rest) if !rest.is_empty() => match parse_zone(rest.trim()) {
+            Some(zone) => (&text[..19], Some(zone)),
+            None => {
+                let _ = writeln!(log.stamp(), "clock: {:?} is not a time zone", rest);
+                return false;
+            }
+        },
+        _ => (text, None),
+    };
+    if let Some(zone) = zone {
+        let before = rtc::time_zone();
+        rtc::set_time_zone(zone);
+        let _ = writeln!(log.stamp(), "clock: time zone set to {} min ahead of GMT (was {})", rtc::time_zone(), before);
+    }
     let Some(t) = parse(text) else {
         let _ = writeln!(log.stamp(), "clock: {:?} is not a time", text);
         return false;
     };
     let before = rtc::now();
     let taken = rtc::set(&t);
+    CHANGED.store(true, Ordering::Relaxed);
     let _ = write!(log.stamp(), "clock: {} {} {}", if taken { "set to" } else { "could NOT be set to" }, t.weekday_name(), t);
     match before {
         Some(b) => {

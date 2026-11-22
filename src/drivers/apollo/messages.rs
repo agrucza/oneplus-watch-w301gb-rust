@@ -89,6 +89,27 @@ impl Encoder {
         }
     }
 
+    /// Add a signed number field (field numbers up to 15). A negative
+    /// value takes ten bytes, as the encoding has it for this field type.
+    pub fn signed(mut self, field: u8, value: i32) -> Self {
+        if value >= 0 {
+            return self.number(field, value as u32);
+        }
+        if self.len + 11 > self.bytes.len() {
+            return self;
+        }
+        let mut bits = value as i64 as u64;
+        self.bytes[self.len] = field << 3;
+        self.len += 1;
+        for i in 0..10 {
+            let byte = (bits & 0x7F) as u8;
+            bits >>= 7;
+            self.bytes[self.len] = if i == 9 { byte } else { byte | 0x80 };
+            self.len += 1;
+        }
+        self
+    }
+
     /// Add a text field (field numbers up to 15); longer text is cut.
     pub fn text(mut self, field: u8, text: &str) -> Self {
         let room = self.bytes.len().saturating_sub(self.len + 2);
@@ -114,11 +135,16 @@ impl Encoder {
 // STM32 firmware's version text (kind 6) and then the settings, beginning
 // with the setup status (kind 140, see `setup_finished`).
 
-/// The time: field 2 = seconds since 1970 (GMT), field 3 = time zone in
-/// minutes (stock sender 0x0806D594). We keep local time only, so local
-/// time goes out as GMT with a zone of zero.
-pub fn time(unix_seconds: u32) -> Encoder {
-    Encoder::new().number(2, unix_seconds)
+/// The time: field 2 = seconds since 1970 in GMT, field 3 = time zone in
+/// minutes, signed (stock sender 0x0806D594).
+///
+/// In the Apollo (main task, 0x4010C in its image): local time = GMT +
+/// zone x 60. Its running clock is moved to that, its clock chip is set to
+/// it, the zone is stored (also in its flash, item 0x21) and its daily
+/// algorithms are told that the time is valid. It logs `Time set:UTC=...
+/// timeZone=...` and the resulting date and time.
+pub fn time(gmt_seconds: u32, zone_minutes: i16) -> Encoder {
+    Encoder::new().number(2, gmt_seconds).signed(3, zone_minutes as i32)
 }
 
 /// Answer to the Apollo's question for the board revision.
@@ -150,6 +176,11 @@ pub fn asks_for_revision(payload: &[u8]) -> bool {
 /// The STM32 firmware's version text: field 1 = 1, field 2 = the text, up
 /// to 47 characters (stock sender 0x0806D5E8; the stock text is
 /// "CONBINE_LTAQ4002_0664_202109111518").
+///
+/// In the Apollo (main task, 0x3F27A in its image): it keeps the text,
+/// logs it as `st version:...`, and because field 1 is 1 it answers with
+/// a message of the same kind carrying field 1 = 0 and its own version
+/// text.
 pub fn version(text: &str) -> Encoder {
     Encoder::new().number(1, 1).text(2, text)
 }

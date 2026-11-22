@@ -39,7 +39,8 @@ def main():
         # Send right at the start of a second, so the watch is not up to a
         # second behind.
         time.sleep(1.0 - time.time() % 1.0)
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        # Local time and how far it is ahead of GMT, e.g. "+0100".
+        now = time.strftime("%Y-%m-%d %H:%M:%S %z")
         watch.send_cmd(f"AT^W301TIME={now}", prefix=opw_bt.PFX_AT)
         if b"OK" not in watch.read_response():
             print("the watch did not accept the time (see 3:log/rust.log)", file=sys.stderr)

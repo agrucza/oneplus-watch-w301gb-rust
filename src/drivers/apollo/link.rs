@@ -62,8 +62,10 @@ const SETUP_RETRY: Duration = Duration::from_secs(3);
 // each is sent by the stock app, but what the Apollo does with it has not
 // been read through yet. One is switched on at a time, once it has been.
 
-/// Time (kind 5) and version text (kind 6) after the Apollo's announcement.
-const SEND_TIME_AND_VERSION: bool = false;
+/// The time (kind 5) after the Apollo's announcement.
+const SEND_TIME: bool = true;
+/// Our version text (kind 6) after the time.
+const SEND_VERSION: bool = true;
 /// The screen status (kind 130) after the setup status and on every change.
 const SEND_SCREEN_STATUS: bool = true;
 /// Wrist-raise detection (kind 121) switched on after the screen status.
@@ -159,6 +161,8 @@ pub struct Apollo {
     screen_on: bool,
     screen_told: Option<bool>,
     raise_to_wake_sent: bool,
+    /// The clock was set while running; the Apollo has to be told.
+    time_changed: bool,
     /// Wear statistics, kept as the stock app keeps them (0x08033566,
     /// 0x08034816): how often the watch was put on and taken off since
     /// start, since when it has been worn, and the worn time so far.
@@ -237,6 +241,7 @@ impl Apollo {
             screen_on: true,
             screen_told: None,
             raise_to_wake_sent: false,
+            time_changed: false,
             put_on_count: 0,
             taken_off_count: 0,
             worn_since: None,
@@ -426,15 +431,33 @@ impl Apollo {
         // heartbeat, before the Apollo's announcement, the Apollo takes
         // the setup status but does not act on it; so it is repeated until
         // the Apollo acknowledges it.
-        if SEND_TIME_AND_VERSION && self.setup_tries == 0 && self.setup_due.is_some_and(|due| Instant::now() >= due) {
-            match rtc::now() {
-                Some(t) => {
-                    self.send(messages::TIME, messages::time(t.unix_seconds()).as_bytes(), log).await;
+        let announced = self.setup_tries == 0 && self.setup_due.is_some_and(|due| Instant::now() >= due);
+        if announced && self.apollo_log == 0 && APOLLO_LOG_WINDOW.is_some_and(|(from, _)| from == 0) {
+            // Diagnosis from the very start: before our first message.
+            if self.send(messages::LOG_SETTING, messages::log_setting(true, APOLLO_LOG_LEVEL, APOLLO_LOG_MODULES).as_bytes(), log).await {
+                self.apollo_log = 1;
+            }
+        }
+        if SEND_TIME && announced {
+            match rtc::gmt_and_zone() {
+                Some((gmt, zone)) => {
+                    let _ = writeln!(log.stamp(), "apollo: sending the time: {} s GMT, zone {} min", gmt, zone);
+                    self.send(messages::TIME, messages::time(gmt, zone).as_bytes(), log).await;
                 }
                 None => {
                     let _ = writeln!(log.stamp(), "apollo: no time to send, the clock is not set");
                 }
             }
+        }
+        if SEND_TIME && self.time_changed && self.setup_tries > 0 {
+            if let Some((gmt, zone)) = rtc::gmt_and_zone() {
+                let _ = writeln!(log.stamp(), "apollo: the clock was set; sending the time: {} s GMT, zone {} min", gmt, zone);
+                if self.send(messages::TIME, messages::time(gmt, zone).as_bytes(), log).await {
+                    self.time_changed = false;
+                }
+            }
+        }
+        if SEND_VERSION && announced {
             self.send(messages::VERSION, messages::version(VERSION_TEXT).as_bytes(), log).await;
         }
         if !self.setup_acknowledged && self.setup_tries < SETUP_TRIES && self.setup_due.is_some_and(|due| Instant::now() >= due) {
@@ -544,6 +567,12 @@ impl Apollo {
     /// The latest wrist gesture since the last call.
     pub fn take_gesture(&mut self) -> Option<messages::WristGesture> {
         self.gesture_pending.take()
+    }
+
+    /// The clock or the time zone was set: the Apollo is told on the next
+    /// `service` (before its announcement the start-up exchange covers it).
+    pub fn time_changed(&mut self) {
+        self.time_changed = true;
     }
 
     /// Tell the driver whether the screen is on; the Apollo is told on the
@@ -717,6 +746,13 @@ impl Apollo {
                         let _ = log.write_str(core::str::from_utf8(&out[..chunk.len()]).unwrap_or(""));
                     }
                     let _ = log.write_str("\n");
+                }
+            }
+            if kind == Some(messages::VERSION) {
+                // The Apollo's answer to our version text: its own.
+                if let Some((_, Value::Bytes(text))) = Fields(payload).find(|&(tag, _)| tag == 2) {
+                    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                    let _ = writeln!(log.stamp(), "apollo: its firmware version is {:?}", core::str::from_utf8(&text[..end]).unwrap_or("?"));
                 }
             }
             if kind == Some(messages::WRIST_GESTURE) {
