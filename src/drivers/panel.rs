@@ -20,7 +20,7 @@
 
 use core::fmt::Write;
 
-use embassy_stm32::dma2d::{self, Buffer2D, Dma2d, PixelFormat};
+use embassy_stm32::dma2d::{self, Dma2d};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::{bind_interrupts, peripherals, Peri};
 use embassy_time::Timer;
@@ -88,9 +88,12 @@ pub struct Resources {
     pub blitter: Peri<'static, peripherals::DMA2D>,
 }
 
+/// How many frames the panel is given.
+pub const FRAMES: usize = 8;
+
 /// A piece of a picture of a move (`Panel::present_move`): a rectangle of
-/// the frame with the page coming (`coming`) or of the frame on the
-/// screen, with its top left corner at `from` in that frame, shown at
+/// the frame with the page coming (`coming`) or of the frame with the
+/// page being left, with its top left corner at `from` in that frame, shown at
 /// `to` on the screen; all as (x, y), `size` as (width, height).
 #[derive(Clone, Copy)]
 pub struct Piece {
@@ -101,11 +104,9 @@ pub struct Piece {
 }
 
 pub struct Panel {
-    /// Two frames, as in the stock app: one is on its way to the panel or
-    /// was sent last, the other is free to be drawn into.
-    frames: [&'static mut Frame; 2],
-    /// Which of the two the panel was sent last.
-    shown: usize,
+    /// The frames pictures are drawn into and shown from. Which frame
+    /// holds what is the caller's business.
+    frames: [&'static mut Frame; FRAMES],
     blitter: Dma2d<'static, peripherals::DMA2D>,
     _pins: [Output<'static>; 4],
 }
@@ -114,7 +115,7 @@ impl Panel {
     /// Power the panel, set up LTDC and DSI with `frame` as the picture
     /// source, switch the panel on. Every stage is logged; `None` if one of
     /// them does not complete.
-    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
+    pub async fn start(r: Resources, frames: [&'static mut Frame; FRAMES], log: &mut Log) -> Option<Self> {
         // Power-up, as in the stock app.
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
@@ -171,7 +172,7 @@ impl Panel {
         dsi::enable();
         let _ = writeln!(log.stamp(), "display: panel switched on");
         let blitter = Dma2d::new(r.blitter, Irqs);
-        Some(Self { frames, shown: 0, blitter, _pins: [pg5, pf12, power, reset] })
+        Some(Self { frames, blitter, _pins: [pg5, pf12, power, reset] })
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
@@ -181,76 +182,21 @@ impl Panel {
         dsi::refresh().await
     }
 
-    /// The frame to draw the next picture into. It holds what was drawn
-    /// two pictures ago, so a picture has to be drawn completely.
-    pub fn back(&mut self) -> &mut Frame {
-        self.frames[1 - self.shown]
-    }
-
-    /// `frame` (0 or 1) as the blitter wants it described.
-    fn blitter_buffer(&mut self, frame: usize) -> Buffer2D {
-        Buffer2D::new(self.frames[frame].as_mut_ptr() as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, HEIGHT as u16)
-    }
-
-    /// Fill a rectangle of the frame to draw into with one colour, using
-    /// the hardware blitter. False if the blitter reported an error.
-    pub async fn blitter_fill(&mut self, x: u16, y: u16, w: u16, h: u16, color: u16) -> bool {
-        let back = 1 - self.shown;
-        let region = self.blitter_buffer(back).region(x, y, w, h);
-        self.blitter.fill(&region, color as u32).await.is_ok()
-    }
-
-    /// Copy the frame the panel was sent last into the frame to draw into,
-    /// using the hardware blitter. False if the blitter reported an error.
-    pub async fn blitter_copy(&mut self) -> bool {
-        let (from, to) = (self.blitter_buffer(self.shown), self.blitter_buffer(1 - self.shown));
-        self.blitter.copy(&from, &to).await.is_ok()
-    }
-
-    /// The opposite copy, done by the processor: the frame to draw into
-    /// is copied over the frame the panel was sent last. For timing only.
-    pub fn processor_copy_back_to_shown(&mut self) {
-        let (first, second) = self.frames.split_at_mut(1);
-        let (from, to) = if self.shown == 0 { (&*second[0], &mut *first[0]) } else { (&*first[0], &mut *second[0]) };
-        to.copy_from_slice(from);
-    }
-
-    /// True if the two frames hold the same picture.
-    pub fn frames_equal(&self) -> bool {
-        self.frames[0][..] == self.frames[1][..]
-    }
-
-    /// Show one picture of a move from the page on the screen to the page
-    /// that has been drawn into the frame to draw into: each piece is a
-    /// rectangle of one of the two frames, which the display controller
-    /// shows straight from there. Nothing is copied and no frame is
-    /// changed; which frame is which stays as it is until `end_move`.
-    pub async fn present_move(&mut self, pieces: [Option<Piece>; 2]) -> dsi::RefreshStatus {
+    /// Show one picture of a move from the page in frame `leaving` to the
+    /// page in frame `coming`: each piece is a rectangle of one of the
+    /// two, which the display controller shows straight from there.
+    /// Nothing is copied and no frame is changed.
+    pub async fn present_move(&mut self, pieces: [Option<Piece>; 2], leaving: usize, coming: usize) -> dsi::RefreshStatus {
         let layers = pieces.map(|piece| {
-            piece.map(|p| {
-                let frame = if p.coming { 1 - self.shown } else { self.shown };
-                dsi::Layer {
-                    address: self.frames[frame].as_ptr() as u32 + (p.from.1 * WIDTH as u32 + p.from.0) * 2,
-                    x: p.to.0,
-                    y: p.to.1,
-                    width: p.size.0,
-                    height: p.size.1,
-                }
+            piece.map(|p| dsi::Layer {
+                address: self.frames[if p.coming { coming } else { leaving }].as_ptr() as u32 + (p.from.1 * WIDTH as u32 + p.from.0) * 2,
+                x: p.to.0,
+                y: p.to.1,
+                width: p.size.0,
+                height: p.size.1,
             })
         });
         dsi::refresh_layers(layers).await
-    }
-
-    /// A move is over, with the page that came on the screen (`arrived`)
-    /// or the old one back. The frame with the page that is not shown is
-    /// made a copy of the other, so that both hold the page shown, as
-    /// drawing expects. False if the blitter reported an error.
-    pub async fn end_move(&mut self, arrived: bool) -> bool {
-        if arrived {
-            self.shown = 1 - self.shown;
-        }
-        self.settle().await;
-        self.blitter_copy().await
     }
 
     /// Wait until the frame on its way to the panel has gone out, before
@@ -268,33 +214,18 @@ impl Panel {
         dsi::frame_out().await;
     }
 
-    /// The frame to draw into, as a target for `embedded-graphics`.
-    pub fn canvas(&mut self) -> Canvas<'_> {
-        Canvas::new(self.frames[1 - self.shown], &mut self.blitter)
+    /// Frame `frame` as a target for `embedded-graphics`. It must not be
+    /// the frame on its way to the panel (`settle` first).
+    pub fn canvas(&mut self, frame: usize) -> Canvas<'_> {
+        Canvas::new(self.frames[frame], &mut self.blitter)
     }
 
-    /// Which of the two frames `back` is: 0 or 1.
-    pub fn back_index(&self) -> usize {
-        1 - self.shown
-    }
-
-    /// Run `f` on both frames (for clearing them).
-    #[allow(dead_code)]
-    pub fn both(&mut self, mut f: impl FnMut(&mut Frame)) {
-        f(self.frames[0]);
-        f(self.frames[1]);
-    }
-
-    /// Start sending the frame that was drawn into (`back`) to the panel,
-    /// in step with it, and make the other one the frame to draw into. It
+    /// Start sending frame `frame` to the panel, in step with it. It
     /// returns while the frame is on its way; the next `present` waits for
     /// it first. `done` in the answer says whether the frame before had
     /// gone out.
-    pub async fn present(&mut self) -> dsi::RefreshStatus {
-        let next = 1 - self.shown;
-        let status = dsi::refresh_from(self.frames[next].as_ptr() as u32).await;
-        self.shown = next;
-        status
+    pub async fn present(&mut self, frame: usize) -> dsi::RefreshStatus {
+        dsi::refresh_from(self.frames[frame].as_ptr() as u32).await
     }
 
     /// Set the brightness, 0 (darkest) to 255. False if the command was
@@ -307,25 +238,5 @@ impl Panel {
     /// panel stays powered and keeps its frame memory.
     pub async fn set_visible(&mut self, visible: bool) -> bool {
         dsi::dcs(if visible { 0x29 } else { 0x28 }).await
-    }
-
-    #[allow(dead_code)] // kept for checking the panel after changes to its set-up
-    /// Fill the framebuffer with a test picture: red, green and blue bands
-    /// from top to bottom, a white stripe down the left edge, and a black
-    /// square in the middle.
-    pub fn test_picture(&mut self) {
-        for y in 0..HEIGHT {
-            let band = match y * 3 / HEIGHT {
-                0 => 0xF800u16,
-                1 => 0x07E0,
-                _ => 0x001F,
-            };
-            let row = &mut self.back()[y * WIDTH..(y + 1) * WIDTH];
-            row.fill(band);
-            row[..40].fill(0xFFFF);
-        }
-        for y in HEIGHT / 2 - 50..HEIGHT / 2 + 50 {
-            self.back()[y * WIDTH + WIDTH / 2 - 50..y * WIDTH + WIDTH / 2 + 50].fill(0);
-        }
     }
 }

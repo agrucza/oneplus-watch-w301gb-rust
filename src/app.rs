@@ -20,6 +20,9 @@ use crate::drivers::cypress::Link;
 use crate::services::gestures::{Gesture, Gestures};
 use motion::Motion;
 use pages::Page;
+
+// The pages share out exactly the frames the panel has.
+const _: () = assert!(pages::FRAMES == panel::FRAMES);
 use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
@@ -145,14 +148,9 @@ pub async fn run(spawner: Spawner, board: Board) {
         if psram::quick_check(&mut log) {
             let _ = writeln!(log.stamp(), "psram: ready");
             // The 2 MB at FRAMEBUFFER belong to the display alone.
-            let frames = unsafe {
-                [&mut *(psram::FRAMEBUFFER as *mut panel::Frame), &mut *(psram::FRAMEBUFFER_2 as *mut panel::Frame)]
-            };
-            let mut panel = panel::Panel::start(board.display, frames, &mut log).await;
-            if let (true, Some(panel)) = (BLITTER_TIMING, panel.as_mut()) {
-                time_blitter(panel, &mut log).await;
-                let _ = log.flush();
-            }
+            let frames: [&'static mut panel::Frame; panel::FRAMES] =
+                core::array::from_fn(|n| unsafe { &mut *((psram::FRAMEBUFFER + n * psram::FRAME_SPACING) as *mut panel::Frame) });
+            let panel = panel::Panel::start(board.display, frames, &mut log).await;
             // The display has a task of its own from here on, and the
             // touch controller goes with it (see `display_task`).
             let touch = touch::Touch::start(board.touch, &mut log).await;
@@ -596,88 +594,6 @@ impl WearView {
 /// 15 times a second.
 const FACE_PERIOD: Duration = Duration::from_millis(66);
 
-/// Diagnosis: at start, fill and copy a frame with the processor and with
-/// the hardware blitter, and log the times. Measured: a whole frame filled in
-/// 23.8 ms by the processor and 4.6 ms by the blitter; copied in 50.5 ms
-/// and 10.1 ms; 100 rectangles of 32 x 32 filled in 10.2 ms and 3.0 ms.
-const BLITTER_TIMING: bool = false;
-
-/// Diagnosis: what filling and copying cost, done by the processor and
-/// done by the hardware blitter. Runs before the first picture; both
-/// frames are left with rubbish in them, which the first two pictures
-/// paint over completely.
-async fn time_blitter(panel: &mut panel::Panel, log: &mut Log) {
-    use crate::drivers::panel::{HEIGHT, WIDTH};
-    start_cycle_counter();
-    let us = |cycles: u64| cycles / 120;
-    let (w, h) = (WIDTH as u16, HEIGHT as u16);
-    let mut stage = cycles();
-
-    // A whole frame filled.
-    panel.back().fill(0x1234);
-    let processor_fill = lap(&mut stage);
-    let filled = panel.blitter_fill(0, 0, w, h, 0x07E0).await;
-    let blitter_fill = lap(&mut stage);
-    let back = panel.back();
-    let fill_right = back[0] == 0x07E0 && back[WIDTH * HEIGHT / 2 + 7] == 0x07E0 && back[WIDTH * HEIGHT - 1] == 0x07E0;
-
-    // A whole frame copied: the other frame gets a pattern first.
-    for (i, pixel) in panel.back().iter_mut().enumerate() {
-        *pixel = (i as u32).wrapping_mul(40503) as u16;
-    }
-    watchdog::feed();
-    // Make that frame the "shown" one by copying it across with the
-    // processor (timed), then wipe the target and copy with the blitter.
-    panel.processor_copy_back_to_shown();
-    let processor_copy = lap(&mut stage);
-    panel.back().fill(0);
-    lap(&mut stage);
-    let copied = panel.blitter_copy().await;
-    let blitter_copy = lap(&mut stage);
-    let same = panel.frames_equal();
-    watchdog::feed();
-
-    // A hundred small rectangles, 32 x 32, filled.
-    lap(&mut stage);
-    for n in 0..100usize {
-        let (x, y) = (n % 10 * 40 + 20, n / 10 * 40 + 20);
-        let frame = panel.back();
-        for row in 0..32 {
-            frame[(y + row) * WIDTH + x..][..32].fill(0xF800);
-        }
-    }
-    let processor_small = lap(&mut stage);
-    let mut small_ok = true;
-    for n in 0..100u16 {
-        small_ok &= panel.blitter_fill(n % 10 * 40 + 20, n / 10 * 40 + 20, 32, 32, 0x001F).await;
-    }
-    let blitter_small = lap(&mut stage);
-
-    let _ = writeln!(
-        log.stamp(),
-        "blitter: whole frame filled: processor {} us, blitter {} us ({}{})",
-        us(processor_fill),
-        us(blitter_fill),
-        if filled { "no error" } else { "ERROR" },
-        if fill_right { ", pixels right" } else { ", pixels WRONG" }
-    );
-    let _ = writeln!(
-        log.stamp(),
-        "blitter: whole frame copied: processor {} us, blitter {} us ({}{})",
-        us(processor_copy),
-        us(blitter_copy),
-        if copied { "no error" } else { "ERROR" },
-        if same { ", copy identical" } else { ", copy DIFFERENT" }
-    );
-    let _ = writeln!(
-        log.stamp(),
-        "blitter: 100 rectangles of 32 x 32 filled: processor {} us, blitter {} us ({})",
-        us(processor_small),
-        us(blitter_small),
-        if small_ok { "no error" } else { "ERROR" }
-    );
-}
-
 /// The processor's cycle counter, for timing short stretches of code.
 fn cycles() -> u32 {
     cortex_m::peripheral::DWT::cycle_count()
@@ -705,10 +621,12 @@ fn start_cycle_counter() {
 const SLIDE_STEPS: usize = 14;
 
 /// A change of page under way: one page moves out, the other follows in.
-/// Kept small on purpose; see `Screen::left_keys`.
+/// Kept small on purpose: it is passed about by value.
 #[derive(Clone, Copy)]
 struct Pull {
-    /// The page being pulled in.
+    /// The page being left, and the one being pulled in (the same page
+    /// if it only gives).
+    from: Page,
     target: Page,
     motion: Motion,
     /// How far the picture should be moved, in pixels: where the finger is.
@@ -737,6 +655,11 @@ struct Pull {
 /// hand-over needs room for the whole of it on the stack. With these
 /// tables inside it, the function that starts the firmware needed 54 KB
 /// of the 64 KB stack for itself, and the first page pull ran out of it.
+///
+/// Every page has frames of its own (`Page::frames`) and keeps its
+/// picture while another page is shown. So everything here that says
+/// what is in a page's frames stays valid while the page is away, and
+/// coming back to a page means drawing only what changed meanwhile.
 struct Tracking {
     /// What every element of the watch face showed when it was last
     /// looked at (`face::key`).
@@ -745,33 +668,40 @@ struct Tracking {
     face_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
     /// The lines of the status page as they were last composed.
     lines: Option<[status::Line; status::LINES]>,
-    /// What has changed on the picture since each frame was drawn.
-    damage: Damage,
+    /// For every page (`Page::index`): what has changed on its picture
+    /// since each of its frames was drawn. At first that is everything.
+    damage: [Damage; Page::COUNT],
+    /// For every page: which of its frames holds its latest picture
+    /// (0 or 1; always 0 for a page with one frame).
+    front: [usize; Page::COUNT],
     /// Where the status page was tapped, the latest 64 places; drawn as
     /// dots.
     dots: [(u16, u16); 64],
     dot_count: usize,
-    /// What was known about the page a pull is leaving: enough to carry on
-    /// redrawing only what changes, if that page comes back.
-    left_page: Page,
-    left_lines: Option<[status::Line; status::LINES]>,
-    left_keys: [Option<u32>; face::ELEMENTS],
-    left_rects: [embedded_graphics::primitives::Rectangle; face::ELEMENTS],
 }
 
 impl Tracking {
+    /// The one there is. It has its start values from the outset, in
+    /// memory of its own: built while the firmware runs it would pass
+    /// over the stack, all of it, and it is some 30 KB.
+    fn take() -> &'static mut Self {
+        static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        static mut THE_ONE: Tracking = Tracking::new();
+        assert!(!TAKEN.swap(true, core::sync::atomic::Ordering::Relaxed), "one screen");
+        // Handed out once only (checked above), so nothing else refers
+        // to it.
+        unsafe { &mut *core::ptr::addr_of_mut!(THE_ONE) }
+    }
+
     const fn new() -> Self {
         Self {
             face_keys: [None; face::ELEMENTS],
             face_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
             lines: None,
-            damage: Damage::new(),
+            damage: [const { Damage::new() }; Page::COUNT],
+            front: [0; Page::COUNT],
             dots: [(0, 0); 64],
             dot_count: 0,
-            left_page: Page::Face,
-            left_lines: None,
-            left_keys: [None; face::ELEMENTS],
-            left_rects: [embedded_graphics::primitives::Rectangle::zero(); face::ELEMENTS],
         }
     }
 }
@@ -798,6 +728,9 @@ struct Screen {
     last_touch: Option<(u16, u16)>,
     /// Which page is shown.
     page: Page,
+    /// The frame the panel was sent last, whole; `None` before the first
+    /// picture.
+    on_screen: Option<usize>,
     /// A change of page under the finger or running out by itself.
     pull: Option<Pull>,
     /// The bulky part of what the screen keeps track of (see `Tracking`).
@@ -843,8 +776,9 @@ impl Screen {
             last_button: "no button yet",
             last_touch: None,
             page: Page::Face,
+            on_screen: None,
             pull: None,
-            t: cortex_m::singleton!(: Tracking = Tracking::new()).expect("one screen"),
+            t: Tracking::take(),
             next_frame: Instant::now(),
             clock_second: None,
             second_began: Instant::now(),
@@ -972,6 +906,7 @@ impl Screen {
                     return;
                 };
                 self.pull = Some(Pull {
+                    from: self.page,
                     target,
                     motion,
                     wanted: motion.along(dx, dy).clamp(0, motion.extent() as i32) as usize,
@@ -1021,12 +956,24 @@ impl Screen {
     /// Show `page` from the next picture on, without a move in between.
     fn go_to(&mut self, page: Page, log: &mut Log) {
         let _ = writeln!(log.stamp(), "display: {:?} -> {:?}", self.page, page);
+        // The page's own frames hold its picture as it was last drawn;
+        // the next picture brings it up to date and shows it.
         self.page = page;
-        // Nothing of the new page is on either frame.
-        self.t.damage = Damage::new();
-        self.t.lines = None;
-        self.t.face_keys = [None; face::ELEMENTS];
         self.changed = true;
+    }
+
+    /// The frame with `page`'s latest picture.
+    fn front_frame(&self, page: Page) -> usize {
+        page.frames().0 + self.t.front[page.index()]
+    }
+
+    /// Which of `page`'s frames to draw its next picture into, as 0 or
+    /// 1: the one that is not its latest, if it has two.
+    fn back_slot(&self, page: Page) -> usize {
+        match page.frames().1 {
+            2 => 1 - self.t.front[page.index()],
+            _ => 0,
+        }
     }
 
     /// Leave a dot on the status page.
@@ -1036,11 +983,11 @@ impl Screen {
         let slot = self.t.dot_count % self.t.dots.len();
         if self.t.dot_count >= self.t.dots.len() {
             let (old_x, old_y) = self.t.dots[slot];
-            self.t.damage.add(status::dot_rect(old_x, old_y));
+            self.t.damage[Page::Status.index()].add(status::dot_rect(old_x, old_y));
         }
         self.t.dots[slot] = (x, y);
         self.t.dot_count += 1;
-        self.t.damage.add(status::dot_rect(x, y));
+        self.t.damage[Page::Status.index()].add(status::dot_rect(x, y));
         self.last_touch = Some((x, y));
         self.changed = true;
     }
@@ -1078,7 +1025,6 @@ impl Screen {
         let now = Instant::now();
         let uptime_s = now.as_secs();
         let new_second = self.drawn_for != Some(uptime_s);
-        let back = self.panel.back_index();
         if self.visible && self.pull.is_some() {
             self.pull_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
             return;
@@ -1088,20 +1034,30 @@ impl Screen {
         // Off the watch face a change is brought to the second frame at
         // once. The watch face is drawn again shortly anyway, and that
         // picture brings the second frame up to date as well.
-        let catch_up = self.page != Page::Face && self.t.damage.pending(back);
-        if !self.visible || !(new_second || self.changed || frame_due || catch_up) {
+        let catch_up = self.page != Page::Face && self.t.damage[self.page.index()].pending(self.back_slot(self.page));
+        // The page was changed without a move: its picture is not on the
+        // screen yet.
+        let not_shown = self.on_screen != Some(self.front_frame(self.page));
+        if !self.visible || !(new_second || self.changed || frame_due || catch_up || not_shown) {
             return;
         }
         self.next_frame = now + FACE_PERIOD;
         self.panel.settle().await;
         if let Some((started, pixels)) = self.draw(now, new_second, readings, lux, bluetooth_connected, measuring_heart, log) {
             self.present(started, pixels, uptime_s, log).await;
+        } else if self.on_screen != Some(self.front_frame(self.page)) {
+            // Nothing to draw, but the page's picture is not the one on
+            // the screen.
+            let frame = self.front_frame(self.page);
+            let _ = self.panel.present(frame).await;
+            self.on_screen = Some(frame);
         }
     }
 
-    /// Draw what changed on the current page into the frame to draw into.
-    /// Returns when drawing began and how many pixels were repainted, or
-    /// `None` if nothing had changed.
+    /// Draw what changed on the current page into the one of its frames
+    /// that does not hold its latest picture; that frame holds it
+    /// afterwards. Returns when drawing began and how many pixels were
+    /// repainted, or `None` if nothing had changed.
     #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
@@ -1114,7 +1070,9 @@ impl Screen {
         log: &mut Log,
     ) -> Option<(Instant, u32)> {
         let uptime_s = now.as_secs();
-        let back = self.panel.back_index();
+        let page = self.page.index();
+        let back = self.back_slot(self.page);
+        let frame = self.page.frames().0 + back;
 
         self.changed = false;
         if new_second {
@@ -1165,25 +1123,25 @@ impl Screen {
                     if self.t.face_keys[n].is_some() && face::overlap(&old, &rect) {
                         // Moved a little: one rectangle round both places
                         // is cheaper to repaint than two that overlap.
-                        self.t.damage.add(face::around(&old, &rect));
+                        self.t.damage[page].add(face::around(&old, &rect));
                     } else {
                         if self.t.face_keys[n].is_some() {
-                            self.t.damage.add(old);
+                            self.t.damage[page].add(old);
                         }
-                        self.t.damage.add(rect);
+                        self.t.damage[page].add(rect);
                     }
                     self.t.face_keys[n] = key;
                     self.t.face_rects[n] = rect;
                 }
             }
-            let changes = self.t.damage.take(back);
+            let changes = self.t.damage[page].take(back);
             self.stages[0] += lap(&mut stage); // comparing, listing changes
             if changes.is_empty() {
                 return None;
             }
             // Repaint each changed rectangle: background, then every
             // element that reaches into it, cut off at its edge.
-            let mut canvas = self.panel.canvas();
+            let mut canvas = self.panel.canvas(frame);
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 let clipped = &mut canvas;
@@ -1200,20 +1158,22 @@ impl Screen {
                 }
                 self.stages[2] += lap(&mut stage);
             }
+            self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
         }
         if panels::draws(self.page) {
             // These pages always look the same: one is drawn where a
             // frame does not have it yet, and never again.
-            let changes = self.t.damage.take(back);
+            let changes = self.t.damage[page].take(back);
             if changes.is_empty() {
                 return None;
             }
-            let mut canvas = self.panel.canvas();
+            let mut canvas = self.panel.canvas(frame);
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 panels::draw(&mut canvas, &area, self.page);
             }
+            self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
         }
         // The status page. What the lines say now; those that differ from
@@ -1232,12 +1192,12 @@ impl Screen {
         });
         for row in 0..status::LINES {
             if self.t.lines.map_or(true, |old| old[row] != lines[row]) {
-                self.t.damage.add(status::line_rect(row));
+                self.t.damage[page].add(status::line_rect(row));
             }
         }
         self.t.lines = Some(lines);
 
-        let changes = self.t.damage.take(back);
+        let changes = self.t.damage[page].take(back);
         if changes.is_empty() {
             return None;
         }
@@ -1245,7 +1205,7 @@ impl Screen {
         // reaches into it, in the order it lies on the screen. Drawing is
         // cut off at the rectangle's edge.
         let dots = &self.t.dots[..self.t.dot_count.min(self.t.dots.len())];
-        let mut canvas = self.panel.canvas();
+        let mut canvas = self.panel.canvas(frame);
         for area in changes.rects(status::whole()) {
             canvas.clip_to(&area);
             status::background(&mut canvas, &area);
@@ -1260,18 +1220,19 @@ impl Screen {
                 }
             }
         }
+        self.t.front[page] = back;
         Some((started, changes.area(status::whole())))
     }
 
     /// Carry a change of page forward.
     ///
-    /// On the first call the page being pulled in is drawn completely
-    /// into the frame to draw into, which is not shown. From then on the
-    /// display controller makes every picture from the two frames as they
-    /// are, a piece of each (`move_to`); nothing is copied. While the
-    /// finger is down the picture is wherever the finger is; once it has
-    /// let go, a short run takes it to the end or back to the start. Then
-    /// the frame that is not shown is made a copy of the one that is.
+    /// On the first call the picture of the page being pulled in is
+    /// brought up to date in a frame of its own, which is not shown. From
+    /// then on the display controller makes every picture from the two
+    /// pages' frames as they are, a piece of each (`move_to`); nothing is
+    /// copied. While the finger is down the picture is wherever the
+    /// finger is; once it has let go, a short run takes it to the end or
+    /// back to the start.
     #[allow(clippy::too_many_arguments)]
     async fn pull_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
         let Some(mut pull) = self.pull.take() else {
@@ -1284,22 +1245,10 @@ impl Screen {
         }
         if pull.shown.is_none() {
             let began = Instant::now();
-            // What is known about the page being left, in case the finger
-            // lets it fall back. Copied field by field inside the screen's
-            // own memory: these are several kilobytes, and a value of that
-            // size passed around while a picture is being presented has to
-            // fit on the stack at every level of the call (the first
-            // version did that, and the firmware died at its first
-            // picture).
-            self.t.left_page = self.page;
-            self.t.left_lines = self.t.lines;
-            self.t.left_keys = self.t.face_keys;
-            self.t.left_rects = self.t.face_rects;
+            // Bring the picture of the page coming up to date, in a frame
+            // of its own: only what changed since that page was last
+            // shown is drawn.
             self.page = pull.target;
-            // Nothing of the new page is on either frame.
-            self.t.damage = Damage::new();
-            self.t.lines = None;
-            self.t.face_keys = [None; face::ELEMENTS];
             self.drawn_for = Some(now.as_secs());
             self.panel.settle().await;
             let _ = self.draw(now, true, readings, lux, bluetooth_connected, measuring_heart, log);
@@ -1310,7 +1259,7 @@ impl Screen {
         let Some(finish) = pull.release else {
             // Under the finger: one picture, where the finger is now.
             if pull.wanted != shown {
-                pull.good &= self.move_to(pull.motion, pull.wanted).await;
+                pull.good &= self.move_to(&pull, pull.wanted).await;
                 pull.shown = Some(pull.wanted);
                 pull.pictures += 1;
             }
@@ -1329,21 +1278,15 @@ impl Screen {
             let t = step * 1024 / steps;
             let eased = 1024 - (1024 - t) * (1024 - t) / 1024;
             let offset = if step == steps { end } else if finish { shown + distance * eased / 1024 } else { shown - distance * eased / 1024 };
-            pull.good &= self.move_to(pull.motion, offset).await;
+            pull.good &= self.move_to(&pull, offset).await;
             watchdog::feed();
         }
-        if !gives {
-            // The screen shows one of the two pages whole. Make the other
-            // frame the same picture; then both are as the page was drawn.
-            pull.good &= self.panel.end_move(finish).await;
-            self.t.damage.clear();
+        // The screen shows one of the two pages whole, from its own
+        // frame; the other page keeps its picture for the next time.
+        if !finish {
+            self.page = pull.from;
         }
-        if !finish && !gives {
-            self.page = self.t.left_page;
-            self.t.lines = self.t.left_lines;
-            self.t.face_keys = self.t.left_keys;
-            self.t.face_rects = self.t.left_rects;
-        }
+        self.on_screen = Some(self.front_frame(self.page));
         let _ = writeln!(
             log.stamp(),
             "display: {:?} {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms; {} frames starved",
@@ -1360,12 +1303,11 @@ impl Screen {
     }
 
     /// Show the picture of a change of page that has got `offset` pixels
-    /// on its way: pieces of the page on the screen and of the page
-    /// drawn into the other frame, which the display controller shows
-    /// from where they are (`Motion::pieces`). False if the panel's pulse
-    /// was missed.
-    async fn move_to(&mut self, motion: Motion, offset: usize) -> bool {
-        let pieces = motion.pieces(offset).map(|piece| {
+    /// on its way: pieces of the two pages' pictures, which the display
+    /// controller shows from the frames they are in (`Motion::pieces`).
+    /// False if the panel's pulse was missed.
+    async fn move_to(&mut self, pull: &Pull, offset: usize) -> bool {
+        let pieces = pull.motion.pieces(offset).map(|piece| {
             piece.map(|p| panel::Piece {
                 coming: p.coming,
                 from: (p.from_x as u32, p.from_y as u32),
@@ -1373,7 +1315,8 @@ impl Screen {
                 size: (p.width as u32, p.height as u32),
             })
         });
-        self.panel.present_move(pieces).await.in_step
+        let (leaving, coming) = (self.front_frame(pull.from), self.front_frame(pull.target));
+        self.panel.present_move(pieces, leaving, coming).await.in_step
     }
 
     /// Present the picture that was just drawn (drawing began at
@@ -1386,7 +1329,9 @@ impl Screen {
         self.pixels += pixels as u64;
 
         let started = Instant::now();
-        let r = self.panel.present().await;
+        let frame = self.front_frame(self.page);
+        let r = self.panel.present(frame).await;
+        self.on_screen = Some(frame);
         // The first picture and every failure go to the log.
         if !r.done || !r.in_step || !self.refresh_logged {
             self.refresh_logged = true;

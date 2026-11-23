@@ -313,10 +313,13 @@ TouchGFX, as its assertion texts show):
   interrupt handler, as the stock app does: host off, the display
   controller pointed at the new frame, immediate reload, host on, frame
   requested. The link carries 58 frames a second.
-- **Two frames in the PSRAM**, the second where the stock app has its
-  own. A picture is
-  drawn into the frame that is not shown, then presented;
-  `Panel::present` returns while the frame travels.
+- **Eight frames in the PSRAM**, 0x71800 bytes apart (the stock app has
+  two, at that distance). Every page has frames of its own
+  (`app::pages::Page::frames`): two for a page that changes while it is
+  shown (the face, the status page), one for a page that always looks
+  the same. A picture is drawn into the page's frame that is not shown,
+  then presented; `Panel::present` returns while the frame travels. A
+  page's picture stays in its frames while another page is shown.
 - **Only what changed is drawn** (`services::damage`): a list of changed
   rectangles for each of the two frames (96 entries; more than that
   repaints the whole picture). A page is a set of elements, each with a
@@ -385,16 +388,17 @@ picture. After a move one blitter copy makes the two frames equal again.
 - Under the finger a picture comes every 17.5 ms (135 pictures in
   2365 ms), where copying gave one every 34 ms; after letting go the run
   takes 17 to 19 ms a picture.
-- Preparing a move is now only drawing the page coming: 9 to 17 ms
-  towards the status page (29 before), 100 ms towards the face (121).
+- Preparing a move is only bringing the picture of the page coming up
+  to date, in its own frame: what changed since it was last shown.
+  Measured: 1 to 9 ms towards the status page, 5 to 15 ms towards the
+  face (once 31 ms after 23 seconds away), 4 to 14 ms for a panel. With
+  every page drawn from scratch it was 29 ms and 121 ms.
+- No copy after a move, and no state of the page being left to save and
+  put back.
 - 43 moves of all kinds (pages, both panels in and out, the give, falling
   back): no missed pulse, no starved frame, nothing displaced.
-- The two spare frames in the PSRAM are no longer used.
 
 Remaining:
-2. The pause before a pulled page starts to move: 29 ms towards the
-   status page, about 120 ms towards the face (its 180 soft ring
-   segments drawn from scratch). Keeping page pictures would remove it.
 3. A shared "page of elements" loop before a second real screen, and
    the ring and digit routines in a shared graphics module.
 4. Scrolling lists.

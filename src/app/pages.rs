@@ -25,6 +25,40 @@ pub enum Page {
     Cards,
 }
 
+/// How many frames the pages have between them (`Page::frames`).
+pub const FRAMES: usize = 8;
+
+impl Page {
+    /// A number for each page, from 0, for tables with an entry a page.
+    pub const COUNT: usize = 6;
+    pub fn index(self) -> usize {
+        match self {
+            Page::Face => 0,
+            Page::Status => 1,
+            Page::Above => 2,
+            Page::Below => 3,
+            Page::Faces => 4,
+            Page::Cards => 5,
+        }
+    }
+
+    /// The frames that are this page's own: the first one's number and
+    /// how many. Every page keeps its picture, so that it is there when
+    /// the page is wanted again. A page whose picture changes while it
+    /// is shown has two frames, to draw into the one that is not on the
+    /// screen; a page that always looks the same has one.
+    pub fn frames(self) -> (usize, usize) {
+        match self {
+            Page::Face => (0, 2),
+            Page::Status => (2, 2),
+            Page::Above => (4, 1),
+            Page::Below => (5, 1),
+            Page::Faces => (6, 1),
+            Page::Cards => (7, 1),
+        }
+    }
+}
+
 /// Where a drag that starts off in `direction` on `page` leads, and how
 /// the picture moves on the way there. `None` if nothing lies that way.
 pub fn drag(page: Page, direction: Direction) -> Option<(Page, Motion)> {

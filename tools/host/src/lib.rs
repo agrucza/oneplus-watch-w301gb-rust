@@ -417,6 +417,27 @@ mod pages {
         }
     }
 
+    /// Every page has frames of its own, and together they are exactly
+    /// the frames there are.
+    #[test]
+    fn frames_are_shared_out() {
+        use crate::app::pages::FRAMES;
+        let mut owner = [None; FRAMES];
+        let mut numbers = [false; Page::COUNT];
+        for page in PAGES {
+            assert!(!numbers[page.index()], "{page:?}");
+            numbers[page.index()] = true;
+            let (first, count) = page.frames();
+            assert!(count == 1 || count == 2, "{page:?}");
+            for frame in first..first + count {
+                assert_eq!(owner[frame], None, "{page:?}");
+                owner[frame] = Some(page);
+            }
+        }
+        assert!(owner.iter().all(Option::is_some));
+        assert_eq!(PAGES.len(), Page::COUNT);
+    }
+
     #[test]
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
