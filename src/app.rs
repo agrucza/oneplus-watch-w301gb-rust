@@ -703,12 +703,6 @@ fn start_cycle_counter() {
 /// itself; a shorter run takes fewer in proportion.
 const SLIDE_STEPS: usize = 14;
 
-/// A flick: letting go faster than this many pixels a second finishes a
-/// change of page however short the pull was. Our own number, tried on
-/// the watch (40 of 40 swipes); stock wants 14 pixels between the last
-/// two places it sampled (`0x80F8D00`), which is more at any likely rate.
-const FLICK: i32 = 400;
-
 /// A change of page under way: one page moves out, the other follows in.
 /// Kept small on purpose; see `Screen::left_keys`.
 #[derive(Clone, Copy)]
@@ -944,10 +938,11 @@ impl Screen {
     /// brings the face back. Dragging down on the watch face pulls a
     /// panel in over it from the top edge, dragging up one from the
     /// bottom edge; each panel is pushed back out the way it came. The
-    /// picture follows the finger; letting go far enough
-    /// (`Motion::far_enough`), or with a flick, finishes the change,
-    /// anything less lets it fall back. A tap on the status page leaves
-    /// a dot.
+    /// picture follows the finger; letting go far enough or with a flick
+    /// (`Motion::finishes`) finishes the change, anything less lets it
+    /// fall back. Where no page lies sideways (to the right on the face,
+    /// to the left on the status page) the page gives `motion::GIVE`
+    /// pixels and goes back. A tap on the status page leaves a dot.
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
         match gesture {
             Gesture::DragStart { direction, dx, dy, .. } if self.pull.is_none() => {
@@ -958,6 +953,10 @@ impl Screen {
                     (Page::Face, Direction::Up) => (Page::Below, Motion::PanelIn { from_top: false }),
                     (Page::Above, Direction::Up) => (Page::Face, Motion::PanelOut { to_top: true }),
                     (Page::Below, Direction::Down) => (Page::Face, Motion::PanelOut { to_top: false }),
+                    // The first and the last of the pages side by side:
+                    // nothing lies further out, the page only gives.
+                    (Page::Face, Direction::Right) => (Page::Face, Motion::Give { leftwards: false }),
+                    (Page::Status, Direction::Left) => (Page::Status, Motion::Give { leftwards: true }),
                     // Nothing lies that way.
                     _ => {
                         let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
@@ -985,7 +984,7 @@ impl Screen {
                 if let Some(pull) = self.pull.as_mut() {
                     let (travel, speed) = (pull.motion.along(dx, dy), pull.motion.along(speed_x, speed_y));
                     pull.wanted = travel.clamp(0, pull.motion.extent() as i32) as usize;
-                    pull.release = Some(pull.motion.far_enough(travel) || speed > FLICK);
+                    pull.release = Some(pull.motion.finishes(travel, speed));
                     let _ = writeln!(log.stamp(), "touch: let go after {} px at {} px/s", travel, speed);
                 } else {
                     let _ = writeln!(log.stamp(), "touch: drag ended {}, {} from its start", dx, dy);
@@ -1251,6 +1250,13 @@ impl Screen {
         let Some(mut pull) = self.pull.take() else {
             return;
         };
+        let gives = matches!(pull.motion, Motion::Give { .. });
+        if pull.shown.is_none() && gives {
+            // Only the picture on the screen is needed, and the page
+            // stays the one it is.
+            pull.good &= self.panel.keep(0, false).await;
+            pull.shown = Some(0);
+        }
         if pull.shown.is_none() {
             let began = Instant::now();
             pull.good &= self.panel.keep(0, false).await;
@@ -1293,7 +1299,7 @@ impl Screen {
         // trip takes longer than a picture).
         let end = if finish { pull.motion.extent() } else { 0 };
         let distance = end.abs_diff(shown);
-        let steps = (distance * SLIDE_STEPS / pull.motion.extent()).max(2);
+        let steps = (distance * SLIDE_STEPS / panel::WIDTH).max(2);
         let run_began = Instant::now();
         for step in 1..=steps {
             // Ease out: fast first, slowing into place.
@@ -1308,7 +1314,7 @@ impl Screen {
         // picture; then both are as the page was drawn.
         pull.good &= self.move_to(pull.motion, end).await;
         self.t.damage.clear();
-        if !finish {
+        if !finish && !gives {
             self.page = self.t.left_page;
             self.t.lines = self.t.left_lines;
             self.t.face_keys = self.t.left_keys;
@@ -1338,6 +1344,7 @@ impl Screen {
             Motion::PanelIn { from_top } => self.panel.cover(offset, from_top, 1).await,
             // The panel is the page being left: so much of it remains.
             Motion::PanelOut { to_top } => self.panel.cover(panel::HEIGHT.saturating_sub(offset), to_top, 0).await,
+            Motion::Give { leftwards } => self.panel.shift(offset, leftwards).await,
         }
     }
 

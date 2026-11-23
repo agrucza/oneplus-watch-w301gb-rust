@@ -250,15 +250,31 @@ mod motion {
     }
 
     /// Pages change past a third of the width, panels past half the
-    /// height.
+    /// height, both also with a flick.
     #[test]
-    fn how_far_is_enough() {
+    fn what_finishes_a_change() {
         let page = Motion::Pages { leftwards: true };
-        assert!(!page.far_enough(151));
-        assert!(page.far_enough(152));
+        assert!(!page.finishes(151, 400));
+        assert!(page.finishes(152, 0));
+        assert!(page.finishes(20, 401));
         for panel in [Motion::PanelIn { from_top: true }, Motion::PanelIn { from_top: false }, Motion::PanelOut { to_top: true }, Motion::PanelOut { to_top: false }] {
-            assert!(!panel.far_enough(227));
-            assert!(panel.far_enough(228));
+            assert!(!panel.finishes(227, 400));
+            assert!(panel.finishes(228, 0));
+            assert!(panel.finishes(20, 401));
         }
+    }
+
+    /// A page with nothing beside it gives 50 pixels the way the finger
+    /// goes, and always goes back.
+    #[test]
+    fn give_at_the_ends() {
+        let right = Motion::Give { leftwards: false };
+        let left = Motion::Give { leftwards: true };
+        assert_eq!(right.extent(), 50);
+        assert_eq!(right.along(30, 80), 30);
+        assert_eq!(left.along(-30, 80), 30);
+        assert_eq!(left.along(30, 80), -30);
+        assert!(!right.finishes(50, 5000));
+        assert!(!left.finishes(400, 5000));
     }
 }

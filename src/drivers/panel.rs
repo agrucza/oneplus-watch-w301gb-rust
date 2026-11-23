@@ -253,6 +253,19 @@ impl Panel {
         }
     }
 
+    /// Put, in the frame to draw into, kept picture 0 moved `offset`
+    /// pixels to the left (`leftwards`) or right, with black where it
+    /// has moved away from. A blitter copy and a blitter fill.
+    pub async fn shift(&mut self, offset: usize, leftwards: bool) -> bool {
+        self.settle().await;
+        let offset = offset.min(WIDTH);
+        let old: *const Frame = self.spare[0];
+        let back: *mut Frame = self.frames[1 - self.shown];
+        let (to_x, gap_x) = if leftwards { (0, WIDTH - offset) } else { (offset, 0) };
+        self.copy_columns(old, if leftwards { offset } else { 0 }, back, to_x, WIDTH - offset).await
+            && (offset == 0 || self.blitter_fill(gap_x as u16, 0, offset as u16, HEIGHT as u16, 0).await)
+    }
+
     /// Copy the rows `from_y .. from_y + height` of one frame, over the
     /// whole width, to the rows starting at `to_y` of another, with the
     /// blitter. False if it reported an error.
