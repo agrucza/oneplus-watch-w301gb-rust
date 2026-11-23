@@ -14,7 +14,7 @@ use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
-use crate::services::gestures::{Gesture, Gestures};
+use crate::services::gestures::{Direction, Gesture, Gestures};
 use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
@@ -701,7 +701,9 @@ fn start_cycle_counter() {
 const SLIDE_STEPS: usize = 14;
 
 /// A flick: letting go faster than this many pixels a second finishes a
-/// change of page however short the pull was.
+/// change of page however short the pull was. Our own number, tried on
+/// the watch (40 of 40 swipes); stock wants 14 pixels between the last
+/// two places it sampled (`0x80F8D00`), which is more at any likely rate.
 const FLICK: i32 = 400;
 
 /// A change of page under way: one page moves out, the other follows in.
@@ -940,11 +942,15 @@ impl Screen {
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
         let width = panel::WIDTH as i32;
         match gesture {
-            Gesture::DragStart { dx, dy, .. } if self.pull.is_none() && dx.abs() >= dy.abs() => {
-                let (target, leftwards) = match (self.page, dx < 0) {
-                    (Page::Face, true) => (Page::Status, true),
-                    (Page::Status, false) => (Page::Face, false),
-                    _ => return, // nothing lies that way
+            Gesture::DragStart { direction, dx, .. } if self.pull.is_none() => {
+                let (target, leftwards) = match (self.page, direction) {
+                    (Page::Face, Direction::Left) => (Page::Status, true),
+                    (Page::Status, Direction::Right) => (Page::Face, false),
+                    // Nothing lies that way; up and down do nothing yet.
+                    _ => {
+                        let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
+                        return;
+                    }
                 };
                 self.pull = Some(Pull {
                     target,
@@ -964,15 +970,22 @@ impl Screen {
                     pull.wanted = travel.clamp(0, width) as usize;
                 }
             }
-            Gesture::DragEnd { dx, speed_x, .. } => {
+            Gesture::DragEnd { dx, dy, speed_x, .. } => {
                 if let Some(pull) = self.pull.as_mut() {
                     let (travel, speed) = if pull.leftwards { (-dx, -speed_x) } else { (dx, speed_x) };
                     pull.wanted = travel.clamp(0, width) as usize;
                     pull.release = Some(travel > width / 3 || speed > FLICK);
                     let _ = writeln!(log.stamp(), "touch: let go after {} px at {} px/s", travel, speed);
+                } else {
+                    let _ = writeln!(log.stamp(), "touch: drag ended {}, {} from its start", dx, dy);
                 }
             }
-            Gesture::Tap { x, y } if self.page == Page::Status => self.dot(x as u16, y as u16),
+            Gesture::Tap { x, y } => {
+                let _ = writeln!(log.stamp(), "touch: tap at {}, {}", x, y);
+                if self.page == Page::Status {
+                    self.dot(x as u16, y as u16);
+                }
+            }
             Gesture::LongPress { x, y } => {
                 let _ = writeln!(log.stamp(), "touch: long press at {}, {}", x, y);
             }

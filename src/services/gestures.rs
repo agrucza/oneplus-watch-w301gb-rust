@@ -1,25 +1,36 @@
-//! What a finger on the glass means: a tap, a long press, or a drag.
+//! What a finger on the glass means: a tap, a long press, or a drag in
+//! one of four directions.
 //!
 //! The touch controller only says where the finger is and when it lifts.
-//! This turns that into gestures, as the stock app's display layer does in
-//! its graphics framework. The thresholds here are our own; the stock
-//! ones have not been read.
+//! This turns that into gestures. The kinds of gesture are the stock
+//! app's (read in its image, version B.70; see docs/hardware-plan.md,
+//! 3.1); the numbers are our own, tried on the watch, and more forgiving
+//! than stock's.
 //!
-//! - A touch that stays within `SLOP` pixels of where it began and lifts
-//!   within `LONG_PRESS` is a **tap**.
-//! - One that stays put for `LONG_PRESS` is a **long press**, reported
-//!   while the finger is still down.
-//! - One that moves further than `SLOP` is a **drag**: it starts, moves
-//!   (reported with the distance from where it began), and ends with the
-//!   speed the finger had when it lifted, so a quick flick can be told
-//!   from a slow pull.
+//! - Once the finger is `START` pixels from where it went down, in x or
+//!   in y, the touch is a **drag**, and it is horizontal or vertical for
+//!   as long as it lasts: horizontal if it had moved further in x than in
+//!   y at that moment, vertical otherwise (the rule of stock's
+//!   `0x8047780`). The direction given with the start is the way the
+//!   finger went then; it may come back later, the line it moves on
+//!   stays. Stock decides after 3 pixels; here it is 15, so that a finger
+//!   that wobbles while tapping still taps.
+//! - A touch that is no drag after `LONG_PRESS` is a **long press**,
+//!   reported while the finger is still down. Stock counts 60 ticks
+//!   (`0x80F6F80`), of a length that was not read.
+//! - A touch that lifts before either is a **tap**.
+//!
+//! After a long press the touch gives nothing more (what stock does then
+//! was not read). The speed at lift-off is taken over `SPEED_WINDOW`,
+//! where stock takes the last two places it sampled; places reach us
+//! less evenly than that.
 
 use embassy_time::{Duration, Instant};
 
 use crate::drivers::touch::TouchEvent;
 
-/// How far a finger may wander and still count as not having moved.
-const SLOP: i32 = 14;
+/// A touch this many pixels from where it began, in x or in y, is a drag.
+const START: i32 = 15;
 const LONG_PRESS: Duration = Duration::from_millis(600);
 /// The speed at lift-off is taken over about this long.
 const SPEED_WINDOW: Duration = Duration::from_millis(90);
@@ -27,13 +38,42 @@ const SPEED_WINDOW: Duration = Duration::from_millis(90);
 /// speed, when the speed at lift-off cannot be told.
 const SHORT_TOUCH: Duration = Duration::from_millis(400);
 
+/// The way the finger went when a drag began.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    /// The direction of a drag that is `dx`, `dy` from where it began
+    /// when it is recognised.
+    fn of(dx: i32, dy: i32) -> Self {
+        if dy.abs() < dx.abs() {
+            if dx < 0 {
+                Direction::Left
+            } else {
+                Direction::Right
+            }
+        } else if dy < 0 {
+            Direction::Up
+        } else {
+            Direction::Down
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Gesture {
     Tap { x: i32, y: i32 },
     LongPress { x: i32, y: i32 },
-    /// A drag began at (x, y); `dx`, `dy` is how far it has got already.
-    DragStart { x: i32, y: i32, dx: i32, dy: i32 },
-    /// The finger is now `dx`, `dy` from where the drag began.
+    /// A drag began at (x, y) and went off in `direction`; `dx`, `dy` is
+    /// how far it has got already.
+    DragStart { x: i32, y: i32, direction: Direction, dx: i32, dy: i32 },
+    /// The finger is now `dx`, `dy` from where the drag began. Only the
+    /// part along the drag's line counts.
     Drag { dx: i32, dy: i32 },
     /// The finger lifted `dx`, `dy` from where the drag began, moving at
     /// `speed_x`, `speed_y` pixels a second.
@@ -87,9 +127,9 @@ impl Gestures {
                 if self.dragging {
                     return Some(Gesture::Drag { dx, dy });
                 }
-                if !self.long_press_reported && (dx.abs() > SLOP || dy.abs() > SLOP) {
+                if !self.long_press_reported && (dx.abs() >= START || dy.abs() >= START) {
                     self.dragging = true;
-                    return Some(Gesture::DragStart { x: began.x, y: began.y, dx, dy });
+                    return Some(Gesture::DragStart { x: began.x, y: began.y, direction: Direction::of(dx, dy), dx, dy });
                 }
                 self.resting(began, now)
             }

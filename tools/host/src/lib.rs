@@ -21,7 +21,7 @@ pub mod services;
 #[cfg(test)]
 mod gestures {
     use crate::drivers::touch::TouchEvent::{Down, Up};
-    use crate::services::gestures::{Gesture, Gestures};
+    use crate::services::gestures::{Direction, Gesture, Gestures};
     use embassy_time::{Duration, Instant};
 
     fn at(ms: u64) -> Instant {
@@ -33,6 +33,7 @@ mod gestures {
         let mut g = Gestures::new();
         assert_eq!(g.feed(Some(Down { x: 100, y: 200 }), at(0)), None);
         assert_eq!(g.feed(None, at(50)), None);
+        // A finger that wobbles is still no drag.
         assert_eq!(g.feed(Some(Down { x: 105, y: 196 }), at(80)), None);
         assert_eq!(g.feed(Some(Up), at(120)), Some(Gesture::Tap { x: 100, y: 200 }));
         assert_eq!(g.feed(None, at(2000)), None);
@@ -51,9 +52,9 @@ mod gestures {
         g.feed(Some(Down { x: 10, y: 10 }), at(0));
         assert_eq!(g.feed(None, at(599)), None);
         assert_eq!(g.feed(None, at(600)), Some(Gesture::LongPress { x: 10, y: 10 }));
-        assert_eq!(g.feed(None, at(900)), None);
-        assert_eq!(g.feed(Some(Down { x: 11, y: 10 }), at(950)), None);
-        assert_eq!(g.feed(Some(Up), at(1000)), None);
+        assert_eq!(g.feed(None, at(1300)), None);
+        assert_eq!(g.feed(Some(Down { x: 11, y: 10 }), at(1350)), None);
+        assert_eq!(g.feed(Some(Up), at(1400)), None);
         // The next touch starts clean.
         g.feed(Some(Down { x: 10, y: 10 }), at(2000));
         assert_eq!(g.feed(Some(Up), at(2050)), Some(Gesture::Tap { x: 10, y: 10 }));
@@ -63,9 +64,73 @@ mod gestures {
     fn no_drag_after_long_press() {
         let mut g = Gestures::new();
         g.feed(Some(Down { x: 200, y: 200 }), at(0));
-        assert!(matches!(g.feed(None, at(700)), Some(Gesture::LongPress { .. })));
-        assert_eq!(g.feed(Some(Down { x: 100, y: 200 }), at(800)), None);
-        assert_eq!(g.feed(Some(Up), at(900)), None);
+        assert!(matches!(g.feed(None, at(1100)), Some(Gesture::LongPress { .. })));
+        assert_eq!(g.feed(Some(Down { x: 100, y: 200 }), at(1200)), None);
+        assert_eq!(g.feed(Some(Up), at(1300)), None);
+    }
+
+    /// The direction a touch from (200, 200) to (x, y) starts a drag in.
+    fn start(x: u16, y: u16) -> Option<Direction> {
+        let mut g = Gestures::new();
+        g.feed(Some(Down { x: 200, y: 200 }), at(0));
+        match g.feed(Some(Down { x, y }), at(20)) {
+            Some(Gesture::DragStart { x: 200, y: 200, direction, dx, dy }) => {
+                assert_eq!((dx, dy), (x as i32 - 200, y as i32 - 200));
+                Some(direction)
+            }
+            None => None,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn drag_left() {
+        assert_eq!(start(185, 200), Some(Direction::Left));
+        assert_eq!(start(150, 240), Some(Direction::Left));
+    }
+
+    #[test]
+    fn drag_right() {
+        assert_eq!(start(215, 200), Some(Direction::Right));
+        assert_eq!(start(250, 160), Some(Direction::Right));
+    }
+
+    #[test]
+    fn drag_up() {
+        assert_eq!(start(200, 185), Some(Direction::Up));
+        assert_eq!(start(240, 150), Some(Direction::Up));
+    }
+
+    #[test]
+    fn drag_down() {
+        assert_eq!(start(200, 215), Some(Direction::Down));
+        assert_eq!(start(160, 250), Some(Direction::Down));
+    }
+
+    /// Fifteen pixels in x or in y start a drag, fourteen do not; as far
+    /// in x as in y is vertical, as in the stock app.
+    #[test]
+    fn where_a_drag_begins() {
+        assert_eq!(start(214, 214), None);
+        assert_eq!(start(186, 186), None);
+        assert_eq!(start(215, 214), Some(Direction::Right));
+        assert_eq!(start(215, 215), Some(Direction::Down));
+        assert_eq!(start(185, 185), Some(Direction::Up));
+        assert_eq!(start(215, 185), Some(Direction::Up));
+    }
+
+    /// The direction is decided once: a drag that began to the left stays
+    /// one drag when the finger wanders up or comes back.
+    #[test]
+    fn direction_is_kept() {
+        let mut g = Gestures::new();
+        g.feed(Some(Down { x: 300, y: 200 }), at(0));
+        assert_eq!(
+            g.feed(Some(Down { x: 280, y: 200 }), at(20)),
+            Some(Gesture::DragStart { x: 300, y: 200, direction: Direction::Left, dx: -20, dy: 0 })
+        );
+        assert_eq!(g.feed(Some(Down { x: 270, y: 120 }), at(40)), Some(Gesture::Drag { dx: -30, dy: -80 }));
+        assert_eq!(g.feed(Some(Down { x: 340, y: 120 }), at(60)), Some(Gesture::Drag { dx: 40, dy: -80 }));
     }
 
     #[test]
@@ -73,7 +138,10 @@ mod gestures {
         let mut g = Gestures::new();
         g.feed(Some(Down { x: 300, y: 200 }), at(0));
         assert_eq!(g.feed(Some(Down { x: 290, y: 200 }), at(20)), None);
-        assert_eq!(g.feed(Some(Down { x: 280, y: 202 }), at(40)), Some(Gesture::DragStart { x: 300, y: 200, dx: -20, dy: 2 }));
+        assert_eq!(
+            g.feed(Some(Down { x: 280, y: 202 }), at(40)),
+            Some(Gesture::DragStart { x: 300, y: 200, direction: Direction::Left, dx: -20, dy: 2 })
+        );
         assert_eq!(g.feed(None, at(50)), None);
         assert_eq!(g.feed(Some(Down { x: 260, y: 202 }), at(60)), Some(Gesture::Drag { dx: -40, dy: 2 }));
         assert_eq!(g.feed(Some(Down { x: 240, y: 202 }), at(80)), Some(Gesture::Drag { dx: -60, dy: 2 }));
@@ -87,6 +155,16 @@ mod gestures {
         }
         // No long press while dragging, and none after.
         assert_eq!(g.feed(None, at(5000)), None);
+    }
+
+    /// Speed is told along y as along x.
+    #[test]
+    fn flick_down() {
+        let mut g = Gestures::new();
+        g.feed(Some(Down { x: 200, y: 100 }), at(0));
+        assert!(matches!(g.feed(Some(Down { x: 200, y: 130 }), at(30)), Some(Gesture::DragStart { direction: Direction::Down, .. })));
+        g.feed(Some(Down { x: 200, y: 160 }), at(60));
+        assert_eq!(g.feed(Some(Up), at(65)), Some(Gesture::DragEnd { dx: 0, dy: 60, speed_x: 0, speed_y: 1000 }));
     }
 
     #[test]

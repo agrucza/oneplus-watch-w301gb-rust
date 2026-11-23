@@ -187,15 +187,15 @@ Which of the two panels is notifications and which quick settings was
 not determined. Elsewhere: on the launcher a drag of 41 pixels to the
 right goes back to the watch face (`0x8118852`, one reading).
 
-**Ours against that** (`services::gestures`, 2026-11-22):
+**Ours against that** (`services::gestures`, 2026-11-23; the recogniser's rules built and tested on the PC, not yet tried on the watch):
 
 | | Stock | Ours |
 |---|---|---|
 | Fingers | one | one |
-| Drag begins after | 3 pixels, then locked to one of 4 directions | 14 pixels (our own number), no direction at all |
+| Drag begins after | 3 pixels, then locked to one of 4 directions | 15 pixels, as before (kept on purpose: a wobbling finger still taps), then locked to one of 4 directions by stock's rule |
 | Left / right on the face | pages | page pull: yes |
 | Up / down on the face | two panels | nothing |
-| Page change finishes at | a third of the width, or 14 pixels a sample | a third of the width, or 400 pixels a second (our own number) |
+| Page change finishes at | a third of the width, or 14 pixels a sample | a third of the width, or 400 pixels a second (kept on purpose: measured 40 of 40 swipes; stock's number is stricter at any likely sample rate). Our speed is taken over the last 90 ms, not the last two samples |
 | Elastic end | 50 pixels | none: a drag towards no page does nothing |
 | Long press | 60 ticks, opens a screen | 0.6 s (our own number), only logged |
 | Tap | per dial | dots on the status page |
@@ -206,9 +206,11 @@ right goes back to the watch face (`0x8118852`, one reading).
 The recogniser's tests run on the PC (`tools/host`).
 
 Remaining:
-1. The recogniser as in the stock app: lock at 3 pixels to one of four
-   directions, speed from the last samples, long press by ticks; with a
-   test for each direction.
+1. The recogniser: four directions by stock's rule, built, with a test
+   for each direction; to be tried on the watch. The numbers stay our
+   own where they are more forgiving than stock's (decided 2026-11-23).
+   Not read: the tick rate, and what stock does with a touch after a
+   long press (ours: nothing more).
 2. On the watch face: up and down panels, the elastic end, long press
    opening a screen.
 3. The covering hand: read the bit, switch the display off.
