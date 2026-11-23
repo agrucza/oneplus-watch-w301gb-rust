@@ -45,6 +45,8 @@ enum Step {
     Do(u8),
     /// DCS command with two parameters.
     Pair(u8, [u8; 2]),
+    /// The brightness command, with the level the panel is to start at.
+    Brightness,
     /// DCS command with four parameters.
     Window(u8, [u8; 4]),
     WaitMs(u64),
@@ -70,7 +72,7 @@ const PANEL_ON: [Step; 18] = [
     Step::Window(0x2B, [0x00, 0x00, 0x01, 0xC5]), // rows 0..=453
     Step::Do(0x11),                               // sleep out
     Step::WaitMs(80),
-    Step::Set(0x51, 0x85), // brightness
+    Step::Brightness,
     Step::Do(0x29),        // display on
     Step::WaitMs(80),
 ];
@@ -108,29 +110,66 @@ pub struct Panel {
     /// holds what is the caller's business.
     frames: [&'static mut Frame; FRAMES],
     blitter: Dma2d<'static, peripherals::DMA2D>,
-    _pins: [Output<'static>; 4],
+    _supplies: [Output<'static>; 2],
+    power: Output<'static>,
+    reset: Output<'static>,
+    /// The brightness last asked for.
+    brightness: u8,
+    /// Powered down (`set_visible(false)`).
+    suspended: bool,
+    /// Powered up again with the brightness at zero: the level is set
+    /// once a picture has gone out, as its frame memory was lost.
+    unlit: bool,
 }
+
+/// The brightness the panel starts with (the stock app's value).
+const START_BRIGHTNESS: u8 = 0x85;
 
 impl Panel {
     /// Power the panel, set up LTDC and DSI with `frame` as the picture
     /// source, switch the panel on. Every stage is logged; `None` if one of
     /// them does not complete.
     pub async fn start(r: Resources, frames: [&'static mut Frame; FRAMES], log: &mut Log) -> Option<Self> {
-        // Power-up, as in the stock app.
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
-        let mut power = Output::new(r.power, Level::Low, Speed::Low);
-        let mut reset = Output::new(r.reset, Level::Low, Speed::Low);
+        let power = Output::new(r.power, Level::Low, Speed::Low);
+        let reset = Output::new(r.reset, Level::Low, Speed::Low);
+        let blitter = Dma2d::new(r.blitter, Irqs);
+        let mut panel = Self {
+            frames,
+            blitter,
+            _supplies: [pg5, pf12],
+            power,
+            reset,
+            brightness: START_BRIGHTNESS,
+            suspended: false,
+            unlit: false,
+        };
+        if !panel.bring_up(START_BRIGHTNESS, log).await {
+            return None;
+        }
+        let _ = writeln!(log.stamp(), "display: panel switched on");
+        Some(panel)
+    }
+
+    /// Power the panel, set up LTDC and DSI with the first frame as the
+    /// picture source, and send the panel its start-up commands, with
+    /// `brightness` as its level. Every stage is logged; false if one of
+    /// them does not complete.
+    async fn bring_up(&mut self, brightness: u8, log: &mut Log) -> bool {
+        // Power-up, as in the stock app.
+        self.power.set_low();
+        self.reset.set_low();
         Timer::after_millis(2).await;
-        power.set_high();
+        self.power.set_high();
         Timer::after_millis(10).await;
-        reset.set_high();
+        self.reset.set_high();
         Timer::after_millis(12).await;
 
         let config = dsi::Config {
             width: WIDTH as u32,
             height: HEIGHT as u32,
-            framebuffer: frames[0].as_ptr() as u32,
+            framebuffer: self.frames[0].as_ptr() as u32,
             back_porch: 1, // the bootloader uses sync 2, back porch 4
             pll_ndiv: 80,
             pll_idf: 6,
@@ -145,11 +184,11 @@ impl Panel {
             Ok(()) => {}
             Err(dsi::Error::RegulatorNotReady) => {
                 let _ = writeln!(log.stamp(), "display: DSI regulator not ready");
-                return None;
+                return false;
             }
             Err(dsi::Error::PllNotLocked) => {
                 let _ = writeln!(log.stamp(), "display: DSI PLL did not lock");
-                return None;
+                return false;
             }
         }
 
@@ -157,6 +196,7 @@ impl Panel {
             let taken = match *step {
                 Step::Set(command, value) => dsi::dcs_1(command, value).await,
                 Step::Do(command) => dsi::dcs(command).await,
+                Step::Brightness => dsi::dcs_1(0x51, brightness).await,
                 Step::Pair(command, params) => dsi::dcs_long(command, &params).await,
                 Step::Window(command, params) => dsi::dcs_long(command, &params).await,
                 Step::WaitMs(ms) => {
@@ -166,13 +206,20 @@ impl Panel {
             };
             if !taken {
                 let _ = writeln!(log.stamp(), "display: panel command {} was not taken", i);
-                return None;
+                return false;
             }
         }
         dsi::enable();
-        let _ = writeln!(log.stamp(), "display: panel switched on");
-        let blitter = Dma2d::new(r.blitter, Irqs);
-        Some(Self { frames, blitter, _pins: [pg5, pf12, power, reset] })
+        true
+    }
+
+    /// Light a panel that was powered up dark, once a picture has gone
+    /// out to it.
+    async fn light(&mut self) {
+        if core::mem::take(&mut self.unlit) {
+            dsi::frame_out().await;
+            dsi::dcs_1(0x51, self.brightness).await;
+        }
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
@@ -196,7 +243,12 @@ impl Panel {
                 height: p.size.1,
             })
         });
-        dsi::refresh_layers(layers).await
+        if self.suspended {
+            return dsi::RefreshStatus::skipped();
+        }
+        let status = dsi::refresh_layers(layers).await;
+        self.light().await;
+        status
     }
 
     /// Wait until the frame on its way to the panel has gone out, before
@@ -225,18 +277,69 @@ impl Panel {
     /// it first. `done` in the answer says whether the frame before had
     /// gone out.
     pub async fn present(&mut self, frame: usize) -> dsi::RefreshStatus {
-        dsi::refresh_from(self.frames[frame].as_ptr() as u32).await
+        if self.suspended {
+            return dsi::RefreshStatus::skipped();
+        }
+        let status = dsi::refresh_from(self.frames[frame].as_ptr() as u32).await;
+        self.light().await;
+        status
     }
 
     /// Set the brightness, 0 (darkest) to 255. False if the command was
-    /// not taken.
+    /// not taken. A panel that is powered down, or powered up and not
+    /// lit yet, gets the level when it is lit.
     pub async fn set_brightness(&mut self, level: u8) -> bool {
+        self.brightness = level;
+        if self.suspended || self.unlit {
+            return true;
+        }
         dsi::dcs_1(0x51, level).await
     }
 
-    /// Blank or show the picture (DCS "display off" / "display on"). The
-    /// panel stays powered and keeps its frame memory.
-    pub async fn set_visible(&mut self, visible: bool) -> bool {
-        dsi::dcs(if visible { 0x29 } else { 0x28 }).await
+    /// Switch the panel off or on, as the stock app does when its display
+    /// goes dark and comes back (0x08039B72 and the start-up it runs
+    /// again, in B.70).
+    ///
+    /// Off: brightness 0, the vendor register 0x6A on page 1 to 0x15,
+    /// 15 ms, "display off", "sleep in"; then the DSI host and the display
+    /// controller are switched off, the reset line goes low and 2 ms
+    /// later the panel's power. The stock app also keeps PF5 pulled down
+    /// for its own low-power modes, which is not needed while the pin is
+    /// driven.
+    ///
+    /// On: the whole start-up again, with the brightness at zero. The
+    /// panel's frame memory was lost with its power, so the caller has to
+    /// send a picture; the brightness follows it (`light`).
+    ///
+    /// False if a command was not taken or the start-up failed.
+    pub async fn set_visible(&mut self, visible: bool, log: &mut Log) -> bool {
+        if visible != self.suspended {
+            return true;
+        }
+        if visible {
+            let started = embassy_time::Instant::now();
+            let up = self.bring_up(0, log).await;
+            self.suspended = !up;
+            self.unlit = up;
+            let _ = writeln!(log.stamp(), "display: panel powered up in {} ms{}", started.elapsed().as_millis(), if up { "" } else { ", FAILED" });
+            return up;
+        }
+        dsi::frame_out().await;
+        let mut taken = dsi::dcs_1(0x51, 0).await;
+        taken &= dsi::dcs_1(0xFE, 0x01).await;
+        taken &= dsi::dcs_1(0x6A, 0x15).await;
+        Timer::after_millis(15).await;
+        taken &= dsi::dcs_1(0xFE, 0x00).await;
+        taken &= dsi::dcs(0x28).await;
+        taken &= dsi::dcs(0x10).await;
+        // The commands leave the host's queue before it is switched off.
+        Timer::after_millis(5).await;
+        dsi::deinit();
+        self.reset.set_low();
+        Timer::after_millis(2).await;
+        self.power.set_low();
+        self.suspended = true;
+        self.unlit = false;
+        taken
     }
 }

@@ -479,6 +479,20 @@ Remaining:
 6. Always-on mode (`lcd_alwayson` in the stock strings): later.
 7. The stage timing in the log can go once it is no longer needed.
 
+**Dark display** (done; measured: 13 times off and on by button, timer and covering hand, every power-up 184 ms, none failed, no command refused, the page shown before comes back). Read in the stock
+app (B.70, `0x08039B72`): to switch the display off it sets the
+brightness to 0, writes 0x15 to the vendor register 0x6A on page 1,
+waits 15 ms, sends "display off" and "sleep in", shuts the DSI host and
+the display controller down (`LCD_DeInit`, `0x08039464`), pulls the
+panel's reset low and 2 ms later cuts its power (PF5). The supplies on
+PG5 and PF12 stay on. To switch it on it runs the whole start-up again,
+up to several times if a step fails (`0x0803989C`), with the brightness
+at 0; the backlight level follows later. With its always-on setting it
+takes another path (`0x08040C34`), not read. `Panel::set_visible` does
+the same; the level is set once the first picture has gone out, since
+the panel's frame memory is lost with its power. Not done: stopping the
+pixel clock's PLL (PLLSAI2) while the display is off.
+
 ### 3.4 Ambient light sensor (item 10) - done
 
 **Measured:** STK31800 on I2C2 at address 0x45, product ID 0x82. Register 2

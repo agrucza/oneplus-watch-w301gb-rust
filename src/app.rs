@@ -827,7 +827,7 @@ impl Screen {
                     self.visible_since = Instant::now();
                     self.shown_by_raise = false;
                     let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
-                    self.panel.set_visible(self.visible).await
+                    self.panel_visible(self.visible, log).await
                 }
             }
             Action::PowerMenu => {
@@ -882,7 +882,7 @@ impl Screen {
         self.visible_since = Instant::now();
         self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: shown");
-        self.panel.set_visible(true).await
+        self.panel_visible(true, log).await
     }
 
     /// React to a wrist gesture from the Apollo. Raising the wrist shows a
@@ -901,11 +901,21 @@ impl Screen {
         self.visible_since = Instant::now();
         self.shown_by_raise = show;
         let _ = writeln!(log.stamp(), "display: {} by wrist gesture", if show { "shown" } else { "blanked" });
-        if !self.panel.set_visible(show).await {
+        if !self.panel_visible(show, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
         self.drawn_for = None;
         true
+    }
+
+    /// Switch the panel off or on (`Panel::set_visible`). A panel coming
+    /// on has lost its picture: the page's frame is sent again by the
+    /// next `update`.
+    async fn panel_visible(&mut self, visible: bool, log: &mut Log) -> bool {
+        if visible {
+            self.on_screen = None;
+        }
+        self.panel.set_visible(visible, log).await
     }
 
     /// The display's switch-off timer: dark after `DISPLAY_TIMEOUT`
@@ -919,7 +929,7 @@ impl Screen {
         self.visible_since = Instant::now();
         self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: blanked after {} s without a finger or a button", DISPLAY_TIMEOUT.as_secs());
-        if !self.panel.set_visible(false).await {
+        if !self.panel_visible(false, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
         self.drawn_for = None;
@@ -939,7 +949,7 @@ impl Screen {
         self.visible_since = Instant::now();
         self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: blanked by a covering hand");
-        if !self.panel.set_visible(false).await {
+        if !self.panel_visible(false, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
         self.drawn_for = None;
@@ -1622,7 +1632,7 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
                 screen.power_chosen = None;
                 screen.t.damage[Page::Power.index()].add(face::whole());
                 screen.visible = false;
-                screen.panel.set_visible(false).await;
+                screen.panel_visible(false, &mut log).await;
                 shared::request_power_off();
             }
             Some(choice) => power_do(choice, &mut log),

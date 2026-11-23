@@ -162,6 +162,21 @@ pub async fn init(c: &Config) -> Result<(), Error> {
 }
 
 /// Switch the DSI wrapper on; frames can be sent from here on.
+/// Switch the DSI host and the display controller off: both are put
+/// into reset and lose their clocks, as after the stock app's
+/// `LCD_DeInit` (0x08039464 in B.70). No frame may be on its way
+/// (`frame_out` first). `init` brings both back.
+pub fn deinit() {
+    cortex_m::peripheral::NVIC::mask(embassy_stm32::interrupt::DSI);
+    ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        modify(RCC_APB2RSTR, 0, LTDC_BIT | DSI_BIT);
+        modify(RCC_APB2RSTR, LTDC_BIT | DSI_BIT, 0);
+        modify(RCC_APB2ENR, LTDC_BIT | DSI_BIT, 0);
+    }
+}
+
 pub fn enable() {
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 3);
 }
@@ -260,6 +275,13 @@ pub struct RefreshStatus {
     pub isr0: u32,
     pub isr1: u32,
     pub psr: u32,
+}
+
+impl RefreshStatus {
+    /// Nothing was sent: the display is switched off.
+    pub fn skipped() -> Self {
+        Self { done: true, in_step: false, wisr: 0, isr0: 0, isr1: 0, psr: 0 }
+    }
 }
 
 /// What one of the display controller's two layers shows: a rectangle of
