@@ -4,16 +4,7 @@
 //! needs from the rest of the firmware is stood in for here by the least
 //! that will do.
 
-pub mod drivers {
-    /// Stand-in for the firmware's touch driver: only the event type.
-    pub mod touch {
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        pub enum TouchEvent {
-            Down { x: u16, y: u16 },
-            Up,
-        }
-    }
-}
+pub mod drivers;
 pub mod app;
 pub mod services;
 
@@ -345,5 +336,52 @@ mod pages {
         for page in [Page::Face, Page::Status, Page::Above, Page::Below] {
             assert_eq!(tap(page), None);
         }
+    }
+}
+
+/// `drivers::touch_report`: what the touch controller's reports say.
+#[cfg(test)]
+mod touch_report {
+    use crate::drivers::touch_report::{parse, TouchReport};
+
+    /// A report as the watch logged it: one finger at 216, 56.
+    const FINGER: [u8; 17] = [0x11, 0x00, 0x01, 0x43, 0x0f, 0x01, 0x40, 0x00, 0xa0, 0xd8, 0x00, 0x38, 0x00, 0x19, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn finger() {
+        assert_eq!(parse(&FINGER), Some(TouchReport { large_object: false, finger: Some((216, 56)) }));
+    }
+
+    #[test]
+    fn lift() {
+        // The touch's event says "lifted".
+        let mut report = FINGER;
+        report[8] = 0x60;
+        assert_eq!(parse(&report), Some(TouchReport { large_object: false, finger: None }));
+        // No touches at all.
+        let mut report = FINGER;
+        report[5] = 0x00;
+        assert_eq!(parse(&report), Some(TouchReport { large_object: false, finger: None }));
+        // A touch report without a touch in it.
+        assert_eq!(parse(&FINGER[..7]), Some(TouchReport { large_object: false, finger: None }));
+    }
+
+    /// Bit 5 of the count byte, with a finger and without.
+    #[test]
+    fn large_object() {
+        let mut report = FINGER;
+        report[5] = 0x21;
+        assert_eq!(parse(&report), Some(TouchReport { large_object: true, finger: Some((216, 56)) }));
+        report[5] = 0x20;
+        assert_eq!(parse(&report), Some(TouchReport { large_object: true, finger: None }));
+    }
+
+    #[test]
+    fn other_reports() {
+        let mut report = FINGER;
+        report[2] = 0x04;
+        assert_eq!(parse(&report), None);
+        assert_eq!(parse(&FINGER[..6]), None);
+        assert_eq!(parse(&[]), None);
     }
 }

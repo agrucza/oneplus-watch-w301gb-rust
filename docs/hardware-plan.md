@@ -26,7 +26,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: frames in step with the panel, two frame buffers, only what changed is drawn, hardware blitter, watch face and status page, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
-| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags act in all 4 of the stock app's directions (pages left and right, two panels up and down, the panels with placeholder content). Open: what the panels hold, covering hand, sleep and wake (see 3.1) |
+| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags act in all 4 of the stock app's directions (pages left and right, two panels up and down, the panels with placeholder content). covering hand blanks the display. Open: what the panels and the long-press pages hold, sleep and wake (see 3.1) |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
@@ -199,7 +199,7 @@ right goes back to the watch face (`0x8118852`, one reading).
 | Elastic end | 50 pixels | 50 pixels (measured on the watch 2026-11-23: 20 of 20 went back, clean): to the right on the face and to the left on the status page the page follows the finger that far, black behind it, and goes back on letting go. That it follows the finger one to one is our choice; how stock eases it was not read |
 | Long press | 60 ticks, opens a screen | 0.6 s (our own number); opens a page of its own on the face and on the status page, left again by a tap (measured on the watch 2026-11-23: 12 of 12 long presses opened their page, 12 of 12 taps led back, clean). Both pages are placeholders: there is one face to choose from and one page to arrange. That a tap leaves them, and that they appear without a move, are our choices |
 | Tap | per dial | dots on the status page |
-| Covering hand | display off | the bit is not read |
+| Covering hand | display off | the bit is read and blanks the display (measured on the watch 2026-11-23: 9 of 9 covers blanked it, 14 taps and 11 swipes did not; a thumb pressed flat counts as a large object too); it comes back by button or wrist raise. While the display is dark, gestures are not acted on |
 | Touch restarts the switch-off timer | yes | no such timer yet |
 | Chip sleeps with the display | yes | never |
 
@@ -217,7 +217,22 @@ Remaining:
    (notifications, quick settings) and what the two pages a long press
    opens hold (faces to choose from, pages to arrange). The elastic end
    and the long press work.
-3. The covering hand: read the bit, switch the display off.
+3. The covering hand: works. The chip reports a thumb pressed flat as a
+   large object as well, so that blanks the display too; whether stock
+   behaves the same on the watch was not tried. The stock path,
+   read 2026-11-23 (checked): the driver logs "Large Object detected"
+   and sets a flag (`0x8079082`); if the display has been lit since the
+   last time (a flag the backlight routine sets, `0x8040B54`), it calls
+   `0x8034178`, which sends event 0x800 to the main task if the first
+   word of a settings block is 0, and otherwise only while screen 0x3F4
+   is shown; with the word 0 the cover acts once per lighting. The
+   routine `0x8033DB0` logs "[LCD_OFF] 3.cover off" and suspends the
+   display. After a large object, a new touch no longer restarts the
+   switch-off timer until the display has been suspended (`0x80791D2`).
+   Not read: what the settings word is (always-on display, by one
+   earlier reading), what screen 0x3F4 is, and the route from event
+   0x800 to the routine. Ours acts on every large object while the
+   display is lit.
 4. The chip's deep sleep with the display, and waking it; belongs with
    blanking and low power.
 5. The stock app's settings after start (`0x0807857A`) and its "underwater

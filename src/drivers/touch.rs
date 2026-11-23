@@ -17,10 +17,7 @@
 //! itself), then read that many bytes again from the start (`0x08077CE4`).
 //! A length of 0 or 2 means "nothing". Byte 2 is the report's kind:
 //!
-//!   - 0x01: touches (`0x08078DCC`). Byte 5 holds the number of touches in
-//!     bits 4:0; ten bytes per touch follow from byte 7: byte 1 is the
-//!     touch number (bits 4:0) and the event (bits 6:5, 3 = finger lifted),
-//!     bytes 2-3 are X and 4-5 are Y, low byte first.
+//!   - 0x01: touches (`0x08078DCC`); see `touch_report` for what is in it.
 //!   - 0x04: wake-up gesture while the chip sleeps.
 //!   - 0x1F: answer to a command.
 //!   - 0xF7 / 0xFF: the chip's description, asked for by writing register 1.
@@ -40,13 +37,13 @@ use embassy_stm32::time::Hertz;
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::{Duration, Instant, Timer};
 
+use super::touch_report;
 use crate::services::log::Log;
 
 const ADDRESS: u8 = 0x24;
 /// The longest report the stock app accepts.
 const MAX_REPORT: usize = 0x108;
 
-const REPORT_TOUCH: u8 = 0x01;
 const REPORT_WAKE: u8 = 0x04;
 const MODE_FIRMWARE: u8 = 0xF7;
 const MODE_BOOTLOADER: u8 = 0xFF;
@@ -99,6 +96,11 @@ pub struct Touch {
     /// The finger lifted in the same call that reported its last place:
     /// the lift is handed out by the next call.
     lift_pending: bool,
+    /// A report said that something large lies on the glass, and nobody
+    /// has asked since (`take_large_object`).
+    large_object: bool,
+    /// The latest touch report said so.
+    large_object_lies: bool,
     logged: u32,
     failures: u32,
 }
@@ -123,7 +125,7 @@ impl Touch {
         enable.set_high();
         Timer::after_millis(120).await;
 
-        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, lift_pending: false, logged: 0, failures: 0 };
+        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, lift_pending: false, large_object: false, large_object_lies: false, logged: 0, failures: 0 };
         let _ = writeln!(log.stamp(), "touch: reset done, interrupt line is {}", if touch.irq.is_low() { "low" } else { "high" });
 
         // Whatever the chip has to say after its reset.
@@ -263,36 +265,51 @@ impl Touch {
                 let _ = writeln!(log.stamp(), "touch: report kind {:#04x}, {} bytes", kind, len);
                 log.hex(&self.buffer[..len]);
             }
-            match kind {
-                REPORT_TOUCH if len >= 7 => {
-                    let count = (self.buffer[5] & 0x1F) as usize;
-                    let lifted = count == 0 || len < 17 || (self.buffer[8] >> 5) & 3 == 3;
-                    if lifted {
-                        if self.touching {
-                            self.touching = false;
-                            let _ = writeln!(log.stamp(), "touch: finger lifted");
-                            if event.is_some() {
-                                self.lift_pending = true;
-                                break;
+            match touch_report::parse(&self.buffer[..len]) {
+                Some(report) => {
+                    if report.large_object {
+                        // Logged once for as long as it lies there.
+                        if !self.large_object_lies {
+                            let _ = writeln!(log.stamp(), "touch: something large on the glass");
+                        }
+                        self.large_object = true;
+                    } else if self.large_object_lies {
+                        let _ = writeln!(log.stamp(), "touch: the large thing is gone");
+                    }
+                    self.large_object_lies = report.large_object;
+                    match report.finger {
+                        None => {
+                            if self.touching {
+                                self.touching = false;
+                                let _ = writeln!(log.stamp(), "touch: finger lifted");
+                                if event.is_some() {
+                                    self.lift_pending = true;
+                                    break;
+                                }
+                                event = Some(TouchEvent::Up);
                             }
-                            event = Some(TouchEvent::Up);
                         }
-                    } else {
-                        let x = u16::from_le_bytes([self.buffer[9], self.buffer[10]]);
-                        let y = u16::from_le_bytes([self.buffer[11], self.buffer[12]]);
-                        if !self.touching {
-                            self.touching = true;
-                            let _ = writeln!(log.stamp(), "touch: finger down at {}, {}", x, y);
+                        Some((x, y)) => {
+                            if !self.touching {
+                                self.touching = true;
+                                let _ = writeln!(log.stamp(), "touch: finger down at {}, {}", x, y);
+                            }
+                            event = Some(TouchEvent::Down { x, y });
                         }
-                        event = Some(TouchEvent::Down { x, y });
                     }
                 }
-                REPORT_WAKE => {
+                None if kind == REPORT_WAKE => {
                     let _ = writeln!(log.stamp(), "touch: wake-up report");
                 }
-                _ => {}
+                None => {}
             }
         }
         event
+    }
+
+    /// True if a report since the last call said that something large
+    /// lies on the glass (a covering hand).
+    pub fn take_large_object(&mut self) -> bool {
+        core::mem::take(&mut self.large_object)
     }
 }

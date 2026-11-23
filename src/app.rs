@@ -921,7 +921,33 @@ impl Screen {
         true
     }
 
-    /// A finger is on the glass: mark the place with a dot.
+    /// A hand covers the glass: blank the display, as the stock app does
+    /// on the touch controller's "large object" (its routine `0x8033DB0`,
+    /// which logs "cover off" and suspends the display). Stock does this
+    /// once each time the display has been lit, and with one of its
+    /// settings on only on one particular screen; that setting was not
+    /// read further and is not kept here.
+    async fn covered(&mut self, log: &mut Log) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.visible_since = Instant::now();
+        self.shown_by_raise = false;
+        let _ = writeln!(log.stamp(), "display: blanked by a covering hand");
+        if !self.panel.set_visible(false).await {
+            let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+        }
+        self.drawn_for = None;
+    }
+
+    /// The finger no longer counts: a move it had begun goes back.
+    fn let_go(&mut self) {
+        if let Some(pull) = self.pull.as_mut() {
+            pull.release.get_or_insert(false);
+        }
+    }
+
     /// React to what the finger did.
     ///
     /// Dragging sideways pulls the next page in: to the left on the watch
@@ -1531,8 +1557,20 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             continue;
         }
         let touched = touch.as_mut().and_then(|touch| touch.poll(&mut log));
-        if let Some(gesture) = gestures.feed(touched, Instant::now()) {
-            screen.touch_gesture(gesture, &mut log);
+        if touch.as_mut().is_some_and(|touch| touch.take_large_object()) {
+            let _turn = crate::services::turn::take().await;
+            screen.covered(&mut log).await;
+        }
+        let gesture = gestures.feed(touched, Instant::now());
+        if screen.visible {
+            if let Some(gesture) = gesture {
+                screen.touch_gesture(gesture, &mut log);
+            }
+        } else {
+            // A dark display takes no gestures (in the stock app the
+            // touch controller sleeps then), and a move the finger had
+            // begun goes back when the display shows again.
+            screen.let_go();
         }
         {
             // Not while a block is being exchanged with the Apollo; see
