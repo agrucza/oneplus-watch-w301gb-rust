@@ -2,13 +2,15 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|below
+//!   cargo run --bin preview -- OUT.ppm above|below|faces|cards
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
 //! watch the blitter does it.
 
 use w301_host::app::face;
+use w301_host::app::pages::Page;
+use w301_host::app::panels;
 use w301_host::services;
 
 use embedded_graphics::pixelcolor::raw::RawU16;
@@ -53,8 +55,10 @@ fn main() {
     };
     let whole = face::whole();
     match args.get(2).map(String::as_str) {
-        Some("above") => w301_host::app::panels::draw(&mut frame, &whole, true),
-        Some("below") => w301_host::app::panels::draw(&mut frame, &whole, false),
+        Some("above") => panels::draw(&mut frame, &whole, Page::Above),
+        Some("below") => panels::draw(&mut frame, &whole, Page::Below),
+        Some("faces") => panels::draw(&mut frame, &whole, Page::Faces),
+        Some("cards") => panels::draw(&mut frame, &whole, Page::Cards),
         _ => {
             for n in 0..face::ELEMENTS {
                 face::draw(&mut frame, &whole, n, &state);

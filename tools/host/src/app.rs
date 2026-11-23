@@ -4,5 +4,7 @@
 pub mod face;
 #[path = "../../../src/app/motion.rs"]
 pub mod motion;
+#[path = "../../../src/app/pages.rs"]
+pub mod pages;
 #[path = "../../../src/app/panels.rs"]
 pub mod panels;

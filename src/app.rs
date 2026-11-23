@@ -2,6 +2,7 @@
 
 mod face;
 mod motion;
+mod pages;
 mod panels;
 mod shared;
 mod status;
@@ -16,8 +17,9 @@ use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
-use crate::services::gestures::{Direction, Gesture, Gestures};
+use crate::services::gestures::{Gesture, Gestures};
 use motion::Motion;
+use pages::Page;
 use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
@@ -726,17 +728,6 @@ struct Pull {
     good: bool,
 }
 
-/// What the screen shows: the watch face, the page of status text beside
-/// it, or one of the two panels pulled over the face from the top and
-/// from the bottom edge.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
-    Face,
-    Status,
-    Above,
-    Below,
-}
-
 /// What the screen keeps track of to redraw only what changes: several
 /// kilobytes of rectangles and keys.
 ///
@@ -942,26 +933,16 @@ impl Screen {
     /// (`Motion::finishes`) finishes the change, anything less lets it
     /// fall back. Where no page lies sideways (to the right on the face,
     /// to the left on the status page) the page gives `motion::GIVE`
-    /// pixels and goes back. A tap on the status page leaves a dot.
+    /// pixels and goes back. All of that is laid down in `pages::drag`.
+    /// A long press on the face or the status page opens a page of its
+    /// own, which a tap leaves again. A tap on the status page leaves a
+    /// dot.
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
         match gesture {
             Gesture::DragStart { direction, dx, dy, .. } if self.pull.is_none() => {
-                let (target, motion) = match (self.page, direction) {
-                    (Page::Face, Direction::Left) => (Page::Status, Motion::Pages { leftwards: true }),
-                    (Page::Status, Direction::Right) => (Page::Face, Motion::Pages { leftwards: false }),
-                    (Page::Face, Direction::Down) => (Page::Above, Motion::PanelIn { from_top: true }),
-                    (Page::Face, Direction::Up) => (Page::Below, Motion::PanelIn { from_top: false }),
-                    (Page::Above, Direction::Up) => (Page::Face, Motion::PanelOut { to_top: true }),
-                    (Page::Below, Direction::Down) => (Page::Face, Motion::PanelOut { to_top: false }),
-                    // The first and the last of the pages side by side:
-                    // nothing lies further out, the page only gives.
-                    (Page::Face, Direction::Right) => (Page::Face, Motion::Give { leftwards: false }),
-                    (Page::Status, Direction::Left) => (Page::Status, Motion::Give { leftwards: true }),
-                    // Nothing lies that way.
-                    _ => {
-                        let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
-                        return;
-                    }
+                let Some((target, motion)) = pages::drag(self.page, direction) else {
+                    let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
+                    return;
                 };
                 self.pull = Some(Pull {
                     target,
@@ -995,12 +976,29 @@ impl Screen {
                 if self.page == Page::Status {
                     self.dot(x as u16, y as u16);
                 }
+                if let (Some(page), None) = (pages::tap(self.page), self.pull) {
+                    self.go_to(page, log);
+                }
             }
             Gesture::LongPress { x, y } => {
                 let _ = writeln!(log.stamp(), "touch: long press at {}, {}", x, y);
+                if let (Some(page), None) = (pages::long_press(self.page), self.pull) {
+                    self.go_to(page, log);
+                }
             }
             _ => {}
         }
+    }
+
+    /// Show `page` from the next picture on, without a move in between.
+    fn go_to(&mut self, page: Page, log: &mut Log) {
+        let _ = writeln!(log.stamp(), "display: {:?} -> {:?}", self.page, page);
+        self.page = page;
+        // Nothing of the new page is on either frame.
+        self.t.damage = Damage::new();
+        self.t.lines = None;
+        self.t.face_keys = [None; face::ELEMENTS];
+        self.changed = true;
     }
 
     /// Leave a dot on the status page.
@@ -1059,10 +1057,10 @@ impl Screen {
         }
         // The watch face moves: it is looked at again every `FACE_PERIOD`.
         let frame_due = self.page == Page::Face && now >= self.next_frame;
-        // On the status page a change is brought to the second frame at
+        // Off the watch face a change is brought to the second frame at
         // once. The watch face is drawn again shortly anyway, and that
         // picture brings the second frame up to date as well.
-        let catch_up = self.page == Page::Status && self.t.damage.pending(back);
+        let catch_up = self.page != Page::Face && self.t.damage.pending(back);
         if !self.visible || !(new_second || self.changed || frame_due || catch_up) {
             return;
         }
@@ -1176,9 +1174,9 @@ impl Screen {
             }
             return Some((started, changes.area(face::whole())));
         }
-        if let Page::Above | Page::Below = self.page {
-            // A panel always looks the same: it is drawn where a frame
-            // does not have it yet, and never again.
+        if panels::draws(self.page) {
+            // These pages always look the same: one is drawn where a
+            // frame does not have it yet, and never again.
             let changes = self.t.damage.take(back);
             if changes.is_empty() {
                 return None;
@@ -1186,7 +1184,7 @@ impl Screen {
             let mut canvas = self.panel.canvas();
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
-                panels::draw(&mut canvas, &area, self.page == Page::Above);
+                panels::draw(&mut canvas, &area, self.page);
             }
             return Some((started, changes.area(face::whole())));
         }

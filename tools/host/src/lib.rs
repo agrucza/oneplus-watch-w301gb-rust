@@ -278,3 +278,72 @@ mod motion {
         assert!(!left.finishes(400, 5000));
     }
 }
+
+/// `app::pages`: which gesture leads from which page to which.
+#[cfg(test)]
+mod pages {
+    use crate::app::motion::Motion;
+    use crate::app::pages::{drag, long_press, tap, Page};
+    use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
+
+    const PAGES: [Page; 6] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards];
+    const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
+
+    /// Every page with every direction: the whole table.
+    #[test]
+    fn drags() {
+        for page in PAGES {
+            for direction in DIRECTIONS {
+                let expected = match (page, direction) {
+                    (Page::Face, Left) => Some((Page::Status, Motion::Pages { leftwards: true })),
+                    (Page::Face, Right) => Some((Page::Face, Motion::Give { leftwards: false })),
+                    (Page::Face, Down) => Some((Page::Above, Motion::PanelIn { from_top: true })),
+                    (Page::Face, Up) => Some((Page::Below, Motion::PanelIn { from_top: false })),
+                    (Page::Status, Right) => Some((Page::Face, Motion::Pages { leftwards: false })),
+                    (Page::Status, Left) => Some((Page::Status, Motion::Give { leftwards: true })),
+                    (Page::Above, Up) => Some((Page::Face, Motion::PanelOut { to_top: true })),
+                    (Page::Below, Down) => Some((Page::Face, Motion::PanelOut { to_top: false })),
+                    _ => None,
+                };
+                assert_eq!(drag(page, direction), expected, "{page:?} {direction:?}");
+            }
+        }
+    }
+
+    /// A drag carries the picture the way the finger went when it began.
+    #[test]
+    fn a_drag_moves_with_the_finger() {
+        for page in PAGES {
+            for direction in DIRECTIONS {
+                if let Some((_, motion)) = drag(page, direction) {
+                    let (x, y) = match direction {
+                        Left => (-10, 0),
+                        Right => (10, 0),
+                        Up => (0, -10),
+                        Down => (0, 10),
+                    };
+                    assert_eq!(motion.along(x, y), 10, "{page:?} {direction:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_press_and_back() {
+        assert_eq!(long_press(Page::Face), Some(Page::Faces));
+        assert_eq!(long_press(Page::Status), Some(Page::Cards));
+        for page in [Page::Above, Page::Below, Page::Faces, Page::Cards] {
+            assert_eq!(long_press(page), None);
+        }
+        // A tap leaves what a long press opened, back to where it came from.
+        for page in PAGES {
+            match long_press(page) {
+                Some(opened) => assert_eq!(tap(opened), Some(page)),
+                None => {}
+            }
+        }
+        for page in [Page::Face, Page::Status, Page::Above, Page::Below] {
+            assert_eq!(tap(page), None);
+        }
+    }
+}
