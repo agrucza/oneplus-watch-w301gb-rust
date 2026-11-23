@@ -1,0 +1,24 @@
+# What can be checked on the PC without the watch: tests for the firmware's
+# pure logic, and a picture of the watch face.
+#
+#   tools/check.sh                      run the tests (and list stack frames)
+#   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
+#
+# The firmware's own source files are used as they are (see src/lib.rs);
+# nothing is copied. This crate is separate from the firmware and builds
+# for the PC (see .cargo/config.toml here).
+[package]
+name = "w301-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+embassy-time = { version = "0.5", features = ["std"] }
+embedded-graphics = "0.8"
+
+# The same upstream commit the firmware is pinned to.
+[patch.crates-io]
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }

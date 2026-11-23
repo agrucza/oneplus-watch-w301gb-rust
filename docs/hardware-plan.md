@@ -24,14 +24,14 @@ runs its own stack. Each chip below hangs off one of them.
 | 1 | eMMC, ~3.6 GB, four FAT32 volumes | SDMMC1 (PC8-12, PD2) | none | works at the stock bus settings (4-bit, 48 MHz), reads and writes up to 64 sectors per command |
 | 2 | Cypress CYW20721 Bluetooth | USART3 3 Mbaud (PC4, PC5, PB13, PB14), PB2, PC6, PB9, PC7 | `cypress/appdriver.bin`, `minidriver.bin` | works for existing pairings |
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
-| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: status screen, one frame per second, brightness, blanking by button and by wrist gesture |
+| 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: frames in step with the panel, two frame buffers, only what changed is drawn, hardware blitter, watch face and status page, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
-| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | works: finger position and events |
+| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags acted on in 2 of the stock app's 4 directions. Open: up and down, long press action, covering hand, sleep and wake (see 3.1) |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
 | 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: calibrated lux, automatic brightness as in the stock app |
-| 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display |
+| 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display. The Apollo's key logic is read; short presses of the lower one are counted on our side |
 | 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
 | 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth with time zone, shown on screen |
 | 14 | Log UART | LPUART1 (PG7, PG8) | none | not used |
@@ -99,7 +99,7 @@ bus beyond the table.
 Effort is relative: S = an evening like the PSRAM, M = like the Apollo
 link, L = several sessions.
 
-### 3.1 Touch controller (item 6) - done, refinements left
+### 3.1 Touch controller (item 6) - positions done, gestures partly
 
 **Measured:** a Cypress/Parade TrueTouch controller on I2C3 (PC0 clock, PB4
 data, 400 kHz) at address 0x24. Reset is PF13 (active low), the interrupt
@@ -114,7 +114,8 @@ report carries the event per finger (down, move, lifted); reports come about
 every 15 ms while a finger is on the glass.
 
 `drivers::touch` resets the chip, logs its description and system
-information and returns finger events; the app marks each touch with a dot.
+information and returns finger events. A lift never swallows the place
+reported just before it: if both are waiting, the place is handed out first.
 The messages sent to the chip are byte for byte the stock app's (driver at
 `0x08077C74` to `0x08079270`).
 
@@ -124,36 +125,150 @@ command is the stock one, but the chip never was in that state).
 A finger on the glass also shades the light sensor, so the brightness
 drops a little while touching.
 
+**What the stock app does with touch** (B.70, read 2026-11-22. "Checked"
+means the instructions at the address were read twice, independently;
+the rest was read once and is marked "one reading". Not read: about 90
+of the other screens' own touch handlers.)
+
+Below the user interface:
+
+- **One finger.** The driver stores up to two touches of a report
+  (`0x80790E2` to `0x8079162`, checked), the touch task drops reports
+  with three or more (one reading), and the routine the interface
+  samples the touch with takes only the first one's position and
+  "pressed or not" (`0x819C79C`, checked).
+- **A covering hand** is bit 5 of the report byte that also holds the
+  touch count: "Large Object detected" (`0x8079082`, checked). One such
+  report switches the display off through the "cover off" path, if
+  always-on mode is off (one reading: `0x8034178`, `0x8022C6E`,
+  `0x8033DB0`). No count or timing in the app.
+- **A touch restarts the display's switch-off timer** (one reading:
+  flag 0x4000, `0x803402C`).
+- **The chip sleeps with the display**: deep sleep on every display
+  suspend and during NFC card reads, woken when the display comes on
+  (one reading: `0x8042648`, `0x8042670`). Entering sends `05 00 01 08`
+  and waits up to 500 ms for an acknowledging report, three tries. So
+  the chip's wake-up report (kind 4), which would switch the display
+  on, normally cannot come on this build. No tap-to-wake or
+  double-tap-to-wake setting was found.
+- **A report-rate check**: after a press of over half a second with far
+  fewer reports than expected, the chip is reset (one reading:
+  `0x8078F60`).
+
+In the user interface (the vendor's layer over TouchGFX,
+`FrontendApplication`):
+
+- **Four directions, not eight.** Once the finger is 3 pixels from where
+  it went down, the drag is locked to horizontal if it moved further
+  sideways, else to vertical, and the other axis is pinned to the press
+  position for the rest of the touch (`0x8047780` to `0x80477B0`,
+  checked). Before the lock no drag is passed on.
+- **Speed** is three times the movement between the last two samples;
+  on release that becomes a horizontal or vertical swipe with that speed
+  (`0x8047756` to `0x8047778` checked; release handling one reading,
+  `0x80475F8`). No least speed and no ageing at this level.
+- **No long press, double tap, edge or two-finger handling** at this
+  level (one reading). A press time is stored and never read.
+
+On the watch face (63 dials share one set of handlers; one reading
+unless marked):
+
+| Gesture | What it does | Threshold |
+|---|---|---|
+| Left / right | pages side by side: the dial, then cards. Left goes on, right goes back; at the ends the page gives 50 pixels and springs back | a third of the width moved, or speed over 40, which is 14 pixels between the last two samples (`0x80F8CE8`, `0x80F8D00`: constants checked) |
+| Down | pulls a panel down from above the picture; only on the dial page | half the height moved, or speed over 30, which is over 10 pixels between samples (`0x80F9324`: constants checked) |
+| Up | pulls a panel up from below; only on the dial page | the same |
+| Long press | on the dial page: goes to screen 0x4B (probably choosing a dial); on a card: to screen 0x3F1 (probably editing cards) | 60 ticks pressed without a drag, so under 3 pixels of movement (`0x80F6F80`, checked). The tick rate was not determined; at the panel's frame rate that is about a second |
+| Tap | a per-dial routine that does nothing on 61 of the 63 dials | released within 60 ticks without a drag |
+| Double tap | none found | |
+| Swipe from the edge | none found; no handler compares the press position with the edge | |
+
+Which of the two panels is notifications and which quick settings was
+not determined. Elsewhere: on the launcher a drag of 41 pixels to the
+right goes back to the watch face (`0x8118852`, one reading).
+
+**Ours against that** (`services::gestures`, 2026-11-22):
+
+| | Stock | Ours |
+|---|---|---|
+| Fingers | one | one |
+| Drag begins after | 3 pixels, then locked to one of 4 directions | 14 pixels (our own number), no direction at all |
+| Left / right on the face | pages | page pull: yes |
+| Up / down on the face | two panels | nothing |
+| Page change finishes at | a third of the width, or 14 pixels a sample | a third of the width, or 400 pixels a second (our own number) |
+| Elastic end | 50 pixels | none: a drag towards no page does nothing |
+| Long press | 60 ticks, opens a screen | 0.6 s (our own number), only logged |
+| Tap | per dial | dots on the status page |
+| Covering hand | display off | the bit is not read |
+| Touch restarts the switch-off timer | yes | no such timer yet |
+| Chip sleeps with the display | yes | never |
+
+The recogniser's tests run on the PC (`tools/host`).
+
 Remaining:
-1. Gestures: tap, swipe, long press.
-2. Sleep and wake: the stock app has a deep-sleep command pair and a
-   wake-up report (kind 4).
-3. The stock app's settings after start (`0x0807857A`) and its "underwater
+1. The recogniser as in the stock app: lock at 3 pixels to one of four
+   directions, speed from the last samples, long press by ticks; with a
+   test for each direction.
+2. On the watch face: up and down panels, the elastic end, long press
+   opening a screen.
+3. The covering hand: read the bit, switch the display off.
+4. The chip's deep sleep with the display, and waking it; belongs with
+   blanking and low power.
+5. The stock app's settings after start (`0x0807857A`) and its "underwater
    mode".
-4. Firmware update of the chip from `tp_firmware.bin` (only if ever needed).
+6. Read: the other screens' touch handlers, the tick rate, which panel
+   is which, and the screens 0x3EB and 0x3ED that get TouchGFX's own
+   events.
+7. Firmware update of the chip from `tp_firmware.bin` (only if ever needed).
 
 ### 3.2 Buttons (item 11) - done
 
 **Measured:** the upper button is PC13 (pull-up, pressed reads low). The
-lower button is wired to the Apollo, which reports it in message kind 51:
-pressed, released, clicked, and long press after 1.5 s. PA0, once
-suspected to be a button, is the touch controller's interrupt line (3.1).
+lower button is wired to the Apollo, which reports it in message kind 51.
+PA0, once suspected to be a button, is the touch controller's interrupt
+line (3.1).
+
+**How the Apollo makes its key events** (read in its firmware: edge
+handler `0x40FAC`, timer callback `0x40F00`, sender `0x40CF8`; not
+checked: that the image read is the version running in the watch, but the
+timings in the log fit):
+
+| Event | When |
+|---|---|
+| 0 released, 1 pressed | on the edges |
+| 2 clicked | 300 ms after a release, from a timer, if the button was held under 800 ms and is not pressed again in that time |
+| 3 double click | in place of the second release, if the second press came within 300 ms and was let go within 300 ms; no "clicked" for either press |
+| 4 long press | held 1.5 s |
+| 5 very long press | held 5 s |
+
+Consequences, all seen on the watch:
+
+- Quick presses are merged; a second press held longer than 300 ms gives
+  one "clicked" and the first press counts for nothing.
+- A press held between 0.8 and 1.5 s gives pressed and released only.
+- The button bounces now and then. A second release report while none is
+  expected stops the click timer, and the "clicked" that was due never
+  comes (in the log: two releases with the same Apollo time).
+
+So wherever every press matters, short presses are counted on our side
+from the press and release reports (`Apollo::take_short_presses`): a press
+ended by a release or a double click after 10 to 800 ms by the Apollo's
+clock. Measured: 28 presses as fast as possible gave 28 steps, where the
+Apollo sent a single "clicked".
 
 **In use:** a click of the upper button (released within 800 ms) blanks
-and shows the display; a click of the lower one steps the brightness mode.
+and shows the display; a short press of the lower one steps the
+brightness mode; a long press of the lower one starts and stops a
+heart-rate measurement.
 
 Remaining:
 1. Long-press detection for the upper button, matching what the Apollo
    does for the lower one.
 2. A long hold as a "return to stock" gesture that does not depend on
    Bluetooth.
+3. What the stock app does with the double click and the very long press.
 
-### 3.3 Display, remaining work (item 4) - M
-
-**Works (measured):** panel on with the stock app's values, framebuffer in
-the PSRAM, drawing with `embedded-graphics`, a status screen redrawn and
-sent once a second, brightness (command `0x51`) and blanking (display off /
-on commands) from the buttons.
+### 3.3 Display (item 4) - pipeline done; one open limit
 
 **How the stock app sends pictures** (read in B.70; its display layer is
 TouchGFX, as its assertion texts show):
@@ -167,40 +282,79 @@ TouchGFX, as its assertion texts show):
   (464,896 bytes); before a frame the display controller is pointed at
   the other one (`0x080ABBD0`, `0x080ABC0A`).
 - It reckons with up to 60 frames a second (`0x080ABDDE`).
+- It draws with the chip's hardware blitter (DMA2D; its base address is
+  referenced at `0x0808EE14`).
 
-Done and measured (2026-11-22):
+**What is built** (all measured on the watch, 2026-11-22):
 
-- Frames are started on the tearing-effect pulse and the tear scanline is
-  set as in the stock app. The same picture sent 120 times: 2040 ms, 58
-  frames a second, every one in step with the panel.
-- Two frames in the PSRAM, the second where the stock app has its own.
-  A picture is drawn into the one that is not shown, then presented: on
-  the pulse the display controller is pointed at it (host off, new
-  address, immediate reload, host on, as at `0x080ABC0A`) and the frame is
-  requested. `Panel::present` returns while the frame travels, so the next
-  picture is drawn meanwhile. Panel commands wait for a frame in transit.
-- Speed with the placeholder status screen (nine lines of text, drawn
-  with embedded-graphics): drawing takes about 29 ms a picture. Drawing,
-  sending and waiting: 19 pictures a second. Drawing while the frame
-  travels: 29 a second, one every second pulse.
+- **Frames in step with the panel.** The tear scanline is set as in the
+  stock app, and the tearing-effect pulse starts the frame in the DSI
+  interrupt handler, as the stock app does: host off, the display
+  controller pointed at the new frame, immediate reload, host on, frame
+  requested. The link carries 58 frames a second.
+- **Two frames in the PSRAM**, the second where the stock app has its
+  own, and two spare frames behind them for kept pictures. A picture is
+  drawn into the frame that is not shown, then presented;
+  `Panel::present` returns while the frame travels.
+- **Only what changed is drawn** (`services::damage`): a list of changed
+  rectangles for each of the two frames (96 entries; more than that
+  repaints the whole picture). A page is a set of elements, each with a
+  rectangle, a key that says what it shows, and a drawing routine; an
+  element is redrawn when its key changes.
+- **The blitter** (`services::canvas`, through the HAL's DMA2D driver)
+  fills rectangles of 320 pixels and more, copies frames, and blends
+  text. Measured: filling 22 ns a pixel against the processor's 116,
+  copying 49 against 245, about 30 us for one operation in all. The
+  driver's operation must be asked exactly twice with the blitter's own
+  flags watched in between; asking again and again restarts a transfer
+  that has just finished. An operation that has not finished after 50 ms
+  is aborted, and the processor draws from then on (logged).
+- **Text from character bitmaps** (`services::font`, data generated by
+  `tools/mkfont.py`): coverage bitmaps of one byte a pixel, DejaVu Sans
+  Mono Bold in 10 x 19, 12 x 24 and 16 x 33, blended into the frame by
+  the blitter, one operation a character. The status page drawn from
+  scratch: 29 ms (65 ms with the library's fonts); an update of it:
+  1.6 ms.
+- **A watch face** (`app::face`) as the real workload: three rings for
+  hours, minutes and seconds with soft edges, seven-segment time, date,
+  status line, two dials and moving marks. About 5 to 6 ms of drawing a
+  picture, a picture every 66 ms by choice; its first full picture takes
+  about 100 ms.
+- **Page changes follow the finger** (`app.rs`): the picture on screen
+  and the other page are kept in the spare frames, and every picture of
+  the change is put together from the two with two blitter copies. After
+  the finger lets go, the change runs out or falls back at the panel's
+  rate (16 to 22 ms a picture).
 
-So the link is at the stock level and drawing is what limits the rate.
-What was tried: handing text to the frame a rectangle at a time instead
-of pixel by pixel changed nothing (31 ms), so the time is not in placing
-pixels. Not yet measured: how much of it is the cost of writing to the
-PSRAM (the memory test suggests roughly 0.15 to 0.2 us a word) and how
-much the library's work on the font. The stock app draws with the chip's
-hardware blitter (DMA2D; its base address is referenced at `0x0808EE14`).
+**The open limit: nothing may touch frame memory while a frame travels.**
+A frame takes about 17 ms to reach the panel. Drawing or copying in that
+time disturbed the picture: the status page shook and page pulls showed
+artifacts, as soon as the display task drew right after presenting. With
+a wait for the travelling frame before every access (`Panel::settle`) the
+picture is clean. How the disturbance comes about is not understood: the
+display controller reads the frame from the PSRAM while it travels, and
+drawing uses the same memory bus, but the counter for the display
+controller's underrun and transfer-error flags has only run with the
+wait in place, where it reads 0.
+
+The consequence: anything that redraws a large area lands on every
+second pulse of the panel. Under the finger a picture comes every 34 ms.
+The stock app has the same memory and bus; how it arranges drawing
+around its frames has not been read.
 
 Remaining:
-1. Drawing speed: measure filling and copying with the processor against
-   the hardware blitter, then build the drawing layer for a real
-   interface on what is faster.
-2. Redrawing when something changes instead of once a second.
-3. Full power-down and power-up with the stock sequences (`0x08039464`,
+1. The limit above: one run with the wait off and the counter on, then
+   read how the stock app (TouchGFX) times its drawing against its frames.
+2. The pause before a pulled page starts to move: 29 ms towards the
+   status page, about 120 ms towards the face (its 180 soft ring
+   segments drawn from scratch). Keeping page pictures would remove it.
+3. A shared "page of elements" loop before a second real screen, and
+   the ring and digit routines in a shared graphics module.
+4. Scrolling lists.
+5. Full power-down and power-up with the stock sequences (`0x08039464`,
    `0x080397E2`); blanking keeps the panel powered. Belongs with low power.
-4. Larger fonts and a real watch face.
-5. Always-on mode (`lcd_alwayson` in the stock strings): later.
+6. Always-on mode (`lcd_alwayson` in the stock strings): later.
+7. The stage timing in the log can go once it is no longer needed.
 
 ### 3.4 Ambient light sensor (item 10) - done
 
@@ -602,10 +756,50 @@ Would give a live log without Bluetooth.
 | Robust update path | Today a broken image falls back to stock; a second slot (`packetB`) could hold a known-good Rust image | M |
 | Factory data file | Address and serial are in `0:flash_device.txt`; never write to volume 0 | S |
 
+### How the firmware is put together (2026-11-22)
+
+Two tasks on one executor. The display task owns the panel, the blitter,
+the touch controller and the gestures; the main task has the Apollo,
+Bluetooth, the buttons, the light sensor and the log file. They exchange
+values and a short queue of events through `app::shared`.
+
+A task that is working is not interrupted by the other, so a short wait
+in one can last as long as the other works in one stretch (over 100 ms
+for a whole page). Two things follow from that:
+
+- What has to happen within a fraction of a millisecond belongs in an
+  interrupt handler (the frame start, see 3.3).
+- A block exchange with the Apollo and a stretch of drawing do not begin
+  while the other is under way (`services::turn`).
+
+**The stack** is the 64 KB at the bottom of the RAM, so running out of it
+stops the processor instead of overwriting data. It did run out once:
+`Screen` held about 13 KB of tables and is handed over by value while the
+firmware starts, and the function doing that reserved 54 KB. Rules since
+then:
+
+- Bulky state lives in statics, not in objects that are moved.
+- `boot::stack` fills the unused stack with a pattern at start; the log
+  shows the most ever used twice a minute. Measured with two tasks:
+  21,184 of 65,536 bytes.
+- Before an image that adds sizeable data goes to the watch, the stack
+  reserved by each function of the build is listed and looked at
+  (`tools/stackframes.py`).
+
+**Checks without the watch:** `tools/check.sh` runs the tests of the
+firmware's pure logic on the PC and lists the build's largest stack
+frames. The tests live in `tools/host`, a small crate of its own that
+uses the firmware's source files as they are; so far it covers the
+gesture recogniser. It also holds a program that draws the watch face
+into a picture file (`cargo run --bin preview`). Not covered by tests
+yet: change tracking, and the read-ahead and write collecting of the
+storage layer.
+
 ## 5. Suggested order
 
-Done so far: buttons (3.2), drawing layer and brightness (3.3), light
-sensor and automatic brightness (3.4), touch positions (3.1), real-time
+Done so far: buttons (3.2), display pipeline and brightness (3.3), light
+sensor and automatic brightness (3.4), touch positions and the first
+gestures (3.1), real-time
 clock with time zone (3.12), Bluetooth address from factory data (3.8),
 Apollo start-up through time, name, setup status, screen status and
 raise-to-wake, wear detection, single heart-rate measurement, vibration
@@ -617,10 +811,13 @@ before adding new chips.
 1. **Full speed underneath:** 120 MHz system clock (section 4), PSRAM
    timing (3.11), eMMC at 48 MHz on four data lines with multi-sector
    reads and writes (3.10): done.
-2. **Display pipeline** (3.3): frames in step with the panel and two
-   frame buffers: done. Left: drawing speed (hardware blitter).
-3. **Finish the half-done STM32 pieces:** touch (3.1), upper button long
-   press (3.2), clock backup file (3.12).
+2. **Display pipeline** (3.3): frames in step with the panel, two frame
+   buffers, change tracking, blitter, text, a watch face, page changes
+   under the finger: done. Left: the limit on drawing while a frame
+   travels, and the shared page loop.
+3. **Finish the half-done STM32 pieces:** the rest of touch (3.1: the
+   gestures not covered, sleep, settings, underwater mode), upper button
+   long press (3.2), clock backup file (3.12).
 4. **Low power** (section 4): after that the watch can be worn.
 5. Alongside: the remaining Apollo settings (3.5).
 6. Then: audio (3.6), GPS, pairing, BLE, NFC.
@@ -628,8 +825,10 @@ before adding new chips.
 ## 6. Open questions
 
 - What PF4 feeds (switched together with the touch reset).
-- Why the lower button's first press after a display command once came
-  without a "clicked" message from the Apollo.
+- Why drawing while a frame travels disturbs the picture, and how the
+  stock app avoids or lives with it (3.3).
+- Whether the Apollo image that was read for the button logic is the
+  version running in the watch (3.2).
 - What SPI2 and the outputs PA4 and PB3 are used for (PB1 is the audio
   codec's supply enable on board revisions 1 and 3).
 - Whether the device at 0x36 on I2C2 is the speaker amplifier, and which

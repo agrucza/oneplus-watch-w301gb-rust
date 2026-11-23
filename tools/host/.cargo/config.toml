@@ -1,0 +1,4 @@
+# The firmware's own configuration (one folder up the tree) builds for the
+# watch's processor; this crate is for the PC.
+[build]
+target = "x86_64-unknown-linux-gnu"
