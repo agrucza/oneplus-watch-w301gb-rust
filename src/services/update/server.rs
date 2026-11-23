@@ -142,8 +142,8 @@ impl Server {
 
     /// Wait up to 20 ms for a packet from the Bluetooth chip and deal with
     /// it. An install or a return request ends in a reset from in here.
-    pub async fn step(&mut self, link: &mut Link, log: &mut Log) -> Activity {
-        let Some(packet) = link.receive(Duration::from_millis(20)).await else {
+    pub async fn step(&mut self, link: &mut Link, wait: Duration, log: &mut Log) -> Activity {
+        let Some(packet) = link.receive_idle(wait).await else {
             if link.rx_errors != self.rx_errors_logged {
                 self.rx_errors_logged = link.rx_errors;
                 let _ = writeln!(log.stamp(), "cypress: {} UART receive errors so far", self.rx_errors_logged);

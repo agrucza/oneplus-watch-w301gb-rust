@@ -190,6 +190,11 @@ impl Taps {
     }
 
     /// Call often: gives out the click of a press no second one followed.
+    /// A press is waiting to be told apart from a double click (`tick`).
+    pub fn waiting(&self) -> bool {
+        self.first_at.is_some()
+    }
+
     pub fn tick(&mut self, now_ms: u64) -> Option<Press> {
         match self.first_at {
             Some(first) if now_ms.saturating_sub(first) > DOUBLE_MS => {

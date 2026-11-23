@@ -590,6 +590,16 @@ impl WearView {
     }
 }
 
+/// How long the main loop waits for something from the Bluetooth chip
+/// before its next pass: while anything is under way, and while the
+/// display is dark and nothing is. The second is bounded by what the
+/// loop does by the clock: the light sensor every 250 ms and the
+/// Apollo's heartbeat every second.
+/// How long the display task waits for news while the display is dark.
+const DARK_WAIT: Duration = Duration::from_millis(500);
+const BUSY_WAIT: Duration = Duration::from_millis(20);
+const QUIET_WAIT: Duration = Duration::from_millis(200);
+
 /// The display goes dark after this long without a finger or a button.
 /// A value of our own; it becomes a setting once there are settings.
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1600,6 +1610,8 @@ impl Sensors {
 async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! {
     let mut log = Log::get();
     let mut gestures = Gestures::new();
+    // How often the loop went round, for the log.
+    let (mut display_passes, mut display_passes_since) = (0u32, Instant::now());
     // The touch controller did not confirm its sleep command.
     let mut touch_sleep_failed = false;
     loop {
@@ -1681,8 +1693,23 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             screen.idle(&mut log).await;
             screen.update(state.readings.as_ref(), state.lux, state.bluetooth_connected, state.measuring_heart, &mut log).await;
         }
-        // Let the main task have its turn even when nothing was presented.
-        Timer::after_millis(1).await;
+        display_passes += 1;
+        if display_passes_since.elapsed() >= Duration::from_secs(30) {
+            let _ = writeln!(log.stamp(), "display task: {} passes in 30 s", display_passes);
+            display_passes = 0;
+            display_passes_since = Instant::now();
+        }
+        // Dark, but the touch controller is still to be put to sleep:
+        // that is the next pass's business.
+        let touch_settled = touch_sleep_failed || touch.as_ref().is_none_or(|touch| touch.asleep());
+        if screen.visible || !touch_settled {
+            // Let the main task have its turn even when nothing was presented.
+            Timer::after_millis(1).await;
+        } else {
+            // Dark: nothing to do until the main task has news (a button,
+            // a wrist gesture, a request to switch off).
+            shared::wait_event(DARK_WAIT).await;
+        }
     }
 }
 
@@ -1728,6 +1755,9 @@ async fn main_loop(
     let (mut hold, mut taps) = (Hold::new(), Taps::new());
     // When the STM32 switches itself off, after the Apollo was asked to.
     let mut power_off_at: Option<u64> = None;
+    // How often the loop went round, for the log.
+    let (mut passes, mut passes_since) = (0u32, Instant::now());
+    crate::hal::wake::start();
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
         // pass - but not while a package is streaming in.
@@ -1846,7 +1876,25 @@ async fn main_loop(
             }
         }
 
-        let activity = server.step(&mut link, &mut log).await;
+        // With the display dark and nothing under way, the pass after
+        // this one can wait: a button, the Apollo or Bluetooth ends the
+        // wait at once (`hal::wake`), as does anything arriving from the
+        // Bluetooth chip.
+        let quiet = has_screen
+            && !shared::visible()
+            && !buttons.upper_pressed()
+            && buttons.settled()
+            && !taps.waiting()
+            && power_off_at.is_none()
+            && !server.transferring();
+        passes += 1;
+        if passes_since.elapsed() >= Duration::from_secs(30) {
+            let (button, apollo_edges, bluetooth) = crate::hal::wake::take_counts();
+            let _ = writeln!(log.stamp(), "main loop: {} passes in 30 s; line changes: button {}, Apollo {}, Bluetooth {}", passes, button, apollo_edges, bluetooth);
+            passes = 0;
+            passes_since = Instant::now();
+        }
+        let activity = server.step(&mut link, if quiet { QUIET_WAIT } else { BUSY_WAIT }, &mut log).await;
 
         // Nothing is arriving: a good moment to save what was logged, so
         // that it survives if the app dies. Not during a transfer, where the

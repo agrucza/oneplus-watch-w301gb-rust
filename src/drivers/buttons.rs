@@ -37,6 +37,12 @@ impl Buttons {
         self.pressed
     }
 
+    /// The last two samples agree with the state handed out: no change
+    /// is on its way.
+    pub fn settled(&self) -> bool {
+        self.last_sample == self.pressed
+    }
+
     /// Sample the button; a change is logged and returned.
     pub fn poll(&mut self, log: &mut Log) -> Option<ButtonEvent> {
         let low = self.upper.is_low();

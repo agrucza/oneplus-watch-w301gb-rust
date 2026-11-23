@@ -28,6 +28,7 @@ use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::usart::{self, RingBufferedUartRx, StopBits, Uart, UartTx};
 use embassy_stm32::{bind_interrupts, dma, peripherals, Peri};
+use embassy_futures::select::{select, Either};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 
 use crate::services::log::Log;
@@ -144,6 +145,18 @@ impl Link {
 
     /// Wait up to `limit` for the next packet.
     pub async fn receive(&mut self, limit: Duration) -> Option<Packet<'_>> {
+        self.receive_until(limit, false).await
+    }
+
+    /// As `receive`, but a change on one of the wake lines (`hal::wake`:
+    /// upper button, Apollo, the chip's interrupt line) ends the wait as
+    /// well, with `None`. For the main loop's idle wait only: an answer
+    /// that is being waited for must not be given up for a button.
+    pub async fn receive_idle(&mut self, limit: Duration) -> Option<Packet<'_>> {
+        self.receive_until(limit, true).await
+    }
+
+    async fn receive_until(&mut self, limit: Duration, edge_ends: bool) -> Option<Packet<'_>> {
         // Drop the packet handed out last time.
         self.buf.copy_within(self.consumed..self.len, 0);
         self.len -= self.consumed;
@@ -175,7 +188,16 @@ impl Link {
             }
             let wait = (end - now).min(Duration::from_millis(100));
             let free = self.len..self.buf.len();
-            match with_timeout(wait, self.rx.read(&mut self.buf[free])).await {
+            let read = if edge_ends {
+                match with_timeout(wait, select(self.rx.read(&mut self.buf[free]), crate::hal::wake::edge())).await {
+                    Ok(Either::First(read)) => Ok(read),
+                    Ok(Either::Second(())) => return None,
+                    Err(timeout) => Err(timeout),
+                }
+            } else {
+                with_timeout(wait, self.rx.read(&mut self.buf[free])).await
+            };
+            match read {
                 Ok(Ok(n)) => self.len += n,
                 Ok(Err(_)) => {
                     // The receiver restarts on the next read. Give the rest of

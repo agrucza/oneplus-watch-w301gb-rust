@@ -76,6 +76,11 @@ pub fn send(event: Event) {
     let _ = EVENTS.try_send(event);
 }
 
+/// Wait until there is an event for the screen, `limit` at most.
+pub async fn wait_event(limit: embassy_time::Duration) {
+    let _ = embassy_time::with_timeout(limit, EVENTS.ready_to_receive()).await;
+}
+
 /// The next event for the screen, if there is one.
 pub fn next_event() -> Option<Event> {
     EVENTS.try_receive().ok()

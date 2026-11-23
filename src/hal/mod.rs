@@ -8,3 +8,4 @@ pub mod power;
 pub mod reg;
 pub mod rtc;
 pub mod sdmmc;
+pub mod wake;
