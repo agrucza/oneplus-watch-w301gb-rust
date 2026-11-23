@@ -669,3 +669,148 @@ mod power {
         assert!(CHOICES.contains(&Choice::PowerOff));
     }
 }
+
+#[cfg(test)]
+mod face {
+    use crate::app::face::{draw, key, rect, whole, State, Time, ELEMENTS, SIZE};
+    use crate::services::font::Paint;
+    use embedded_graphics::pixelcolor::Rgb565;
+    use embedded_graphics::prelude::*;
+    use embedded_graphics::primitives::Rectangle;
+
+    /// A picture that only remembers which pixels were drawn to.
+    struct Touched(Vec<bool>);
+
+    impl OriginDimensions for Touched {
+        fn size(&self) -> Size {
+            Size::new(SIZE as u32, SIZE as u32)
+        }
+    }
+
+    impl DrawTarget for Touched {
+        type Color = Rgb565;
+        type Error = core::convert::Infallible;
+        fn draw_iter<I: IntoIterator<Item = Pixel<Rgb565>>>(&mut self, pixels: I) -> Result<(), Self::Error> {
+            for Pixel(p, _) in pixels {
+                assert!((0..SIZE).contains(&p.x) && (0..SIZE).contains(&p.y), "drawn outside the picture at {p:?}");
+                self.0[(p.y * SIZE + p.x) as usize] = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl Paint for Touched {}
+
+    fn states() -> Vec<State> {
+        let mut all = Vec::new();
+        for (hour, minute, second, weekday, day, month) in [(23, 42, 37, 2, 24, 11), (0, 0, 0, 1, 1, 1), (8, 8, 59, 3, 31, 5), (19, 51, 15, 7, 9, 9)] {
+            for (battery, heart) in [(Some((62, false)), Some(62)), (Some((100, true)), Some(188)), (Some((0, false)), None), (None, None)] {
+                all.push(State {
+                    time: Some(Time { year: 2026, month, day, weekday, hour, minute, second }),
+                    millis: 400,
+                    ticks: 12_345,
+                    battery,
+                    heart,
+                    measuring: heart.is_some(),
+                    bluetooth: true,
+                    worn: Some(true),
+                    temperature: Some(268),
+                });
+            }
+        }
+        // A clock that was never set.
+        all.push(State { time: None, ..all[0] });
+        all
+    }
+
+    /// The damage tracking repaints an element's rectangle when its key
+    /// changes, and nothing else: whatever an element draws outside its
+    /// rectangle would be left behind.
+    #[test]
+    fn every_element_draws_inside_its_rectangle() {
+        for state in states() {
+            for n in 0..ELEMENTS {
+                let mut picture = Touched(vec![false; (SIZE * SIZE) as usize]);
+                draw(&mut picture, &whole(), n, &state);
+                let r = rect(n, &state);
+                for y in 0..SIZE {
+                    for x in 0..SIZE {
+                        if picture.0[(y * SIZE + x) as usize] {
+                            assert!(r.contains(Point::new(x, y)), "element {n} drew at ({x}, {y}), outside {r:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_rectangle_is_inside_the_picture() {
+        for state in states() {
+            for n in 0..ELEMENTS {
+                let r = rect(n, &state);
+                assert_eq!(r.intersection(&whole()), r, "element {n}: {r:?}");
+            }
+        }
+    }
+
+    /// Drawing with a clip touches nothing outside the clip.
+    #[test]
+    fn a_clip_is_kept() {
+        let state = states()[0];
+        let clip = Rectangle::new(Point::new(150, 120), Size::new(160, 130));
+        let mut picture = Touched(vec![false; (SIZE * SIZE) as usize]);
+        for n in 0..ELEMENTS {
+            draw(&mut picture, &clip, n, &state);
+        }
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                if picture.0[(y * SIZE + x) as usize] {
+                    assert!(clip.contains(Point::new(x, y)), "drawn at ({x}, {y}), outside the clip");
+                }
+            }
+        }
+    }
+
+    /// What an element shows depends on nothing but what its key covers:
+    /// two states with the same key must give the same picture. Checked
+    /// for the fields the face does not show at all.
+    #[test]
+    fn keys_ignore_what_the_face_does_not_show() {
+        let a = states()[0];
+        let b = State { millis: 900, ticks: 99, bluetooth: false, worn: None, temperature: None, measuring: false, ..a };
+        for n in 0..ELEMENTS {
+            assert_eq!(key(n, &a), key(n, &b), "element {n}");
+            assert_eq!(rect(n, &a), rect(n, &b), "element {n}");
+        }
+    }
+}
+
+/// The screen is round: what a page puts into the corners of the square
+/// picture is not seen.
+#[cfg(test)]
+mod round {
+    use crate::app::theme::{C, SIZE};
+    use crate::app::{power, status};
+    use embedded_graphics::primitives::Rectangle;
+
+    fn on_the_glass(r: &Rectangle) -> bool {
+        let (x0, y0) = (r.top_left.x, r.top_left.y);
+        let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+        [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].iter().all(|&(x, y)| (x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2))
+    }
+
+    #[test]
+    fn status_rows_are_on_the_glass() {
+        for row in 0..status::LINES {
+            assert!(on_the_glass(&status::line_rect(row)), "row {row}: {:?}", status::line_rect(row));
+        }
+    }
+
+    #[test]
+    fn power_rows_are_on_the_glass() {
+        for n in 0..power::CHOICES.len() {
+            assert!(on_the_glass(&power::row_rect(n)), "row {n}");
+        }
+    }
+}

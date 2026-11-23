@@ -1,16 +1,24 @@
-//! The watch face: three rings of sixty segments that fill up, all drawn
-//! the same way - the outer one for the seconds, then the minutes, then
-//! the hours (five segments to the hour) - and in
-//! the middle the time in segment digits with the date, two small dials
-//! (battery and heart rate) and a strip of bars.
+//! The watch face, after the "Nightwatch OS" design (round kit, screen 01):
+//! sixty ticks around the rim that light up with the seconds and a dot
+//! that goes round with them, the hours in red over the minutes in white,
+//! a date tag above them, an arc for the battery on the left and one for
+//! the steps on the right, two pills below the time, and a line of text
+//! bent along the top and the bottom.
+//!
+//! The design's small text is 9 to 12 pixels, which is under a millimetre
+//! on this panel; labels and values are about 18 pixels here. Its scan
+//! lines and vignette over the whole picture are left out. What the
+//! firmware has no data for yet (steps, unread messages) is shown as
+//! dashes, dimmed.
 //!
 //! The face is a list of elements. Each has a rectangle (`rect`), a number
 //! that stands for what it shows right now (`key`) and a routine that
 //! draws it (`draw`). Whoever shows the face compares the keys with those
 //! of the picture on the screen and repaints only the elements whose key
-//! changed (see `services::damage`). Some elements move; for those the
+//! changed (see `services::damage`). The second dot moves; for it the
 //! rectangle depends on the state, and both the old and the new place
-//! have to be repainted.
+//! have to be repainted. Elements are drawn in the order of their
+//! numbers, so the glow of a digit lies under every digit.
 //!
 //! Nothing in here depends on the watch: it draws into any
 //! `embedded-graphics` target, which is how the preview pictures on the PC
@@ -20,25 +28,22 @@ use core::fmt::Write;
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, Triangle};
 
-use crate::services::font::{Font, Paint};
-use crate::services::font_data::{MEDIUM as TEXT_MEDIUM, SMALL as TEXT_SMALL};
+use crate::services::font::Paint;
+use crate::services::font_data::{
+    NW_HEART, NW_HERO, NW_HERO_GLOW, NW_HERO_GLOW_PAD, NW_LABEL, NW_MESSAGE, NW_MONO, NW_RIM_BOTTOM, NW_RIM_BOTTOM_AT, NW_RIM_TOP, NW_RIM_TOP_AT,
+};
 
-/// The picture is `SIZE` x `SIZE`, round, centred on (`C`, `C`).
-pub const SIZE: i32 = 454;
-const C: i32 = SIZE / 2;
+pub use super::theme::{whole, SIZE};
+use super::theme::{self, rgb, BONE, C, CHROME, CYAN, INK, SIGNAL, SIGNAL_HOT, STEEL, STEEL_2};
 
-const TEAL: Rgb565 = Rgb565::new(0, 56, 27);
-const TEAL_MID: Rgb565 = Rgb565::new(0, 34, 17);
-const TEAL_DIM: Rgb565 = Rgb565::new(0, 13, 7);
-const TEAL_OFF: Rgb565 = Rgb565::new(0, 6, 3);
-const ORANGE: Rgb565 = Rgb565::new(31, 36, 0);
-const ORANGE_OFF: Rgb565 = Rgb565::new(5, 5, 0);
-const RED: Rgb565 = Rgb565::new(31, 10, 4);
+/// The minutes' soft white glow: the design's 25 % of the text colour.
+const BONE_GLOW: Rgb565 = rgb(0x3A3B3C);
 
-/// What the face shows.
+/// What the face shows. Not every face uses all of it.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct State {
     /// Local time; `None` if the clock is not set.
     pub time: Option<Time>,
@@ -59,6 +64,7 @@ pub struct State {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct Time {
     pub year: u16,
     pub month: u8,
@@ -70,80 +76,69 @@ pub struct Time {
     pub second: u8,
 }
 
+
 // --- Elements -----------------------------------------------------------------
 
-/// Sixty segments, one per second: those that have passed are lit, and
-/// the current one fills up as the second goes by.
-const FIRST_SECOND: usize = 0;
-/// Sixty segments, one per minute.
-const FIRST_MINUTE: usize = FIRST_SECOND + 60;
-/// Sixty segments for the twelve hours, five to the hour, so the ring
-/// also shows how far the hour has got; every fifth one, where an hour
-/// begins, is deeper.
-const FIRST_HOUR: usize = FIRST_MINUTE + 60;
-const HOUR_TENS: usize = FIRST_HOUR + 60;
-const HOUR_ONES: usize = HOUR_TENS + 1;
-const MINUTE_TENS: usize = HOUR_ONES + 1;
-const MINUTE_ONES: usize = MINUTE_TENS + 1;
-const COLON: usize = MINUTE_ONES + 1;
-const SECOND_TENS: usize = COLON + 1;
-const SECOND_ONES: usize = SECOND_TENS + 1;
-const DATE: usize = SECOND_ONES + 1;
-const STATUS: usize = DATE + 1;
-/// The dials' bodies stand still; what circles round them are elements
-/// of their own, so that a turn repaints only a small mark.
-const BATTERY_DIAL: usize = STATUS + 1;
-const HEART_DIAL: usize = BATTERY_DIAL + 1;
-const BATTERY_MARK: usize = HEART_DIAL + 1;
-const FIRST_HEART_MARK: usize = BATTERY_MARK + 1;
-const BARS: usize = FIRST_HEART_MARK + 3;
-/// Number of elements.
-pub const ELEMENTS: usize = BARS + 1;
+/// Sixty ticks, one per second: those up to the current second are lit.
+const FIRST_TICK: usize = 0;
+/// The dot that goes round the rim with the seconds.
+const SECOND_DOT: usize = FIRST_TICK + 60;
+/// The red triangle at twelve o'clock.
+const MARKER: usize = SECOND_DOT + 1;
+const RIM_TOP: usize = MARKER + 1;
+const RIM_BOTTOM: usize = RIM_TOP + 1;
+const BATTERY_ARC: usize = RIM_BOTTOM + 1;
+const STEP_ARC: usize = BATTERY_ARC + 1;
+const BATTERY_TEXT: usize = STEP_ARC + 1;
+const STEP_TEXT: usize = BATTERY_TEXT + 1;
+/// The glows of the four big digits, before everything they shine under.
+const FIRST_GLOW: usize = STEP_TEXT + 1;
+const DATE: usize = FIRST_GLOW + 4;
+/// The big digits: hours' tens and ones, minutes' tens and ones.
+const FIRST_DIGIT: usize = DATE + 1;
+const HEART_PILL: usize = FIRST_DIGIT + 4;
+const MESSAGE_PILL: usize = HEART_PILL + 1;
+/// How many elements the face has.
+pub const ELEMENTS: usize = MESSAGE_PILL + 1;
 
-/// The three rings: inner and outer radius. The hours are 20 wide, the
-/// minutes half that and the seconds half of that again, packed against
-/// the edge of the glass.
-const SECOND_RING: (i32, i32) = (221, 226);
-const MINUTE_RING: (i32, i32) = (206, 216);
-const HOUR_RING: (i32, i32) = (181, 201);
-/// Inner radius of the hour ring's segments that begin an hour.
-const HOUR_MARK: i32 = 173;
-/// A segment of the second or minute ring: from and to within its six
-/// degrees, in tenths of a degree.
-const SEGMENT: (i32, i32) = (8, 52);
-
-// Large digits: hours and minutes.
-const BIG: Digit = Digit { w: 46, h: 84, t: 9 };
-const BIG_Y: i32 = 185;
-const BIG_X: [i32; 4] = [103, 161, 247, 305];
-// Small digits: seconds.
-const SMALL: Digit = Digit { w: 22, h: 40, t: 5 };
-const SMALL_Y: i32 = 282;
-const SMALL_X: [i32; 2] = [202, 230];
-/// Where the date and the status line have their top edge.
-const DATE_Y: i32 = 152;
-const STATUS_Y: i32 = 129;
-// The two dials.
-const DIAL_Y: i32 = 302;
-const DIAL_X: [i32; 2] = [140, 314];
-/// The marks circling the dials: inner and outer radius, and their length
-/// in tenths of a degree. Short and far enough out that the rectangle
-/// around a mark never reaches the number in the middle of the dial,
-/// wherever on the circle the mark is: text is costly to draw again.
-const MARK: (i32, i32) = (29, 32);
-const MARK_LENGTH: i32 = 300;
+// Where things are. Angles are tenths of a degree, clockwise from twelve.
+/// Ticks: outer radius, inner radius of every fifth and of the others,
+/// and half their widths as angles.
+const TICK_OUTER: i32 = 217;
+const TICK_INNER: (i32, i32) = (207, 210);
+const TICK_HALF: (i32, i32) = (4, 2);
+/// The second dot's distance from the middle and its radius.
+const DOT: (i32, i32) = (221, 4);
+/// The two arcs: inner and outer radius; the battery's from bottom left
+/// up to top left, the steps' from top right down to bottom right.
+const ARC: (i32, i32) = (176, 184);
+const BATTERY_SPAN: (i32, i32) = (2150, 3250);
+const STEP_SPAN: (i32, i32) = (350, 1450);
+/// A dash of an arc and the gap after it (the design's 4 and 2 pixels).
+const DASH: (i32, i32) = (13, 6);
+/// The two small blocks of text beside the time: left edge of the left
+/// one, right edge of the right one, top of the label, top of the value.
+const SIDE_X: (i32, i32) = (60, 394);
+const SIDE_Y: (i32, i32) = (201, 227);
+const SIDE_WIDTH: i32 = 50;
+/// The top of the date tag.
+const TAG_Y: i32 = 95;
+/// The big digits: left edges, and the tops of the hours and the minutes.
+const DIGIT_X: [i32; 2] = [C - NW_HERO.width as i32 + 1, C - 1];
+const DIGIT_Y: [i32; 2] = [133, 220];
+/// The pills: left edges, top, width, height, and the cut of their corners.
+const PILL_X: [i32; 2] = [149, 231];
+const PILL: (i32, i32, i32, i32) = (309, 74, 30, 7);
 
 /// Which kind of element `n` is, for timing the drawing: 0 = a ring
-/// segment, 1 = a digit or the colon, 2 = a line of text, 3 = a dial,
-/// 4 = a mark circling a dial, 5 = the bars.
+/// segment (ticks, dot, arcs), 1 = a big digit or its glow, 2 = text,
+/// 3 = a pill; 4 and 5 are not used by this face.
 pub fn kind(n: usize) -> usize {
     match n {
-        FIRST_SECOND..HOUR_TENS => 0,
-        HOUR_TENS..DATE => 1,
-        DATE | STATUS => 2,
-        BATTERY_DIAL | HEART_DIAL => 3,
-        BATTERY_MARK..BARS => 4,
-        _ => 5,
+        FIRST_TICK..RIM_TOP | BATTERY_ARC | STEP_ARC => 0,
+        n if (FIRST_GLOW..HEART_PILL).contains(&n) && n != DATE => 1,
+        HEART_PILL | MESSAGE_PILL => 3,
+        _ => 2,
     }
 }
 
@@ -166,254 +161,198 @@ pub fn around(a: &Rectangle, b: &Rectangle) -> Rectangle {
     Rectangle::new(Point::new(left, top), Size::new((right - left) as u32, (bottom - top) as u32))
 }
 
-/// The whole picture.
-pub fn whole() -> Rectangle {
-    Rectangle::new(Point::zero(), Size::new(SIZE as u32, SIZE as u32))
+/// A tick's inner radius and half width.
+fn tick(k: i32) -> (i32, i32) {
+    if k % 5 == 0 { (TICK_INNER.0, TICK_HALF.0) } else { (TICK_INNER.1, TICK_HALF.1) }
 }
 
-/// How much of the current second's segment is filled, in tenths of a
-/// degree (in steps of four).
-fn second_fill(s: &State) -> i32 {
-    (SEGMENT.1 - SEGMENT.0) * s.millis.min(999) as i32 / 1000 / 4 * 4 + 4
+/// The middle of the second dot.
+fn dot_at(s: &State) -> Point {
+    let second = s.time.map_or(0, |t| t.second as i32);
+    let (dx, dy) = direction(second * 60);
+    Point::new(C + dx * DOT.0 / 16384, C + dy * DOT.0 / 16384)
 }
 
-/// Where the mark circling the battery dial begins, in tenths of a degree.
-fn battery_mark(s: &State) -> i32 {
-    spin(s, 3000) as i32 * 20
+/// Which of the four big digits `n` (0 to 3) shows, if the time is known.
+fn digit(n: usize, s: &State) -> Option<u8> {
+    let t = s.time?;
+    let value = if n < 2 { t.hour } else { t.minute };
+    Some(if n % 2 == 0 { value / 10 } else { value % 10 })
 }
 
-/// Where heart mark `n` (0 to 2) begins; they circle the other way, and
-/// faster while a measurement runs.
-fn heart_mark(n: usize, s: &State) -> i32 {
-    3600 - spin(s, if s.measuring { 1000 } else { 4000 }) as i32 * 20 + n as i32 * 1200
+/// The top left corner of big digit `n` (0 to 3).
+fn digit_at(n: usize) -> Point {
+    Point::new(DIGIT_X[n % 2], DIGIT_Y[n / 2])
+}
+
+/// The date as the tag shows it, e.g. "TUE 24 NOV".
+fn date_text(s: &State) -> Label {
+    const DAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+    const MONTHS: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+    let mut label = Label::new();
+    match s.time {
+        Some(t) => {
+            let day = DAYS[(t.weekday as usize + 6) % 7];
+            let month = MONTHS[(t.month as usize + 11) % 12];
+            let _ = write!(label, "{} {:02} {}", day, t.day, month);
+        }
+        None => {
+            let _ = write!(label, "NO CLOCK");
+        }
+    }
+    label
 }
 
 /// The rectangle element `n` covers while it shows `s`.
 pub fn rect(n: usize, s: &State) -> Rectangle {
     match n {
-        FIRST_SECOND..FIRST_MINUTE => {
-            let k = (n - FIRST_SECOND) as i32;
-            segment_box(C, C, SECOND_RING.0, SECOND_RING.1, k * 60 + SEGMENT.0, k * 60 + SEGMENT.1)
+        FIRST_TICK..SECOND_DOT => {
+            let k = (n - FIRST_TICK) as i32;
+            let (inner, half) = tick(k);
+            segment_box(C, C, inner, TICK_OUTER, k * 60 - half, k * 60 + half)
         }
-        FIRST_MINUTE..FIRST_HOUR => {
-            let k = (n - FIRST_MINUTE) as i32;
-            segment_box(C, C, MINUTE_RING.0, MINUTE_RING.1, k * 60 + SEGMENT.0, k * 60 + SEGMENT.1)
-        }
-        FIRST_HOUR..HOUR_TENS => {
-            let k = (n - FIRST_HOUR) as i32;
-            segment_box(C, C, HOUR_MARK, HOUR_RING.1, k * 60 + SEGMENT.0, k * 60 + SEGMENT.1)
-        }
-        HOUR_TENS..=MINUTE_ONES => BIG.rect(BIG_X[n - HOUR_TENS], BIG_Y),
-        COLON => Rectangle::new(Point::new(219, BIG_Y), Size::new(16, BIG.h as u32)),
-        SECOND_TENS | SECOND_ONES => SMALL.rect(SMALL_X[n - SECOND_TENS], SMALL_Y),
-        DATE => text_rect(DATE_Y, &TEXT_MEDIUM, 14),
-        STATUS => text_rect(STATUS_Y, &TEXT_SMALL, 18),
-        BATTERY_DIAL | HEART_DIAL => Rectangle::with_center(Point::new(DIAL_X[n - BATTERY_DIAL], DIAL_Y), Size::new(53, 53)),
-        BATTERY_MARK => segment_box(DIAL_X[0], DIAL_Y, MARK.0, MARK.1, battery_mark(s), battery_mark(s) + MARK_LENGTH),
-        FIRST_HEART_MARK..BARS => {
-            let from = heart_mark(n - FIRST_HEART_MARK, s);
-            segment_box(DIAL_X[1], DIAL_Y, MARK.0, MARK.1, from, from + MARK_LENGTH)
-        }
-        _ => Rectangle::new(Point::new(170, 330), Size::new(114, 26)),
+        SECOND_DOT => Rectangle::with_center(dot_at(s), Size::new(2 * DOT.1 as u32 + 5, 2 * DOT.1 as u32 + 5)).intersection(&whole()),
+        MARKER => Rectangle::new(Point::new(C - 8, 3), Size::new(17, 16)),
+        RIM_TOP => NW_RIM_TOP.rect(NW_RIM_TOP_AT.0, NW_RIM_TOP_AT.1),
+        RIM_BOTTOM => NW_RIM_BOTTOM.rect(NW_RIM_BOTTOM_AT.0, NW_RIM_BOTTOM_AT.1),
+        BATTERY_ARC => segment_box(C, C, ARC.0, ARC.1, BATTERY_SPAN.0, BATTERY_SPAN.1),
+        STEP_ARC => segment_box(C, C, ARC.0, ARC.1, STEP_SPAN.0, STEP_SPAN.1),
+        BATTERY_TEXT => Rectangle::new(Point::new(SIDE_X.0, SIDE_Y.0), Size::new(SIDE_WIDTH as u32, (SIDE_Y.1 - SIDE_Y.0) as u32 + NW_MONO.height as u32)),
+        STEP_TEXT => Rectangle::new(Point::new(SIDE_X.1 - SIDE_WIDTH, SIDE_Y.0), Size::new(SIDE_WIDTH as u32, (SIDE_Y.1 - SIDE_Y.0) as u32 + NW_MONO.height as u32)),
+        FIRST_GLOW..DATE => NW_HERO_GLOW.rect(digit_at(n - FIRST_GLOW).x - NW_HERO_GLOW_PAD, digit_at(n - FIRST_GLOW).y - NW_HERO_GLOW_PAD, 1),
+        // As wide as the widest date, so that a shorter one leaves nothing behind.
+        DATE => theme::tag_rect(C, TAG_Y, "WED 00 MAY"),
+        FIRST_DIGIT..HEART_PILL => NW_HERO.rect(digit_at(n - FIRST_DIGIT).x, digit_at(n - FIRST_DIGIT).y, 1),
+        _ => Rectangle::new(Point::new(PILL_X[n - HEART_PILL], PILL.0), Size::new(PILL.1 as u32, PILL.2 as u32)),
     }
 }
 
-/// A number that changes whenever what element `n` shows changes.
+/// A number that changes exactly when what element `n` shows changes.
 pub fn key(n: usize, s: &State) -> u32 {
-    let t = s.time;
-    let digit = |value: Option<u8>, tens: bool| value.map_or(10, |v| if tens { v / 10 } else { v % 10 }) as u32;
-    // A ring's segment: 0 = still to come, 1 = passed, 2 = the current one.
-    let ring = |index: usize, now: Option<u8>| match now {
-        Some(now) if index as u8 == now => 2,
-        Some(now) if (index as u8) < now => 1,
-        _ => 0,
-    };
     match n {
-        FIRST_SECOND..FIRST_MINUTE => match ring(n - FIRST_SECOND, t.map(|t| t.second)) {
-            // The current one changes as it fills.
-            2 => 2 + second_fill(s) as u32,
-            other => other,
-        },
-        FIRST_MINUTE..FIRST_HOUR => ring(n - FIRST_MINUTE, t.map(|t| t.minute)),
-        // Five segments to the hour: twelve minutes each.
-        FIRST_HOUR..HOUR_TENS => ring(n - FIRST_HOUR, t.map(|t| t.hour % 12 * 5 + t.minute / 12)),
-        HOUR_TENS => digit(t.map(|t| t.hour), true),
-        HOUR_ONES => digit(t.map(|t| t.hour), false),
-        MINUTE_TENS => digit(t.map(|t| t.minute), true),
-        MINUTE_ONES => digit(t.map(|t| t.minute), false),
-        COLON => t.map_or(0, |_| (s.millis < 500) as u32),
-        SECOND_TENS => digit(t.map(|t| t.second), true),
-        SECOND_ONES => digit(t.map(|t| t.second), false),
-        DATE => t.map_or(0, |t| (t.year as u32) << 16 | (t.month as u32) << 12 | (t.day as u32) << 4 | t.weekday as u32),
-        STATUS => {
-            (s.temperature.unwrap_or(i16::MIN) as u16 as u32) << 8
-                | (s.bluetooth as u32) << 2
-                | match s.worn {
-                    Some(true) => 2,
-                    Some(false) => 1,
-                    None => 0,
-                }
-        }
-        BATTERY_DIAL => s.battery.map_or(0x1FF, |(percent, power)| (percent as u32) << 1 | power as u32),
-        HEART_DIAL => (s.heart.unwrap_or(0) as u32) << 1 | s.measuring as u32,
-        BATTERY_MARK => battery_mark(s) as u32,
-        FIRST_HEART_MARK..BARS => (heart_mark(n - FIRST_HEART_MARK, s) as u32) << 1 | s.measuring as u32,
-        // The bars jump five times a second.
-        _ => s.ticks / 200,
+        FIRST_TICK..SECOND_DOT => s.time.is_some_and(|t| (n - FIRST_TICK) as u8 <= t.second) as u32,
+        SECOND_DOT => s.time.map_or(60, |t| t.second as u32),
+        BATTERY_ARC | BATTERY_TEXT => s.battery.map_or(u32::MAX, |(percent, _)| percent as u32),
+        FIRST_GLOW..DATE => digit(n - FIRST_GLOW, s).map_or(10, |d| d as u32),
+        DATE => s.time.map_or(0, |t| (t.weekday as u32) << 16 | (t.month as u32) << 8 | t.day as u32),
+        FIRST_DIGIT..HEART_PILL => digit(n - FIRST_DIGIT, s).map_or(10, |d| d as u32),
+        HEART_PILL => s.heart.map_or(u32::MAX, |bpm| bpm as u32),
+        // The marker, the rim texts, and what has no data yet.
+        _ => 0,
     }
-}
-
-/// Where something that turns once in `period` milliseconds stands, in
-/// steps of two degrees (0 to 179).
-fn spin(s: &State, period: u32) -> u32 {
-    s.ticks % period * 180 / period
 }
 
 /// Draw element `n` as it shows `s`. Only pixels inside `clip` are worked
 /// out; the background there must already be black.
 pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
-    let t = s.time;
-    let digit = |value: Option<u8>, tens: bool| value.map(|v| if tens { v / 10 } else { v % 10 });
     match n {
-        FIRST_SECOND..FIRST_MINUTE => {
-            let k = (n - FIRST_SECOND) as i32;
-            let (from, to) = (k * 60 + SEGMENT.0, k * 60 + SEGMENT.1);
-            let rest = if k % 5 == 0 { TEAL_DIM } else { TEAL_OFF };
-            match key(n, s) {
-                0 => ring_segment(target, clip, C, C, SECOND_RING.0, SECOND_RING.1, from, to, rest),
-                1 => ring_segment(target, clip, C, C, SECOND_RING.0, SECOND_RING.1, from, to, TEAL),
-                _ => {
-                    // The current second: orange as far as it has got.
-                    let filled = from + second_fill(s);
-                    ring_segment(target, clip, C, C, SECOND_RING.0, SECOND_RING.1, from, filled.min(to), ORANGE);
-                    ring_segment(target, clip, C, C, SECOND_RING.0, SECOND_RING.1, filled.min(to), to, rest);
-                }
-            }
-        }
-        FIRST_MINUTE..FIRST_HOUR => {
-            let k = (n - FIRST_MINUTE) as i32;
-            let color = match key(n, s) {
-                2 => ORANGE,
-                1 => TEAL,
-                _ if k % 5 == 0 => TEAL_DIM,
-                _ => TEAL_OFF,
+        FIRST_TICK..SECOND_DOT => {
+            let k = (n - FIRST_TICK) as i32;
+            let (inner, half) = tick(k);
+            let color = match (key(n, s), k % 5) {
+                (0, _) => STEEL,
+                (_, 0) => SIGNAL_HOT,
+                _ => SIGNAL,
             };
-            ring_segment(target, clip, C, C, MINUTE_RING.0, MINUTE_RING.1, k * 60 + SEGMENT.0, k * 60 + SEGMENT.1, color);
+            ring_segment(target, clip, C, C, inner, TICK_OUTER, k * 60 - half, k * 60 + half, color);
         }
-        FIRST_HOUR..HOUR_TENS => {
-            let k = (n - FIRST_HOUR) as i32;
-            let color = match key(n, s) {
-                2 => ORANGE,
-                1 => TEAL,
-                _ if k % 5 == 0 => TEAL_DIM,
-                _ => TEAL_OFF,
-            };
-            let inner = if k % 5 == 0 { HOUR_MARK } else { HOUR_RING.0 };
-            ring_segment(target, clip, C, C, inner, HOUR_RING.1, k * 60 + SEGMENT.0, k * 60 + SEGMENT.1, color);
-        }
-        HOUR_TENS => BIG.draw(target, BIG_X[0], BIG_Y, digit(t.map(|t| t.hour), true), TEAL, TEAL_OFF),
-        HOUR_ONES => BIG.draw(target, BIG_X[1], BIG_Y, digit(t.map(|t| t.hour), false), TEAL, TEAL_OFF),
-        MINUTE_TENS => BIG.draw(target, BIG_X[2], BIG_Y, digit(t.map(|t| t.minute), true), TEAL, TEAL_OFF),
-        MINUTE_ONES => BIG.draw(target, BIG_X[3], BIG_Y, digit(t.map(|t| t.minute), false), TEAL, TEAL_OFF),
-        COLON => {
-            let color = if key(n, s) == 1 { ORANGE } else { ORANGE_OFF };
-            for y in [BIG_Y + 24, BIG_Y + 52] {
-                let _ = target.fill_solid(&Rectangle::new(Point::new(222, y), Size::new(10, 10)), color);
+        SECOND_DOT => {
+            if s.time.is_some() {
+                let at = dot_at(s);
+                ring_segment(target, clip, at.x, at.y, 0, DOT.1, 0, 3600, SIGNAL_HOT);
             }
         }
-        SECOND_TENS => SMALL.draw(target, SMALL_X[0], SMALL_Y, digit(t.map(|t| t.second), true), ORANGE, ORANGE_OFF),
-        SECOND_ONES => SMALL.draw(target, SMALL_X[1], SMALL_Y, digit(t.map(|t| t.second), false), ORANGE, ORANGE_OFF),
-        DATE => {
-            let mut text = Label::new();
-            match t {
-                Some(t) => {
-                    let day = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].get(t.weekday.wrapping_sub(1) as usize).copied().unwrap_or("???");
-                    let _ = write!(text, "{} {:02}.{:02}.{:04}", day, t.day, t.month, t.year);
-                }
-                None => {
-                    let _ = write!(text, "NO TIME SIGNAL");
-                }
-            }
-            centred(target, clip, text.as_str(), C, DATE_Y, &TEXT_MEDIUM, TEAL);
+        MARKER => {
+            let triangle = Triangle::new(Point::new(C, 4), Point::new(C + 8, 18), Point::new(C - 8, 18));
+            let _ = triangle.into_styled(PrimitiveStyle::with_fill(SIGNAL)).draw(&mut target.clipped(clip));
         }
-        STATUS => {
-            let mut text = Label::new();
-            let _ = write!(
-                text,
-                "{} : {}",
-                if s.bluetooth { "LINK" } else { "SOLO" },
-                match s.worn {
-                    Some(true) => "ON",
-                    Some(false) => "OFF",
-                    None => "--",
-                }
-            );
-            if let Some(temperature) = s.temperature {
-                let _ = write!(text, " : {}.{}C", temperature / 10, (temperature % 10).abs());
+        RIM_TOP => target.art(clip, NW_RIM_TOP_AT.0, NW_RIM_TOP_AT.1, &NW_RIM_TOP, CYAN),
+        RIM_BOTTOM => target.art(clip, NW_RIM_BOTTOM_AT.0, NW_RIM_BOTTOM_AT.1, &NW_RIM_BOTTOM, CHROME),
+        BATTERY_ARC => {
+            ring_segment(target, clip, C, C, ARC.0, ARC.1, BATTERY_SPAN.0, BATTERY_SPAN.1, INK);
+            if let Some((percent, _)) = s.battery {
+                let to = BATTERY_SPAN.0 + (BATTERY_SPAN.1 - BATTERY_SPAN.0) * percent.min(100) as i32 / 100;
+                dashes(target, clip, BATTERY_SPAN.0, to, CYAN);
             }
-            centred(target, clip, text.as_str(), C, STATUS_Y, &TEXT_SMALL, ORANGE);
         }
-        BATTERY_DIAL => {
-            let (x, y) = (DIAL_X[0], DIAL_Y);
-            let (percent, _) = s.battery.unwrap_or((0, false));
-            let low = s.battery.is_some() && percent < 20;
-            // A track, and the charge as an arc on it.
-            ring_segment(target, clip, x, y, 19, 25, 0, 3600, TEAL_OFF);
-            ring_segment(target, clip, x, y, 19, 25, 0, percent.min(100) as i32 * 36, if low { RED } else { TEAL });
-            let mut text = Label::new();
+        STEP_ARC => {
+            // No step count yet: the track only.
+            ring_segment(target, clip, C, C, ARC.0, ARC.1, STEP_SPAN.0, STEP_SPAN.1, INK);
+        }
+        BATTERY_TEXT => {
+            target.text(clip, SIDE_X.0, SIDE_Y.0, &NW_LABEL, "BAT", CYAN);
+            let mut value = Label::new();
             match s.battery {
-                Some(_) => {
-                    let _ = write!(text, "{}", percent.min(99));
+                Some((percent, _)) => {
+                    let _ = write!(value, "{}%", percent);
                 }
                 None => {
-                    let _ = write!(text, "--");
+                    let _ = write!(value, "--%");
                 }
             }
-            // Text is costly to draw, so only where it is really asked for:
-            // the marks circling outside touch the dial's rectangle at
-            // its corners, never the number.
-            if touches(clip, x, y) {
-                centred(target, clip, text.as_str(), x, y - 9, &TEXT_SMALL, if low { RED } else { TEAL });
+            target.text(clip, SIDE_X.0, SIDE_Y.1, &NW_MONO, value.as_str(), BONE);
+        }
+        STEP_TEXT => {
+            // Right-aligned; the label's last letter carries its spacing.
+            let label = "STEP";
+            target.text(clip, SIDE_X.1 - NW_LABEL.measure(label) + 3, SIDE_Y.0, &NW_LABEL, label, STEEL_2);
+            let value = "----";
+            target.text(clip, SIDE_X.1 - NW_MONO.measure(value), SIDE_Y.1, &NW_MONO, value, STEEL_2);
+        }
+        FIRST_GLOW..DATE => {
+            let i = n - FIRST_GLOW;
+            if let Some(d) = digit(i, s) {
+                let at = digit_at(i);
+                let color = if i < 2 { SIGNAL } else { BONE_GLOW };
+                target.glyph(clip, at.x - NW_HERO_GLOW_PAD, at.y - NW_HERO_GLOW_PAD, &NW_HERO_GLOW, b'0' + d, color);
             }
         }
-        HEART_DIAL => {
-            let (x, y) = (DIAL_X[1], DIAL_Y);
-            ring_segment(target, clip, x, y, 19, 25, 0, 3600, if s.measuring { ORANGE } else { ORANGE_OFF });
-            let mut text = Label::new();
+        DATE => {
+            theme::tag(target, clip, C, TAG_Y, date_text(s).as_str(), CYAN);
+        }
+        FIRST_DIGIT..HEART_PILL => {
+            let i = n - FIRST_DIGIT;
+            if let Some(d) = digit(i, s) {
+                let at = digit_at(i);
+                target.glyph(clip, at.x, at.y, &NW_HERO, b'0' + d, if i < 2 { SIGNAL } else { BONE });
+            }
+        }
+        HEART_PILL => {
+            let mut value = Label::new();
             match s.heart {
-                Some(bpm) if bpm != 0 => {
-                    let _ = write!(text, "{}", bpm.min(999));
+                Some(bpm) => {
+                    let _ = write!(value, "{:03}", bpm.min(999));
                 }
-                _ => {
-                    let _ = write!(text, "--");
+                None => {
+                    let _ = write!(value, "---");
                 }
             }
-            if touches(clip, x, y) {
-                centred(target, clip, text.as_str(), x, y - 9, &TEXT_SMALL, ORANGE);
-            }
-        }
-        BATTERY_MARK => {
-            let from = battery_mark(s);
-            ring_segment(target, clip, DIAL_X[0], DIAL_Y, MARK.0, MARK.1, from, from + MARK_LENGTH, ORANGE);
-        }
-        FIRST_HEART_MARK..BARS => {
-            let from = heart_mark(n - FIRST_HEART_MARK, s);
-            ring_segment(target, clip, DIAL_X[1], DIAL_Y, MARK.0, MARK.1, from, from + MARK_LENGTH, if s.measuring { ORANGE } else { TEAL_MID });
+            pill(target, clip, PILL_X[0], &NW_HEART, value.as_str(), SIGNAL);
         }
         _ => {
-            // Nineteen bars above and below a middle line, scrambled from
-            // the time: teal up, orange down.
-            let seed = key(n, s);
-            for bar in 0..19u32 {
-                let scrambled = (seed.wrapping_mul(2654435761).wrapping_add(bar.wrapping_mul(0x9E3779B1))).wrapping_mul(0x85EBCA6B) >> 24;
-                let up = 2 + scrambled as i32 % 11;
-                let down = 1 + (scrambled as i32 >> 4) % 9;
-                let x = 170 + bar as i32 * 6;
-                let _ = target.fill_solid(&Rectangle::new(Point::new(x, 343 - up), Size::new(4, up as u32)), TEAL);
-                let _ = target.fill_solid(&Rectangle::new(Point::new(x, 345), Size::new(4, down as u32)), ORANGE);
-            }
+            // No count of unread messages yet.
+            pill(target, clip, PILL_X[1], &NW_MESSAGE, "x--", STEEL_2);
         }
     }
+}
+
+/// The lit part of an arc, from `from` to `to`, in dashes.
+fn dashes<D: Paint>(target: &mut D, clip: &Rectangle, from: i32, to: i32, color: Rgb565) {
+    let mut at = from;
+    while at < to {
+        ring_segment(target, clip, C, C, ARC.0, ARC.1, at, (at + DASH.0).min(to), color);
+        at += DASH.0 + DASH.1;
+    }
+}
+
+/// A pill: a thin outline with two corners cut, an icon and a value.
+fn pill<D: Paint>(target: &mut D, clip: &Rectangle, x: i32, icon: &crate::services::font::Art, value: &str, color: Rgb565) {
+    let (y, w, h, cut) = PILL;
+    theme::frame(target, clip, &Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)), cut, color);
+    let inner = icon.width as i32 + 6 + NW_MONO.measure(value);
+    let left = x + (w - inner) / 2;
+    target.art(clip, left, y + (h - icon.height as i32) / 2, icon, color);
+    target.text(clip, left + icon.width as i32 + 6, y + (h - NW_MONO.height as i32) / 2, &NW_MONO, value, color);
 }
 
 // --- Ring segments --------------------------------------------------------------
@@ -614,71 +553,7 @@ fn root_up(v: i32) -> i32 {
     }
 }
 
-// --- Segment digits -------------------------------------------------------------
-
-/// A seven-segment digit of width `w`, height `h` and stroke `t`. All of
-/// it is rectangles, which is the cheapest thing to draw.
-struct Digit {
-    w: i32,
-    h: i32,
-    t: i32,
-}
-
-/// Which segments are lit for 0 to 9: bit 0 = top, then clockwise (top
-/// right, bottom right, bottom, bottom left, top left), bit 6 = middle.
-const SEGMENTS: [u8; 10] = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F];
-
-impl Digit {
-    fn rect(&self, x: i32, y: i32) -> Rectangle {
-        Rectangle::new(Point::new(x, y), Size::new(self.w as u32, self.h as u32))
-    }
-
-    /// The rectangle of segment `n` for a digit at (x, y).
-    fn segment(&self, n: usize, x: i32, y: i32) -> Rectangle {
-        let (w, h, t) = (self.w, self.h, self.t);
-        let gap = 2;
-        let mid = y + (h - t) / 2;
-        let across = |top: i32| Rectangle::new(Point::new(x + t + gap, top), Size::new((w - 2 * t - 2 * gap) as u32, t as u32));
-        let down = |left: i32, top: i32, bottom: i32| Rectangle::new(Point::new(left, top + gap), Size::new(t as u32, (bottom - top - 2 * gap) as u32));
-        match n {
-            0 => across(y),
-            1 => down(x + w - t, y + t / 2, mid + t / 2),
-            2 => down(x + w - t, mid + t / 2, y + h - t / 2),
-            3 => across(y + h - t),
-            4 => down(x, mid + t / 2, y + h - t / 2),
-            5 => down(x, y + t / 2, mid + t / 2),
-            _ => across(mid),
-        }
-    }
-
-    /// Draw `value` (or, for `None`, only the middle bar) at (x, y); the
-    /// segments that are not lit are drawn in `off`.
-    fn draw<D: DrawTarget<Color = Rgb565>>(&self, target: &mut D, x: i32, y: i32, value: Option<u8>, on: Rgb565, off: Rgb565) {
-        let lit = value.map_or(0x40, |v| SEGMENTS[(v % 10) as usize]);
-        for n in 0..7 {
-            let _ = target.fill_solid(&self.segment(n, x, y), if lit & 1 << n != 0 { on } else { off });
-        }
-    }
-}
-
 // --- Text -----------------------------------------------------------------------
-
-/// True if `clip` reaches into the place of a dial's number, a field of
-/// 34 x 20 pixels around (x, y).
-fn touches(clip: &Rectangle, x: i32, y: i32) -> bool {
-    overlap(&Rectangle::with_center(Point::new(x, y), Size::new(34, 20)), clip)
-}
-
-/// The rectangle a line of `chars` characters, centred on the middle of
-/// the face with its top at `y`, covers.
-fn text_rect(y: i32, font: &Font, chars: usize) -> Rectangle {
-    font.rect(C - font.width as i32 * chars as i32 / 2, y, chars)
-}
-
-/// Draw `text` centred on `x` with its top at `y`.
-fn centred<D: Paint>(target: &mut D, clip: &Rectangle, text: &str, x: i32, y: i32, font: &Font, color: Rgb565) {
-    target.text(clip, x - font.width as i32 * text.len() as i32 / 2, y, font, text, color);
-}
 
 /// A short piece of text put together with `write!`.
 struct Label {

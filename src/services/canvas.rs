@@ -29,7 +29,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::drivers::panel::{Frame, HEIGHT, WIDTH};
-use crate::services::font::{self, Font, Paint};
+use crate::services::font::{self, Paint};
 
 /// Rectangles of at least this many pixels are filled by the blitter.
 const BLITTER_FROM: u32 = 320;
@@ -64,24 +64,21 @@ fn whole() -> Rectangle {
 }
 
 impl Paint for Canvas<'_> {
-    /// One character, blended into the frame by the blitter: the
-    /// character's coverage bitmap is the "how much" for every pixel, the
-    /// colour is fixed, and what is in the frame is the background.
-    fn glyph(&mut self, clip: &Rectangle, x: i32, y: i32, font: &Font, character: u8, color: Rgb565) {
-        let Some(coverage) = font.glyph(character) else {
-            return;
-        };
-        let area = font.rect(x, y, 1).intersection(clip).intersection(&self.clip);
+    /// A coverage bitmap, blended into the frame by the blitter: the
+    /// bitmap is the "how much" for every pixel, the colour is fixed, and
+    /// what is in the frame is the background.
+    fn coverage(&mut self, clip: &Rectangle, x: i32, y: i32, width: u16, height: u16, coverage: &[u8], color: Rgb565) {
+        let area = Rectangle::new(Point::new(x, y), Size::new(width as u32, height as u32)).intersection(clip).intersection(&self.clip);
         if area.is_zero_sized() {
             return;
         }
         if !blitter_usable() {
             // Without the blitter: the plain way, on black.
-            return font::glyph_on_black(self, &area, x, y, font, coverage, color);
+            return font::coverage_on_black(self, &area, x, y, width, coverage, color);
         }
         let (w, h) = (area.size.width as u16, area.size.height as u16);
-        let glyph = Buffer2D::new(coverage.as_ptr() as *mut u8, PixelFormat::A8, font.width as u16, font.width as u16, font.height as u16);
-        let from = glyph.region((area.top_left.x - x) as u16, (area.top_left.y - y) as u16, w, h);
+        let bitmap = Buffer2D::new(coverage.as_ptr() as *mut u8, PixelFormat::A8, width, width, height);
+        let from = bitmap.region((area.top_left.x - x) as u16, (area.top_left.y - y) as u16, w, h);
         let buffer = self.buffer();
         let onto = buffer.region(area.top_left.x as u16, area.top_left.y as u16, w, h);
         let into = buffer.region(area.top_left.x as u16, area.top_left.y as u16, w, h);
@@ -89,7 +86,7 @@ impl Paint for Canvas<'_> {
         // green and blue.
         let rgb = (color.r() as u32 * 255 / 31) << 16 | (color.g() as u32 * 255 / 63) << 8 | (color.b() as u32 * 255 / 31);
         if !matches!(finish(self.blitter.blit_with(&from, &onto, &into, Some(rgb))), Some(Ok(()))) {
-            font::glyph_on_black(self, &area, x, y, font, coverage, color);
+            font::coverage_on_black(self, &area, x, y, width, coverage, color);
         }
     }
 }

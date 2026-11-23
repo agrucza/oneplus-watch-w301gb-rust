@@ -12,3 +12,7 @@ pub mod panels;
 pub mod controls;
 #[path = "../../../src/app/power.rs"]
 pub mod power;
+#[path = "../../../src/app/status.rs"]
+pub mod status;
+#[path = "../../../src/app/theme.rs"]
+pub mod theme;

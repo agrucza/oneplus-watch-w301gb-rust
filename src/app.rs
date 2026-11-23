@@ -8,6 +8,7 @@ mod panels;
 mod power;
 mod shared;
 mod status;
+mod theme;
 
 use core::fmt::Write;
 
@@ -1260,7 +1261,7 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 let clipped = &mut canvas;
-                status::background(clipped, &area);
+                theme::clear(clipped, &area);
                 self.areas += 1;
                 self.stages[1] += lap(&mut stage); // background
                 for n in 0..face::ELEMENTS {
@@ -1307,8 +1308,20 @@ impl Screen {
         // The status page. What the lines say now; those that differ from
         // what is on the screen have changed.
         let lines = status::compose(&status::Status {
+            time: clock::now().map(|t| face::Time {
+                year: t.year,
+                month: t.month,
+                day: t.day,
+                weekday: t.weekday,
+                hour: t.hour,
+                minute: t.minute,
+                second: t.second,
+            }),
             uptime_s,
-            readings,
+            battery: readings.and_then(|r| r.battery),
+            temperatures: readings.and_then(|r| r.temperatures),
+            barometer: readings.and_then(|r| r.barometer),
+            heart_bpm: readings.and_then(|r| r.heart_bpm),
             lux,
             bluetooth_connected,
             worn,

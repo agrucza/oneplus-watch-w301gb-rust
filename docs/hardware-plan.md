@@ -493,6 +493,47 @@ the same; the level is set once the first picture has gone out, since
 the panel's frame memory is lost with its power. Not done: stopping the
 pixel clock's PLL (PLLSAI2) while the display is off.
 
+**The look of every page: the user's "Nightwatch OS" design** (built
+and drawn on the PC with `tools/host`'s preview; not yet on the watch).
+The design is the base for everything the watch shows. Its parts live
+in one place, `app::theme`: the colours (signal red, cyan, yellow,
+green, the greys), the page title over a line, the tag with leaning
+sides, the frame and the plate with two corners cut, the handle bar.
+`tools/mkfont.py` makes the bitmaps from the design's three fonts
+(Orbitron, Rajdhani, JetBrains Mono; fetched once, not in the
+repository) and from its icon sheet; the plain DejaVu fonts are gone.
+`services::font` has fonts with a width per character and drawings of
+any size (`Art`), both blended by the blitter like text.
+
+- Watch face (round kit, screen 01): sixty ticks that light up with the
+  seconds and a dot going round with them, hours in red with a glow over
+  minutes in white, a date tag, an arc and a value for the battery, two
+  pills (pulse, messages), a line of text bent along the top and the
+  bottom. The glow is a second, blurred bitmap of each digit, at about
+  half the design's strength (the user found the full one too much).
+- Status page: title, a line with date and time, nine rows of label and
+  value with dividers. It no longer reads the clock and the Apollo's
+  readings itself but is handed plain values, so the preview draws it.
+- Power page: three framed rows with icon, title and note in the row's
+  colour (cyan restart, red power off, yellow stock); the row tapped
+  once becomes a plate in its colour with black text.
+- The two panels and the two long-press pages: title, the page's icon
+  in a frame, and how to leave. Named after the design: quick access
+  comes from the top, alerts from the bottom.
+
+Differences from the design, on purpose: its text of 9 to 12 pixels is
+17 to 19 here (under a millimetre otherwise); no scan lines and no
+vignette; glows only where a bitmap exists (the big digits); no status
+strip along the top of every page (on a round screen that strip is a
+few characters wide); the face's ticks are shorter and the bent text
+sits right inside them; the bent lines say what is true of this watch.
+Shown as dimmed dashes until there is data: steps and unread messages.
+Not built yet, for lack of anything to show in them: the design's
+launcher, vitals, call, settings rows with toggles, brightness bar.
+Host tests check that every element of the face draws only inside its
+rectangle and that the rows of the status and power pages lie on the
+round glass. The image is about 625 KB (294 KB before the fonts).
+
 ### 3.4 Ambient light sensor (item 10) - done
 
 **Measured:** STK31800 on I2C2 at address 0x45, product ID 0x82. Register 2
