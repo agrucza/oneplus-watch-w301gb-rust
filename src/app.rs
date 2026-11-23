@@ -726,6 +726,8 @@ struct Pull {
     pictures: u32,
     /// No blitter error and no missed pulse so far.
     good: bool,
+    /// `dsi::starved_ever` when the change began.
+    starved: u32,
 }
 
 /// What the screen keeps track of to redraw only what changes: several
@@ -980,6 +982,7 @@ impl Screen {
                     prepared: Duration::from_ticks(0),
                     pictures: 0,
                     good: true,
+                    starved: crate::hal::dsi::starved_ever(),
                 });
             }
             Gesture::Drag { dx, dy } => {
@@ -1346,7 +1349,7 @@ impl Screen {
         }
         let _ = writeln!(
             log.stamp(),
-            "display: {:?} {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms",
+            "display: {:?} {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms; {} frames starved",
             pull.motion,
             if finish { "finished" } else { "fell back" },
             if pull.good { "" } else { " (with an ERROR or a missed pulse)" },
@@ -1354,7 +1357,8 @@ impl Screen {
             pull.pictures,
             (run_began - pull.began).as_millis().saturating_sub(pull.prepared.as_millis()),
             steps,
-            run_began.elapsed().as_millis()
+            run_began.elapsed().as_millis(),
+            crate::hal::dsi::starved_ever().wrapping_sub(pull.starved)
         );
     }
 
@@ -1414,6 +1418,8 @@ impl Screen {
             );
             let _ = writeln!(log.stamp(), "stack: {} of {} bytes used at most", crate::boot::stack::most_used(), crate::boot::stack::SIZE);
             let _ = writeln!(log.stamp(), "display: {} frames in which the display controller ran short of pixels", crate::hal::dsi::take_starved());
+            let (shortest, longest) = crate::hal::dsi::take_travel_us();
+            let _ = writeln!(log.stamp(), "display: a frame took {} to {} us from its start to the end of refresh", shortest, longest);
             if !crate::services::canvas::blitter_usable() {
                 let _ = writeln!(log.stamp(), "display: the blitter did NOT finish an operation once; the processor draws everything now");
             }

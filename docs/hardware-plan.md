@@ -347,25 +347,46 @@ TouchGFX, as its assertion texts show):
   the finger lets go, the change runs out or falls back at the panel's
   rate (16 to 22 ms a picture).
 
-**The open limit: nothing may touch frame memory while a frame travels.**
-A frame takes about 17 ms to reach the panel. Drawing or copying in that
-time disturbed the picture: the status page shook and page pulls showed
-artifacts, as soon as the display task drew right after presenting. With
-a wait for the travelling frame before every access (`Panel::settle`) the
-picture is clean. How the disturbance comes about is not understood: the
-display controller reads the frame from the PSRAM while it travels, and
-drawing uses the same memory bus, but the counter for the display
-controller's underrun and transfer-error flags has only run with the
-wait in place, where it reads 0.
+**The limit: the frame memory must be left alone while a frame travels.**
+Measured on the watch, 2026-11-23:
 
-The consequence: anything that redraws a large area lands on every
-second pulse of the panel. Under the finger a picture comes every 34 ms.
-The stock app has the same memory and bus; how it arranges drawing
-around its frames has not been read.
+- A frame takes 10.44 to 10.47 ms from its start to "end of refresh",
+  every time (timed in the DSI interrupt). The panel's pulses are 17.1 ms
+  apart, so 6.6 ms of every period are free.
+- Any use of the external memory while a frame travels shifts the picture
+  sideways from some line on. Shown with a white bar crossing a black
+  screen, a new picture on every pulse: whole when nothing else happened
+  (293 pictures in 5 s), displaced when the blitter copied one spare
+  frame over the other during each frame's travel, and displaced as well
+  when the processor only read a spare frame. Neither spare frame is ever
+  shown.
+- It is not what was suspected at one time or another: the frames in
+  memory stay intact (511 pictures of page changes compared with what
+  they should be, 0 pixels wrong); the panel is sent the frame that was
+  just drawn and not the one before (four plain colours presented once
+  each were seen in order); the display controller's underrun and
+  transfer-error flags and the DSI host's two error registers stay 0;
+  and the frame's travel time does not change.
+- How the shift comes about inside the chip is not known. The display
+  controller reads the frame through the same memory controller as
+  everything else; that a late read moves the rest of the picture along
+  without a flag is inferred from what it looks like.
+
+So `Panel::settle` waits for the travelling frame before every access,
+and that is now a rule, not a diagnosis. What fits into the free 6.6 ms
+runs at the panel's full rate. Putting a page change together does not:
+two blitter copies of one frame's worth take about 10 ms, so under the
+finger a picture comes on every second pulse (34 ms).
+
+The way out that is planned: let the display controller do the moving.
+It has two layers, each with its own frame and its own window on the
+screen; a page change is then the old page in one layer and the new one
+in the other, and every picture of the move is a handful of register
+writes at the frame's start, with nothing copied. That would give every
+pulse a picture and remove the copies that prepare a move as well.
 
 Remaining:
-1. The limit above: one run with the wait off and the counter on, then
-   read how the stock app (TouchGFX) times its drawing against its frames.
+1. Page changes with the display controller's two layers (see above).
 2. The pause before a pulled page starts to move: 29 ms towards the
    status page, about 120 ms towards the face (its 180 soft ring
    segments drawn from scratch). Keeping page pictures would remove it.

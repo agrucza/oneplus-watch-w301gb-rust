@@ -88,10 +88,6 @@ pub struct Resources {
     pub blitter: Peri<'static, peripherals::DMA2D>,
 }
 
-/// Diagnosis: draw the next picture while the last one is still on its
-/// way to the panel. `false` waits for it first.
-const DRAW_WHILE_FRAME_TRAVELS: bool = false;
-
 pub struct Panel {
     /// Two frames, as in the stock app: one is on its way to the panel or
     /// was sent last, the other is free to be drawn into.
@@ -300,14 +296,16 @@ impl Panel {
     /// Wait until the frame on its way to the panel has gone out, before
     /// the frame memory is read or written for the next picture.
     ///
-    /// While a frame travels, the display controller reads it from the
-    /// external memory without a pause, and drawing uses the same memory
-    /// bus. Under test (`DRAW_WHILE_FRAME_TRAVELS`): whether drawing in
-    /// that time is what disturbs the picture.
+    /// While a frame travels (10.45 ms), the display controller reads it
+    /// from the external memory, and any other use of that memory in the
+    /// same time shifts the picture sideways from some line on. Measured
+    /// with a moving bar (2026-11-23): whole when the memory is left
+    /// alone, displaced when the blitter copies between two frames that
+    /// are not even shown, or when the processor only reads one. The
+    /// frames in memory stay intact, and neither the display controller
+    /// nor the DSI host raises a flag.
     pub async fn settle(&mut self) {
-        if !DRAW_WHILE_FRAME_TRAVELS {
-            dsi::frame_out().await;
-        }
+        dsi::frame_out().await;
     }
 
     /// The frame to draw into, as a target for `embedded-graphics`.

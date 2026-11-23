@@ -178,6 +178,7 @@ pub async fn frame_out() -> bool {
     if flags & 0b110 != 0 {
         LTDC.icr().write_value(lt::Icr(0b110));
         STARVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        STARVED_EVER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     done
 }
@@ -185,6 +186,14 @@ pub async fn frame_out() -> bool {
 /// Frames during which the display controller reported that it ran short
 /// of pixels or could not read them.
 static STARVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The same, never set back.
+static STARVED_EVER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many frames were starved since the firmware started.
+pub fn starved_ever() -> u32 {
+    STARVED_EVER.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// How many frames were starved since this was last asked.
 pub fn take_starved() -> u32 {
@@ -298,19 +307,46 @@ fn start_frame(framebuffer: u32) {
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 3); // wrapper on
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 2); // request one frame
     IN_FLIGHT.store(true, core::sync::atomic::Ordering::Relaxed);
+    // Diagnosis: time the frame. The "end of refresh" interrupt (WIER
+    // bit 1) notes when it has gone out.
+    STARTED_US.store(Instant::now().as_micros() as u32, core::sync::atomic::Ordering::Relaxed);
+    DSIHOST.wier().modify(|w| w.0 |= 1 << 1);
 }
 
-/// The DSI host's interrupt: only the tearing-effect pulse is enabled,
-/// and only while a frame is waiting for it. Starts that frame and
-/// switches itself off again.
+/// Diagnosis: when the frame on its way was started, and the shortest and
+/// longest time a frame took to go out, in microseconds.
+static STARTED_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TRAVEL_MIN_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static TRAVEL_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The shortest and the longest time a frame took from its start to
+/// "end of refresh" since this was last asked, in microseconds.
+pub fn take_travel_us() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (TRAVEL_MIN_US.swap(u32::MAX, Ordering::Relaxed), TRAVEL_MAX_US.swap(0, Ordering::Relaxed))
+}
+
+/// The DSI host's interrupt. The tearing-effect pulse is enabled only
+/// while a frame is waiting for it: it starts that frame and switches
+/// itself off again. "End of refresh" is enabled while a frame travels,
+/// for timing it (diagnosis); its flag is left for `frame_out` to see.
 #[interrupt]
 unsafe fn DSI() {
     use core::sync::atomic::Ordering;
-    DSIHOST.wier().modify(|w| w.0 &= !1);
-    DSIHOST.wifcr().write_value(dsi::Wifcr(1));
-    let framebuffer = ARMED.swap(0, Ordering::Relaxed);
-    if framebuffer != 0 {
-        start_frame(framebuffer);
+    let (enabled, flags) = (DSIHOST.wier().read().0, DSIHOST.wisr().read().0);
+    if enabled & flags & 1 << 1 != 0 {
+        DSIHOST.wier().modify(|w| w.0 &= !(1 << 1));
+        let took = (Instant::now().as_micros() as u32).wrapping_sub(STARTED_US.load(Ordering::Relaxed));
+        TRAVEL_MIN_US.fetch_min(took, Ordering::Relaxed);
+        TRAVEL_MAX_US.fetch_max(took, Ordering::Relaxed);
+    }
+    if enabled & flags & 1 != 0 {
+        DSIHOST.wier().modify(|w| w.0 &= !1);
+        DSIHOST.wifcr().write_value(dsi::Wifcr(1));
+        let framebuffer = ARMED.swap(0, Ordering::Relaxed);
+        if framebuffer != 0 {
+            start_frame(framebuffer);
+        }
     }
 }
 
