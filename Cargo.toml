@@ -24,6 +24,9 @@ embassy-sync = "0.8"
 # Waiting for whichever of two things comes first. Already part of the
 # build through the crates above.
 embassy-futures = "0.1"
+# The token the HAL asks for where interrupts must be off. Already part of
+# the build through the crates above.
+critical-section = "1"
 
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 # set-sp / set-vtor: don't trust the state the bootloader hands us, re-load MSP

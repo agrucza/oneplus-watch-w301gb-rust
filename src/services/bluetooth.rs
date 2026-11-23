@@ -28,14 +28,23 @@ const PAIR_RECORD_LEN: usize = 2 + 136;
 /// PC its pairing with the stock firmware. So every step is checked and the
 /// chip only becomes connectable if all of them worked.
 pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link> {
-    // The chip starts on a default address; without the watch's own there
-    // is no point in starting it.
-    let address = factory::bluetooth_address(log)?;
     let Some(mut link) = cypress::Link::power_up(r).await else {
         let _ = writeln!(log.stamp(), "cypress: could not open the link");
         return None;
     };
     let _ = writeln!(log.stamp(), "cypress: powered up");
+    set_up(&mut link, log).await.then_some(link)
+}
+
+/// What `start` does with a chip that has just been powered up; also run
+/// after the chip was switched off and on again while the firmware runs
+/// (`cypress::Link::power_cycle`). True if the chip is connectable.
+pub async fn set_up(link: &mut cypress::Link, log: &mut Log) -> bool {
+    // The chip starts on a default address; without the watch's own there
+    // is no point in starting it.
+    let Some(address) = factory::bluetooth_address(log) else {
+        return false;
+    };
 
     // 1. Wait for the chip's start-up packet.
     let started = loop {
@@ -47,7 +56,7 @@ pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link
     };
     if !started {
         let _ = writeln!(log.stamp(), "cypress: no start-up packet");
-        return None;
+        return false;
     }
     let _ = writeln!(log.stamp(), "cypress: started");
 
@@ -71,9 +80,9 @@ pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link
         }
 
         // 3. Pairing keys from the stock app's file on volume 2.
-        let Some(table) = cortex_m::singleton!(: [u8; PAIR_FILE_LEN] = [0; PAIR_FILE_LEN]) else {
-            break 'setup false;
-        };
+        // Safety: only the main task runs this, one call at a time.
+        static mut TABLE: [u8; PAIR_FILE_LEN] = [0; PAIR_FILE_LEN];
+        let table = unsafe { &mut *(&raw mut TABLE) };
         let read = storage::inspect(PAIRING_VOLUME).map_err(|_| 1u8).and_then(|p| storage::read_root_file(p, PAIR_FILE, table));
         match read {
             Ok(PAIR_FILE_LEN) => {}
@@ -118,5 +127,5 @@ pub async fn start(r: cypress::Resources, log: &mut Log) -> Option<cypress::Link
         if connectable { "connectable as the watch" } else { "NOT made connectable" }
     );
 
-    connectable.then_some(link)
+    connectable
 }

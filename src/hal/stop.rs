@@ -9,6 +9,7 @@
 //! firmware has said that nothing of its own is under way.
 
 use core::cell::RefCell;
+use core::fmt;
 
 use embassy_stm32::rcc::{StopMode, WakeGuard};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -28,7 +29,18 @@ pub fn forbid() {
 }
 
 /// Allow Stop mode from now on, as far as the HAL's own peripherals let it.
-#[allow(dead_code)] // nothing allows it yet
 pub fn allow() {
     GUARD.lock(|guard| drop(guard.borrow_mut().take()));
+}
+
+/// What the HAL would do if the processor had nothing to run now, for
+/// the log: "Stop 2", "Stop 1" (something it manages needs more than
+/// Stop 2 keeps) or "no stop".
+pub fn write_outlook(out: &mut impl fmt::Write) {
+    let mode = critical_section::with(embassy_stm32::rcc::get_stop_mode);
+    let _ = out.write_str(match mode {
+        Some(StopMode::Stop2) | Some(StopMode::Standby) => "Stop 2",
+        Some(StopMode::Stop1) => "Stop 1",
+        None => "no stop",
+    });
 }

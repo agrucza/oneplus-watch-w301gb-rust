@@ -87,7 +87,11 @@ pub fn next_event() -> Option<Event> {
 }
 
 pub fn set_visible(visible: bool) {
-    VISIBLE.store(visible, Ordering::Relaxed);
+    if VISIBLE.swap(visible, Ordering::Relaxed) != visible {
+        // The main task may be waiting with the processor allowed to
+        // stop; a lit display ends that.
+        crate::hal::wake::nudge();
+    }
 }
 
 /// Whether the picture is visible (not blanked).

@@ -46,6 +46,7 @@ static EDGE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static BUTTON_EDGES: AtomicU32 = AtomicU32::new(0);
 static APOLLO_EDGES: AtomicU32 = AtomicU32::new(0);
 static BLUETOOTH_EDGES: AtomicU32 = AtomicU32::new(0);
+static BLUETOOTH_CHANGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Switch the edge interrupts on. The pins must already be inputs.
 pub fn start() {
@@ -73,10 +74,21 @@ pub async fn edge() {
     EDGE.wait().await
 }
 
+/// End a wait for an edge from inside the firmware: something has
+/// changed that the waiting task should look at.
+pub fn nudge() {
+    EDGE.signal(());
+}
+
 /// How often each line changed since this was last asked: button,
 /// Apollo, Bluetooth.
 pub fn take_counts() -> (u32, u32, u32) {
     (BUTTON_EDGES.swap(0, Ordering::Relaxed), APOLLO_EDGES.swap(0, Ordering::Relaxed), BLUETOOTH_EDGES.swap(0, Ordering::Relaxed))
+}
+
+/// Whether the Bluetooth chip's line changed since this was last asked.
+pub fn take_bluetooth_changed() -> bool {
+    BLUETOOTH_CHANGED.swap(false, Ordering::Relaxed)
 }
 
 /// Acknowledge the pending lines among `mask` and pass the news on.
@@ -91,6 +103,7 @@ fn taken(mask: u32) {
     }
     if pending & 1 << BLUETOOTH.pin != 0 {
         BLUETOOTH_EDGES.fetch_add(1, Ordering::Relaxed);
+        BLUETOOTH_CHANGED.store(true, Ordering::Relaxed);
     }
     if pending != 0 {
         EDGE.signal(());

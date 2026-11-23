@@ -596,7 +596,17 @@ impl WearView {
 /// loop does by the clock: the light sensor every 250 ms and the
 /// Apollo's heartbeat every second.
 /// How long the display task waits for news while the display is dark.
-const DARK_WAIT: Duration = Duration::from_millis(500);
+/// Long, so that it does not end a stop for nothing: news ends the wait.
+const DARK_WAIT: Duration = Duration::from_secs(10);
+/// Whether the Bluetooth link sleeps and the processor may stop while it
+/// is dark and quiet.
+const STOP_WHILE_DARK: bool = true;
+/// How long it has to be quiet, with nobody connected, before the
+/// Bluetooth link is closed and the processor may stop.
+const STOP_AFTER: Duration = Duration::from_secs(10);
+/// How long the main loop waits between passes while the processor may
+/// stop; a button or the Apollo ends the wait at once.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 const BUSY_WAIT: Duration = Duration::from_millis(20);
 const QUIET_WAIT: Duration = Duration::from_millis(200);
 
@@ -1757,6 +1767,15 @@ async fn main_loop(
     let mut power_off_at: Option<u64> = None;
     // How often the loop went round, for the log.
     let (mut passes, mut passes_since) = (0u32, Instant::now());
+    // Since when it has been quiet with nobody connected, and how many
+    // waits the processor could have stopped in.
+    let mut quiet_since: Option<Instant> = None;
+    let mut stop_waits = 0u32;
+    // How often the Bluetooth link was put to sleep, since when it
+    // sleeps, and when the chip last woke it.
+    let mut link_sleeps = 0u32;
+    let mut asleep_since = Instant::now();
+    let mut chip_called_at: Option<Instant> = None;
     crate::hal::wake::start();
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
@@ -1887,6 +1906,67 @@ async fn main_loop(
             && !taps.waiting()
             && power_off_at.is_none()
             && !server.transferring();
+        // The Bluetooth link sleeps and the processor may stop, the way
+        // the stock app does it (its routines at 0x080969B6 and
+        // 0x08096A58; see `cypress::Link::close`): after a while of dark
+        // and quiet with nobody connected, and only while the chip's own
+        // line says that it has nothing for us. The chip stays
+        // connectable meanwhile, keeps what it has to say, and raises
+        // that line, which wakes the link at once. So does the end of
+        // the quiet: a button, the Apollo, a lit display.
+        if quiet && !server.connected {
+            quiet_since.get_or_insert(Instant::now());
+        } else {
+            quiet_since = None;
+        }
+        if STOP_WHILE_DARK
+            && link.is_open()
+            && !link.chip_wants_host()
+            && quiet_since.is_some_and(|since| since.elapsed() >= STOP_AFTER)
+        {
+            link.close();
+            let _ = crate::hal::wake::take_bluetooth_changed();
+            if link_sleeps < 5 {
+                crate::hal::stop::allow();
+                let _ = write!(log.stamp(), "stop: Bluetooth link asleep after {} s of quiet; with nothing to run the HAL would enter ", STOP_AFTER.as_secs());
+                crate::hal::stop::write_outlook(&mut log);
+                crate::hal::stop::forbid();
+                let _ = writeln!(log, "");
+            }
+            link_sleeps += 1;
+            let _ = log.flush();
+            last_save = Instant::now();
+            stop_waits = 0;
+            asleep_since = Instant::now();
+        }
+        if !link.is_open() {
+            let edge = crate::hal::wake::take_bluetooth_changed();
+            let chip_calls = link.chip_wants_host() || edge;
+            if quiet_since.is_none() || chip_calls {
+                let opened = link.open();
+                let _ = writeln!(
+                    log.stamp(),
+                    "stop: Bluetooth link {} after {} s asleep ({} waits in which the processor could stop): {}",
+                    if opened { "awake" } else { "could NOT be woken" },
+                    asleep_since.elapsed().as_secs(),
+                    stop_waits,
+                    if chip_calls { "the chip called" } else { "the quiet ended" }
+                );
+                quiet_since = None;
+                chip_called_at = chip_calls.then(Instant::now);
+            } else {
+                // The log is written out now and then, awake.
+                if log.pending() && last_save.elapsed() > Duration::from_secs(120) {
+                    let _ = log.flush();
+                    last_save = Instant::now();
+                }
+                stop_waits += 1;
+                crate::hal::stop::allow();
+                let _ = embassy_time::with_timeout(STOP_WAIT, crate::hal::wake::edge()).await;
+                crate::hal::stop::forbid();
+                continue;
+            }
+        }
         passes += 1;
         if passes_since.elapsed() >= Duration::from_secs(30) {
             let (button, apollo_edges, bluetooth) = crate::hal::wake::take_counts();
@@ -1895,6 +1975,22 @@ async fn main_loop(
             passes_since = Instant::now();
         }
         let activity = server.step(&mut link, if quiet { QUIET_WAIT } else { BUSY_WAIT }, &mut log).await;
+        // The chip woke the link and then said nothing: that is how the
+        // chip looked when it was lost once (2026-11-23, with the "ready"
+        // line not yet driven by hand). Switched off and on, it works
+        // again.
+        if activity == Activity::Handled {
+            chip_called_at = None;
+        } else if chip_called_at.is_some_and(|at| at.elapsed() > Duration::from_secs(5)) {
+            chip_called_at = None;
+            if link.chip_wants_host() {
+                let _ = writeln!(log.stamp(), "stop: the chip has been calling for 5 s and said nothing; switching it off and on");
+                let back = link.power_cycle().await && bluetooth::set_up(&mut link, &mut log).await;
+                let _ = writeln!(log.stamp(), "stop: the chip is {}", if back { "back" } else { "NOT back" });
+            } else {
+                let _ = writeln!(log.stamp(), "stop: the chip called, said nothing and stopped calling");
+            }
+        }
 
         // Nothing is arriving: a good moment to save what was logged, so
         // that it survives if the app dies. Not during a transfer, where the
