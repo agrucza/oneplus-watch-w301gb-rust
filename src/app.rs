@@ -1,6 +1,8 @@
 //! The application: bring the hardware up in a safe order, then run.
 
 mod face;
+mod motion;
+mod panels;
 mod shared;
 mod status;
 
@@ -15,6 +17,7 @@ use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
 use crate::services::gestures::{Direction, Gesture, Gestures};
+use motion::Motion;
 use crate::drivers::{apollo, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
@@ -712,9 +715,8 @@ const FLICK: i32 = 400;
 struct Pull {
     /// The page being pulled in.
     target: Page,
-    /// The pages move to the left (the new one comes from the right).
-    leftwards: bool,
-    /// How far the pages should be moved, in pixels: where the finger is.
+    motion: Motion,
+    /// How far the picture should be moved, in pixels: where the finger is.
     wanted: usize,
     /// How far they were moved in the last picture; `None` until the two
     /// pages' pictures have been made.
@@ -730,11 +732,15 @@ struct Pull {
     good: bool,
 }
 
-/// What the screen shows: the watch face, or the page of status text.
+/// What the screen shows: the watch face, the page of status text beside
+/// it, or one of the two panels pulled over the face from the top and
+/// from the bottom edge.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Face,
     Status,
+    Above,
+    Below,
 }
 
 /// What the screen keeps track of to redraw only what changes: several
@@ -935,18 +941,24 @@ impl Screen {
     ///
     /// Dragging sideways pulls the next page in: to the left on the watch
     /// face brings the status page, to the right on the status page
-    /// brings the face back. The pages follow the finger; letting go past
-    /// a third of the way, or with a flick, finishes the change, anything
-    /// less lets the page fall back. A tap on the status page leaves a
-    /// dot.
+    /// brings the face back. Dragging down on the watch face pulls a
+    /// panel in over it from the top edge, dragging up one from the
+    /// bottom edge; each panel is pushed back out the way it came. The
+    /// picture follows the finger; letting go far enough
+    /// (`Motion::far_enough`), or with a flick, finishes the change,
+    /// anything less lets it fall back. A tap on the status page leaves
+    /// a dot.
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
-        let width = panel::WIDTH as i32;
         match gesture {
-            Gesture::DragStart { direction, dx, .. } if self.pull.is_none() => {
-                let (target, leftwards) = match (self.page, direction) {
-                    (Page::Face, Direction::Left) => (Page::Status, true),
-                    (Page::Status, Direction::Right) => (Page::Face, false),
-                    // Nothing lies that way; up and down do nothing yet.
+            Gesture::DragStart { direction, dx, dy, .. } if self.pull.is_none() => {
+                let (target, motion) = match (self.page, direction) {
+                    (Page::Face, Direction::Left) => (Page::Status, Motion::Pages { leftwards: true }),
+                    (Page::Status, Direction::Right) => (Page::Face, Motion::Pages { leftwards: false }),
+                    (Page::Face, Direction::Down) => (Page::Above, Motion::PanelIn { from_top: true }),
+                    (Page::Face, Direction::Up) => (Page::Below, Motion::PanelIn { from_top: false }),
+                    (Page::Above, Direction::Up) => (Page::Face, Motion::PanelOut { to_top: true }),
+                    (Page::Below, Direction::Down) => (Page::Face, Motion::PanelOut { to_top: false }),
+                    // Nothing lies that way.
                     _ => {
                         let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
                         return;
@@ -954,8 +966,8 @@ impl Screen {
                 };
                 self.pull = Some(Pull {
                     target,
-                    leftwards,
-                    wanted: dx.unsigned_abs() as usize,
+                    motion,
+                    wanted: motion.along(dx, dy).clamp(0, motion.extent() as i32) as usize,
                     shown: None,
                     release: None,
                     began: Instant::now(),
@@ -964,17 +976,16 @@ impl Screen {
                     good: true,
                 });
             }
-            Gesture::Drag { dx, .. } => {
+            Gesture::Drag { dx, dy } => {
                 if let Some(pull) = self.pull.as_mut() {
-                    let travel = if pull.leftwards { -dx } else { dx };
-                    pull.wanted = travel.clamp(0, width) as usize;
+                    pull.wanted = pull.motion.along(dx, dy).clamp(0, pull.motion.extent() as i32) as usize;
                 }
             }
-            Gesture::DragEnd { dx, dy, speed_x, .. } => {
+            Gesture::DragEnd { dx, dy, speed_x, speed_y } => {
                 if let Some(pull) = self.pull.as_mut() {
-                    let (travel, speed) = if pull.leftwards { (-dx, -speed_x) } else { (dx, speed_x) };
-                    pull.wanted = travel.clamp(0, width) as usize;
-                    pull.release = Some(travel > width / 3 || speed > FLICK);
+                    let (travel, speed) = (pull.motion.along(dx, dy), pull.motion.along(speed_x, speed_y));
+                    pull.wanted = travel.clamp(0, pull.motion.extent() as i32) as usize;
+                    pull.release = Some(pull.motion.far_enough(travel) || speed > FLICK);
                     let _ = writeln!(log.stamp(), "touch: let go after {} px at {} px/s", travel, speed);
                 } else {
                     let _ = writeln!(log.stamp(), "touch: drag ended {}, {} from its start", dx, dy);
@@ -1166,6 +1177,20 @@ impl Screen {
             }
             return Some((started, changes.area(face::whole())));
         }
+        if let Page::Above | Page::Below = self.page {
+            // A panel always looks the same: it is drawn where a frame
+            // does not have it yet, and never again.
+            let changes = self.t.damage.take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas();
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                panels::draw(&mut canvas, &area, self.page == Page::Above);
+            }
+            return Some((started, changes.area(face::whole())));
+        }
         // The status page. What the lines say now; those that differ from
         // what is on the screen have changed.
         let lines = status::compose(&status::Status {
@@ -1218,9 +1243,9 @@ impl Screen {
     /// On the first call the picture on the screen is kept, the page being
     /// pulled in is drawn completely (into the frame to draw into, which is
     /// not shown) and kept as well. From then on every picture is put
-    /// together from the two with two blitter copies: while the finger is
-    /// down, at wherever the finger is; once it has let go, in a short run
-    /// to the end or back to the start.
+    /// together from the two with two blitter copies (`move_to`): while
+    /// the finger is down, at wherever the finger is; once it has let go,
+    /// in a short run to the end or back to the start.
     #[allow(clippy::too_many_arguments)]
     async fn pull_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
         let Some(mut pull) = self.pull.take() else {
@@ -1255,7 +1280,7 @@ impl Screen {
         let Some(finish) = pull.release else {
             // Under the finger: one picture, where the finger is now.
             if pull.wanted != shown {
-                pull.good &= self.panel.slide(pull.wanted, pull.leftwards).await;
+                pull.good &= self.move_to(pull.motion, pull.wanted).await;
                 pull.good &= self.panel.present().await.in_step;
                 pull.shown = Some(pull.wanted);
                 pull.pictures += 1;
@@ -1266,22 +1291,22 @@ impl Screen {
         // Let go: run to the end or back to the start, in one go without
         // going back to the rest of the firmware in between (that round
         // trip takes longer than a picture).
-        let end = if finish { panel::WIDTH } else { 0 };
+        let end = if finish { pull.motion.extent() } else { 0 };
         let distance = end.abs_diff(shown);
-        let steps = (distance * SLIDE_STEPS / panel::WIDTH).max(2);
+        let steps = (distance * SLIDE_STEPS / pull.motion.extent()).max(2);
         let run_began = Instant::now();
         for step in 1..=steps {
             // Ease out: fast first, slowing into place.
             let t = step * 1024 / steps;
             let eased = 1024 - (1024 - t) * (1024 - t) / 1024;
             let offset = if step == steps { end } else if finish { shown + distance * eased / 1024 } else { shown - distance * eased / 1024 };
-            pull.good &= self.panel.slide(offset, pull.leftwards).await;
+            pull.good &= self.move_to(pull.motion, offset).await;
             pull.good &= self.panel.present().await.in_step;
             watchdog::feed();
         }
         // The frame shown is right. Bring the other one to the same
         // picture; then both are as the page was drawn.
-        pull.good &= self.panel.slide(end, pull.leftwards).await;
+        pull.good &= self.move_to(pull.motion, end).await;
         self.t.damage.clear();
         if !finish {
             self.page = self.t.left_page;
@@ -1291,8 +1316,9 @@ impl Screen {
         }
         let _ = writeln!(
             log.stamp(),
-            "display: page {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms",
-            if finish { "changed" } else { "fell back" },
+            "display: {:?} {}{}: {} ms to draw the other page, {} pictures under the finger in {} ms, then {} pictures in {} ms",
+            pull.motion,
+            if finish { "finished" } else { "fell back" },
             if pull.good { "" } else { " (with an ERROR or a missed pulse)" },
             pull.prepared.as_millis(),
             pull.pictures,
@@ -1300,6 +1326,19 @@ impl Screen {
             steps,
             run_began.elapsed().as_millis()
         );
+    }
+
+    /// Put together the picture of a change of page that has got `offset`
+    /// pixels on its way, from the kept pictures of the page being left
+    /// (0) and the page coming (1), in the frame to draw into.
+    async fn move_to(&mut self, motion: Motion, offset: usize) -> bool {
+        match motion {
+            Motion::Pages { leftwards } => self.panel.slide(offset, leftwards).await,
+            // The panel is the page coming: it reaches `offset` rows in.
+            Motion::PanelIn { from_top } => self.panel.cover(offset, from_top, 1).await,
+            // The panel is the page being left: so much of it remains.
+            Motion::PanelOut { to_top } => self.panel.cover(panel::HEIGHT.saturating_sub(offset), to_top, 0).await,
+        }
     }
 
     /// Present the picture that was just drawn (drawing began at

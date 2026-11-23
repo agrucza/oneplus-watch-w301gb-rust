@@ -26,7 +26,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 3 | Apollo co-processor | SPI1 slave (PA5-7), PG1, PA15, PF10, PG12, PF7 | `apollo/apollo_app.bin` | link works; start-up exchange done through time, name, setup status, screen status and raise-to-wake; its own log can be read (see 3.5) |
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: frames in step with the panel, two frame buffers, only what changed is drawn, hardware blitter, watch face and status page, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
-| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags acted on in 2 of the stock app's 4 directions. Open: up and down, long press action, covering hand, sleep and wake (see 3.1) |
+| 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags act in all 4 of the stock app's directions (pages left and right, two panels up and down, the panels with placeholder content). Open: the give at the pages' ends, long press action, what the panels hold, covering hand, sleep and wake (see 3.1) |
 | 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
@@ -187,14 +187,14 @@ Which of the two panels is notifications and which quick settings was
 not determined. Elsewhere: on the launcher a drag of 41 pixels to the
 right goes back to the watch face (`0x8118852`, one reading).
 
-**Ours against that** (`services::gestures`, 2026-11-23; the recogniser's rules built and tested on the PC, not yet tried on the watch):
+**Ours against that** (`services::gestures`, 2026-11-23; the recogniser's four directions measured on the watch):
 
 | | Stock | Ours |
 |---|---|---|
 | Fingers | one | one |
 | Drag begins after | 3 pixels, then locked to one of 4 directions | 15 pixels, as before (kept on purpose: a wobbling finger still taps), then locked to one of 4 directions by stock's rule |
 | Left / right on the face | pages | page pull: yes |
-| Up / down on the face | two panels | nothing |
+| Up / down on the face | two panels | two panels that follow the finger (measured on the watch 2026-11-23: both come in and go out under the finger, nothing torn or left behind, no blitter error or missed pulse in about 55 moves): down pulls one in from the top edge, up one from the bottom edge, each is pushed back the way it came; finished past half the height (stock's share) or with a flick over 400 pixels a second (ours). The panel lies over the face, which stays in place: our choice, how stock moves them was not read. Their content is a placeholder |
 | Page change finishes at | a third of the width, or 14 pixels a sample | a third of the width, or 400 pixels a second (kept on purpose: measured 40 of 40 swipes; stock's number is stricter at any likely sample rate). Our speed is taken over the last 90 ms, not the last two samples |
 | Elastic end | 50 pixels | none: a drag towards no page does nothing |
 | Long press | 60 ticks, opens a screen | 0.6 s (our own number), only logged |
@@ -206,12 +206,15 @@ right goes back to the watch face (`0x8118852`, one reading).
 The recogniser's tests run on the PC (`tools/host`).
 
 Remaining:
-1. The recogniser: four directions by stock's rule, built, with a test
-   for each direction; to be tried on the watch. The numbers stay our
+1. The recogniser: four directions by stock's rule, with a test for
+   each direction; measured on the watch (22 of 22 swipes, 10 of 10
+   taps, 5 of 5 up, 5 of 5 down). The numbers stay our
    own where they are more forgiving than stock's (decided 2026-11-23).
    Not read: the tick rate, and what stock does with a touch after a
    long press (ours: nothing more).
-2. On the watch face: up and down panels, the elastic end, long press
+2. On the watch face: the up and down panels work, with placeholder
+   content; open are what they hold
+   (notifications, quick settings), the elastic end, and long press
    opening a screen.
 3. The covering hand: read the bit, switch the display off.
 4. The chip's deep sleep with the display, and waking it; belongs with

@@ -219,3 +219,46 @@ mod gestures {
         assert_eq!(g.feed(Some(Up), at(455)), Some(Gesture::DragEnd { dx: 200, dy: 0, speed_x: 0, speed_y: 0 }));
     }
 }
+
+/// `app::motion`: how far a finger's movement carries a change of page.
+#[cfg(test)]
+mod motion {
+    use crate::app::motion::Motion;
+
+    #[test]
+    fn pages_go_by_x() {
+        let left = Motion::Pages { leftwards: true };
+        let right = Motion::Pages { leftwards: false };
+        assert_eq!(left.along(-100, 30), 100);
+        assert_eq!(left.along(100, 30), -100);
+        assert_eq!(right.along(100, -30), 100);
+        assert_eq!(right.along(-100, -30), -100);
+        assert_eq!(left.extent(), 454);
+    }
+
+    #[test]
+    fn panels_go_by_y() {
+        // In from the top and out over the bottom: downwards.
+        assert_eq!(Motion::PanelIn { from_top: true }.along(30, 100), 100);
+        assert_eq!(Motion::PanelOut { to_top: false }.along(30, 100), 100);
+        assert_eq!(Motion::PanelIn { from_top: true }.along(30, -100), -100);
+        // In from the bottom and out over the top: upwards.
+        assert_eq!(Motion::PanelIn { from_top: false }.along(30, -100), 100);
+        assert_eq!(Motion::PanelOut { to_top: true }.along(30, -100), 100);
+        assert_eq!(Motion::PanelOut { to_top: true }.along(30, 100), -100);
+        assert_eq!(Motion::PanelIn { from_top: true }.extent(), 454);
+    }
+
+    /// Pages change past a third of the width, panels past half the
+    /// height.
+    #[test]
+    fn how_far_is_enough() {
+        let page = Motion::Pages { leftwards: true };
+        assert!(!page.far_enough(151));
+        assert!(page.far_enough(152));
+        for panel in [Motion::PanelIn { from_top: true }, Motion::PanelIn { from_top: false }, Motion::PanelOut { to_top: true }, Motion::PanelOut { to_top: false }] {
+            assert!(!panel.far_enough(227));
+            assert!(panel.far_enough(228));
+        }
+    }
+}

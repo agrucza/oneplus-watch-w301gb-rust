@@ -2,6 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
+//!   cargo run --bin preview -- OUT.ppm above|below
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -51,8 +52,14 @@ fn main() {
         temperature: Some(268),
     };
     let whole = face::whole();
-    for n in 0..face::ELEMENTS {
-        face::draw(&mut frame, &whole, n, &state);
+    match args.get(2).map(String::as_str) {
+        Some("above") => w301_host::app::panels::draw(&mut frame, &whole, true),
+        Some("below") => w301_host::app::panels::draw(&mut frame, &whole, false),
+        _ => {
+            for n in 0..face::ELEMENTS {
+                face::draw(&mut frame, &whole, n, &state);
+            }
+        }
     }
     if args.get(3).is_some() {
         for n in 0..face::ELEMENTS {

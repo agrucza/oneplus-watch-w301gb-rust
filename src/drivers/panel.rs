@@ -253,7 +253,37 @@ impl Panel {
         }
     }
 
-    /// The frame to draw into, as a target for `embedded-graphics`.
+    /// Copy the rows `from_y .. from_y + height` of one frame, over the
+    /// whole width, to the rows starting at `to_y` of another, with the
+    /// blitter. False if it reported an error.
+    async fn copy_rows(&mut self, from: *const Frame, from_y: usize, to: *mut Frame, to_y: usize, height: usize) -> bool {
+        if height == 0 {
+            return true;
+        }
+        let source = Buffer2D::new(unsafe { (from as *mut u16).add(from_y * WIDTH) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, height as u16);
+        let target = Buffer2D::new(unsafe { (to as *mut u16).add(to_y * WIDTH) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, height as u16);
+        self.blitter.copy(&source, &target).await.is_ok()
+    }
+
+    /// Put together, in the frame to draw into, a picture of one kept
+    /// picture lying over the other: the picture in spare frame
+    /// `panel_slot` reaches `amount` rows in from the top edge (`top`) or
+    /// the bottom edge, its far end first, and the other kept picture
+    /// shows in the rest, where it always is. `amount` 0 is all of the
+    /// other picture, `HEIGHT` all of the panel. Two blitter copies,
+    /// together one frame's worth.
+    pub async fn cover(&mut self, amount: usize, top: bool, panel_slot: usize) -> bool {
+        self.settle().await;
+        let amount = amount.min(HEIGHT);
+        let (panel, under): (*const Frame, *const Frame) = (self.spare[panel_slot], self.spare[1 - panel_slot]);
+        let back: *mut Frame = self.frames[1 - self.shown];
+        if top {
+            self.copy_rows(panel, HEIGHT - amount, back, 0, amount).await && self.copy_rows(under, amount, back, amount, HEIGHT - amount).await
+        } else {
+            self.copy_rows(under, 0, back, 0, HEIGHT - amount).await && self.copy_rows(panel, 0, back, HEIGHT - amount, amount).await
+        }
+    }
+
     /// Wait until the frame on its way to the panel has gone out, before
     /// the frame memory is read or written for the next picture.
     ///
@@ -267,6 +297,7 @@ impl Panel {
         }
     }
 
+    /// The frame to draw into, as a target for `embedded-graphics`.
     pub fn canvas(&mut self) -> Canvas<'_> {
         Canvas::new(self.frames[1 - self.shown], &mut self.blitter)
     }
