@@ -201,7 +201,7 @@ right goes back to the watch face (`0x8118852`, one reading).
 | Tap | per dial | dots on the status page |
 | Covering hand | display off | the bit is read and blanks the display (measured on the watch 2026-11-23: 9 of 9 covers blanked it, 14 taps and 11 swipes did not; a thumb pressed flat counts as a large object too); it comes back by button or wrist raise. While the display is dark, gestures are not acted on |
 | Touch restarts the switch-off timer | yes | done and measured: dark 15.0 s after the display came on, after a button, after the wrist gesture, and after the finger lifted (`DISPLAY_TIMEOUT`, a value of our own). A touch on the dark display does nothing |
-| Chip sleeps with the display | yes | never |
+| Chip sleeps with the display | yes | done and measured: the stock power command (`05 00 01 08` to sleep, `05 00 00 08` to wake) whenever the display goes dark or lit. Three sleeps, each confirmed at the first try within 11 to 33 ms (answer `05 00 f0 01 08`); three wakes, each answered within 1 ms (`05 00 f0 00 88`); no touch reports while asleep; touches read again after every wake. Not done: giving up the interrupt pin while the chip sleeps, as stock does |
 
 The recogniser's tests run on the PC (`tools/host`).
 

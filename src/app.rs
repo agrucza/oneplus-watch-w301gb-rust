@@ -1590,6 +1590,8 @@ impl Sensors {
 async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! {
     let mut log = Log::get();
     let mut gestures = Gestures::new();
+    // The touch controller did not confirm its sleep command.
+    let mut touch_sleep_failed = false;
     loop {
         let state = shared::state();
         while let Some(event) = shared::next_event() {
@@ -1629,6 +1631,18 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         if state.transferring {
             Timer::after_millis(20).await;
             continue;
+        }
+        // The touch controller sleeps while the display is dark.
+        if let Some(touch) = touch.as_mut() {
+            if screen.visible && touch.asleep() {
+                touch.wake(&mut log).await;
+            } else if !screen.visible && !touch.asleep() && !touch_sleep_failed {
+                // Not tried again until the display has been lit once more.
+                touch_sleep_failed = !touch.sleep(&mut log).await;
+            }
+            if screen.visible {
+                touch_sleep_failed = false;
+            }
         }
         let touched = touch.as_mut().and_then(|touch| touch.poll(&mut log));
         if touch.as_mut().is_some_and(|touch| touch.take_large_object()) {

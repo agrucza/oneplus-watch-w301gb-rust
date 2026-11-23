@@ -66,6 +66,12 @@ const ASK_SYSTEM_INFORMATION: [u8; 7] = [0x04, 0x00, 0x05, 0x00, 0x2F, 0x00, 0x0
 /// 0x081F00C8); for this command it comes to 0xC720.
 const START_FIRMWARE: [u8; 13] = [0x04, 0x00, 0x0B, 0x00, 0x40, 0x00, 0x01, 0x3B, 0x00, 0x00, 0x20, 0xC7, 0x17];
 
+/// The power command (stock: 0x0807865A; the bytes at 0x081F15E4 with the
+/// state put into the third): 1 puts the chip into its deep sleep, 0
+/// wakes it.
+const POWER_SLEEP: [u8; 4] = [0x05, 0x00, 0x01, 0x08];
+const POWER_ON: [u8; 4] = [0x05, 0x00, 0x00, 0x08];
+
 /// How many reports are written to the log in full.
 const LOGGED_REPORTS: u32 = 40;
 
@@ -103,6 +109,9 @@ pub struct Touch {
     large_object_lies: bool,
     logged: u32,
     failures: u32,
+    asleep: bool,
+    /// How many sleeps and wakes were written to the log in full.
+    power_logged: u32,
 }
 
 impl Touch {
@@ -125,7 +134,7 @@ impl Touch {
         enable.set_high();
         Timer::after_millis(120).await;
 
-        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, lift_pending: false, large_object: false, large_object_lies: false, logged: 0, failures: 0 };
+        let mut touch = Self { bus, irq, _pins: [enable, reset], buffer: [0; MAX_REPORT], touching: false, lift_pending: false, large_object: false, large_object_lies: false, logged: 0, failures: 0, asleep: false, power_logged: 0 };
         let _ = writeln!(log.stamp(), "touch: reset done, interrupt line is {}", if touch.irq.is_low() { "low" } else { "high" });
 
         // Whatever the chip has to say after its reset.
@@ -305,6 +314,94 @@ impl Touch {
             }
         }
         event
+    }
+
+    /// Whether the chip was put to sleep (`sleep`) and not woken since.
+    pub fn asleep(&self) -> bool {
+        self.asleep
+    }
+
+    /// Put the chip into its deep sleep, as the stock app does whenever
+    /// the display goes dark (0x08042648, 0x08079392): the power command
+    /// with state 1, up to three times, each time waiting up to 500 ms
+    /// for the chip's answer (F0, the state, 08 from the third byte on).
+    /// The stock app also gives up the interrupt pin while the chip
+    /// sleeps; here it stays an input with its pull-up. False if the chip
+    /// did not confirm; it is then taken as awake.
+    pub async fn sleep(&mut self, log: &mut Log) -> bool {
+        if self.asleep {
+            return true;
+        }
+        // A finger that is on the glass now is gone for us.
+        self.touching = false;
+        self.lift_pending = false;
+        self.large_object_lies = false;
+        let started = Instant::now();
+        for attempt in 1..=3 {
+            // What is waiting would be taken for the answer.
+            for _ in 0..4 {
+                if self.irq.is_high() {
+                    break;
+                }
+                let _ = self.read_report();
+            }
+            if self.bus.blocking_write(ADDRESS, &POWER_SLEEP).is_err() {
+                let _ = writeln!(log.stamp(), "touch: sleep command not accepted (try {})", attempt);
+                continue;
+            }
+            // Touch reports may still come before the answer.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if !self.wait_for_irq(deadline.saturating_duration_since(Instant::now()).as_millis()).await {
+                    break;
+                }
+                let Some(len) = self.read_report() else { break };
+                if len >= 5 && self.buffer[2] == 0xF0 && self.buffer[3] & 3 == 1 && self.buffer[4] & 0x0F == 8 {
+                    self.asleep = true;
+                    if self.power_logged < 6 {
+                        self.power_logged += 1;
+                        let _ = writeln!(log.stamp(), "touch: asleep after {} ms (try {}), answer:", started.elapsed().as_millis(), attempt);
+                        log.hex(&self.buffer[..len]);
+                    }
+                    return true;
+                }
+            }
+            let _ = writeln!(log.stamp(), "touch: no answer to the sleep command (try {})", attempt);
+        }
+        false
+    }
+
+    /// Wake the chip from its deep sleep (stock: 0x08042670, 0x080793CC):
+    /// the power command with state 0, sent once there and not waited
+    /// for. Here it is sent again if the bus refuses it, and if it is
+    /// refused three times the chip is reset, which wakes it in any case.
+    pub async fn wake(&mut self, log: &mut Log) {
+        if !self.asleep {
+            return;
+        }
+        self.asleep = false;
+        let started = Instant::now();
+        for attempt in 1..=3 {
+            if self.bus.blocking_write(ADDRESS, &POWER_ON).is_ok() {
+                if self.power_logged < 12 {
+                    self.power_logged += 1;
+                    // Not waited for in normal use; here to see what the
+                    // chip says and how long it takes.
+                    let answered = self.wait_for_irq(100).await;
+                    let _ = writeln!(log.stamp(), "touch: woken (try {}), {} after {} ms", attempt, if answered { "report" } else { "no report" }, started.elapsed().as_millis());
+                    if answered {
+                        self.log_report("after waking", log);
+                    }
+                }
+                return;
+            }
+            Timer::after_millis(2).await;
+        }
+        let _ = writeln!(log.stamp(), "touch: wake command refused three times; resetting the chip");
+        self._pins[1].set_low();
+        Timer::after_millis(10).await;
+        self._pins[1].set_high();
+        Timer::after_millis(120).await;
     }
 
     /// True if a report since the last call said that something large
