@@ -25,6 +25,7 @@
 //! |    59 | Apollo's own reset info         | 1 shutdown type, 2 reset reason               |
 //! |    80 | 180-byte record, type 19        | 1 time s, 2 type, 3 bytes                     |
 //! |    84 | vibration motor (to the Apollo) | see `motor_pulses`                            |
+//! |   102 | system state (to the Apollo)    | see `power_off`                               |
 //! |   121 | raise to wake on/off (to the Apollo) | see `raise_to_wake`                      |
 //! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
 //! |   130 | screen status (to the Apollo)   | see `screen_status`                           |
@@ -60,6 +61,7 @@ pub const SCREEN: u32 = 130;
 pub const RAISE_TO_WAKE: u32 = 121;
 pub const DO_NOT_DISTURB: u32 = 122;
 pub const LOG_SETTING: u32 = 100;
+pub const SYSTEM: u32 = 102;
 pub const SEDENTARY: u32 = 125;
 
 /// Builds a sub-message field by field. Fields with the value zero are
@@ -279,6 +281,22 @@ pub fn sedentary(first: Option<(Minutes, Minutes)>, second: Option<(Minutes, Min
 /// mean is not known. Results come back as kind `HEART`.
 pub fn heart_rate(on: bool) -> Encoder {
     Encoder::new().number(1, on as u32).number(3, 40).number(7, 1).number(8, 3)
+}
+
+/// Switch the watch off: kind 102 with field 1 = 3.
+///
+/// Kind 102 carries one number, a system state. The stock app's "model
+/// sys shutdown" (0x0807FAB2) sends 3 through 0x0805C6C6; its other call
+/// sites send 2 (restart), 4 (the low-battery shutdown), 5, 6 and 7, none
+/// of which is sent here. The Apollo's dispatcher (0x3EC88) logs "shut
+/// down event!" for 3 and hands it to its main task; the routine that
+/// then runs (0x54164) stops the sensors, switches supply pins and puts
+/// the Apollo itself to sleep. Measured: the Apollo acknowledges, then
+/// takes no more messages, and the STM32 keeps running; switching the
+/// STM32 off is the STM32's own step (`hal::power::shutdown`). On the
+/// charger the STM32 was restarted within 10 s of the message.
+pub fn power_off() -> Encoder {
+    Encoder::new().number(1, 3)
 }
 
 /// Motor command "stop" (stock: 0x08091D18): field 1 = 0, field 5 = 6.

@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|below|faces|cards
+//!   cargo run --bin preview -- OUT.ppm above|below|faces|cards|power|power-chosen
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -59,6 +59,8 @@ fn main() {
         Some("below") => panels::draw(&mut frame, &whole, Page::Below),
         Some("faces") => panels::draw(&mut frame, &whole, Page::Faces),
         Some("cards") => panels::draw(&mut frame, &whole, Page::Cards),
+        Some("power") => w301_host::app::power::draw(&mut frame, &whole, None, true),
+        Some("power-chosen") => w301_host::app::power::draw(&mut frame, &whole, Some(w301_host::app::power::Choice::Stock), false),
         _ => {
             for n in 0..face::ELEMENTS {
                 face::draw(&mut frame, &whole, n, &state);

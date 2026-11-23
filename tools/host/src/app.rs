@@ -8,3 +8,7 @@ pub mod motion;
 pub mod pages;
 #[path = "../../../src/app/panels.rs"]
 pub mod panels;
+#[path = "../../../src/app/controls.rs"]
+pub mod controls;
+#[path = "../../../src/app/power.rs"]
+pub mod power;

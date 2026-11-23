@@ -36,7 +36,7 @@ fn look(page: Page) -> Option<Look> {
         Page::Below => Look { background: Rgb565::new(7, 8, 2), title: "Panel from below", leave: "push down to close", handle: Some(30) },
         Page::Faces => Look { background: Rgb565::new(5, 4, 8), title: "Watch faces", leave: "tap to go back", handle: None },
         Page::Cards => Look { background: Rgb565::new(2, 10, 3), title: "Pages", leave: "tap to go back", handle: None },
-        Page::Face | Page::Status => return None,
+        Page::Face | Page::Status | Page::Power => return None,
     })
 }
 

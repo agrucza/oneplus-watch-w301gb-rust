@@ -4,6 +4,7 @@
 pub mod clocks;
 pub mod dsi;
 pub mod fmc;
+pub mod power;
 pub mod reg;
 pub mod rtc;
 pub mod sdmmc;

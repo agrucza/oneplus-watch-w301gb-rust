@@ -36,9 +36,9 @@ pub const SIZE: usize = 16 * 1024 * 1024;
 pub const FRAMEBUFFER: usize = BASE + 0x00C0_0000;
 /// Frames lie 0x71800 bytes apart from there (512 x 454 pixels of two
 /// bytes; the stock app has its second frame at that distance,
-/// 0x080ABBD8 in B.70). Eight of them fit before the end of the memory.
+/// 0x080ABBD8 in B.70). Nine of them fit before the end of the memory.
 pub const FRAME_SPACING: usize = 0x0007_1800;
-const _: () = assert!(FRAMEBUFFER + 8 * FRAME_SPACING <= BASE + SIZE);
+const _: () = assert!(FRAMEBUFFER + 9 * FRAME_SPACING <= BASE + SIZE);
 
 const GPIOE: usize = 0x4800_1000;
 const CRE_PIN: u32 = 2;

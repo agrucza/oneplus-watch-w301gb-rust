@@ -242,7 +242,7 @@ Remaining:
    events.
 7. Firmware update of the chip from `tp_firmware.bin` (only if ever needed).
 
-### 3.2 Buttons (item 11) - done
+### 3.2 Buttons (item 11) - done; other chips not powered down when off
 
 **Measured:** the upper button is PC13 (pull-up, pressed reads low). The
 lower button is wired to the Apollo, which reports it in message kind 51.
@@ -277,17 +277,89 @@ ended by a release or a double click after 10 to 800 ms by the Apollo's
 clock. Measured: 28 presses as fast as possible gave 28 steps, where the
 Apollo sent a single "clicked".
 
-**In use:** a click of the upper button (released within 800 ms) blanks
-and shows the display; a short press of the lower one steps the
-brightness mode; a long press of the lower one starts and stops a
-heart-rate measurement.
+**What the buttons do** (`app::controls`; seen working on the watch
+2026-11-23, by the user's account - the log of that run was not pulled):
+a table gives an action for every kind of press of each button. It can
+be changed while the firmware runs (`Bindings::set`); nothing changes it
+yet, and nothing stores it. This is our own design, not the stock app's.
+
+| Button | Press | Action at start |
+|---|---|---|
+| Upper | click | home or sleep: a dark display is shown; a lit one goes back to the face from another page, and dark from the face |
+| Upper | held 1 s | the power page |
+| Upper | held 10 s | restart at once; fixed, cannot be changed |
+| Lower | click | status page; from there back to the face |
+| Lower | double click | brightness step |
+| Lower | long (1.5 s, the Apollo's) | start or stop a heart-rate measurement |
+| Lower | very long (5 s, the Apollo's) | nothing |
+
+The upper button's presses are told apart from how long it is held
+(`Hold`); it has no double click, which would make every click late. The
+lower button's short presses are told apart as click and double click
+here (`Taps`, 300 ms), and a click waits those 300 ms only while a
+double click does something.
+
+**The power page** (`app::power`): restart, power off, stock firmware. A
+tap chooses a row, a second tap on it does it, a tap elsewhere takes the
+choice back. Restart and the return to stock work.
+
+**Power off** (two halves; the second not yet tried on the watch).
+
+1. The Apollo. Read in the stock app: "model sys shutdown" (0x0807FAB2)
+   calls 0x0805C6C6, which sends the Apollo message kind 102 with field
+   1 = 3. Read in the Apollo: its dispatcher (0x3EC88) logs "shut down
+   event!" and the routine at 0x54164 stops the sensors, switches supply
+   pins and puts the Apollo to sleep. Measured: the Apollo acknowledges
+   after 31 ms and then takes no more messages; the STM32 keeps running.
+   On the charger the STM32 was restarted within 10 s instead (by what
+   was not seen; the Apollo holds the STM32's reset line).
+2. The STM32. Read in the stock app: after the acknowledgement a task
+   runs 0x08024776: a power-down of the other chips (0x08024702, not
+   read), PF3 as input with pull-down and that pull-down kept through
+   PWR_PDCRF, then Shutdown mode (0x0804C9EA). No wake-up pin is enabled
+   there. This firmware does the same 500 ms after the message
+   (`hal::power::shutdown`), without the power-down of the other chips,
+   Measured: the display stays dark, the lower button does nothing,
+   the clock keeps running.
+3. Switching on. Measured: on the charger the Apollo wakes and restarts
+   the STM32 through its reset line (reset cause "pin"), and the watch
+   comes up with the Apollo talking. Tried and dropped: the upper button
+   as the STM32's wake-up pin 2. It starts the STM32 (reset cause
+   "brown-out pin"), but the Apollo sleeps on, and neither the reset
+   pulse on PG12 nor holding the upper button for up to 8.5 s wakes it.
+
+Read in the Apollo, and seen on the watch by the user (a hold of the
+lower button of about 3 s started it; no log read for that run): how a
+button switches the watch on.
+When it starts after a shutdown ("isShutDown is valid", 0x41414) and no
+charger is there, the Apollo marks the STM32 as off and waits. Its key
+handler (lcPowerPowerKeyParse, 0x40CF8) then answers a long press of its
+own key with "Wake stm32!" and a pulse on the STM32's reset line
+(0x33E24, pin 16); with the STM32 marked as on, the same handler sends
+the key events of kind 51 instead, so the key is the lower button. A
+press that stays short does not count, and after 10 s without a long
+press the Apollo sleeps again ("Shutdown apollo !"). The Apollo has to
+start up first after the press that wakes it (in our logs its first
+message comes about 5 s after a reset), so the hold has to outlast
+that; how long exactly has not been measured. The upper button does not
+reach the Apollo as far as the code read shows.
+
+Not known: how much current the watch draws while off without the
+power-down of the other chips.
+
+A restart comes back to this firmware only once a PC has been in touch
+since the start (the bootloader is then booked to install it again);
+before that it leads to the stock firmware, and the page says which.
+The same goes for the upper button's 10 seconds.
 
 Remaining:
-1. Long-press detection for the upper button, matching what the Apollo
-   does for the lower one.
-2. A long hold as a "return to stock" gesture that does not depend on
-   Bluetooth.
-3. What the stock app does with the double click and the very long press.
+1. Power off: try it on the watch (does the power go, how does the watch
+   start again, and into which firmware).
+2. Keeping the table: a settings file and a page to change it.
+3. The rule that a start without a PC within 30 minutes returns to the
+   stock firmware, and that a restart before a PC was seen does: both
+   belong to the bring-up and stand in the way of stand-alone use. To
+   be decided by the user.
 
 ### 3.3 Display (item 4) - pipeline done; one open limit
 

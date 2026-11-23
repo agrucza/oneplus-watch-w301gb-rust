@@ -23,14 +23,17 @@ pub enum Page {
     /// long press on a page beside the face leads to another screen,
     /// probably the one to arrange those pages on.
     Cards,
+    /// Restart, power off and the way back to the stock firmware
+    /// (`super::power`).
+    Power,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
-pub const FRAMES: usize = 8;
+pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -39,6 +42,7 @@ impl Page {
             Page::Below => 3,
             Page::Faces => 4,
             Page::Cards => 5,
+            Page::Power => 6,
         }
     }
 
@@ -46,7 +50,10 @@ impl Page {
     /// how many. Every page keeps its picture, so that it is there when
     /// the page is wanted again. A page whose picture changes while it
     /// is shown has two frames, to draw into the one that is not on the
-    /// screen; a page that always looks the same has one.
+    /// screen; a page that always looks the same has one, and so has
+    /// the power page, which changes only on a tap: its frame is drawn
+    /// into between two pictures, and the panel shows what it was sent
+    /// until the next one.
     pub fn frames(self) -> (usize, usize) {
         match self {
             Page::Face => (0, 2),
@@ -55,6 +62,7 @@ impl Page {
             Page::Below => (5, 1),
             Page::Faces => (6, 1),
             Page::Cards => (7, 1),
+            Page::Power => (8, 1),
         }
     }
 }

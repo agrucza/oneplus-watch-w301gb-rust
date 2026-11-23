@@ -89,7 +89,7 @@ pub struct Resources {
 }
 
 /// How many frames the panel is given.
-pub const FRAMES: usize = 8;
+pub const FRAMES: usize = 9;
 
 /// A piece of a picture of a move (`Panel::present_move`): a rectangle of
 /// the frame with the page coming (`coming`) or of the frame with the

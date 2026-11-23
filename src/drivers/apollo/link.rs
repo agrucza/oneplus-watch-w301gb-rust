@@ -607,6 +607,12 @@ impl Apollo {
         self.send(messages::HEART_RATE_SET, messages::heart_rate(on).as_bytes(), log).await
     }
 
+    /// Ask the Apollo to switch the watch off (`messages::power_off`).
+    /// True if it took the message; the power goes a moment later.
+    pub async fn power_off(&mut self, log: &mut Log) -> bool {
+        self.send(messages::SYSTEM, messages::power_off().as_bytes(), log).await
+    }
+
     /// Stop a vibration that is still going.
     #[allow(dead_code)] // not needed yet: the pulses in use end by themselves
     pub async fn stop_vibration(&mut self, log: &mut Log) -> bool {

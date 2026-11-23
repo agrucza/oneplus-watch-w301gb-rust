@@ -1,9 +1,11 @@
 //! The application: bring the hardware up in a safe order, then run.
 
+mod controls;
 mod face;
 mod motion;
 mod pages;
 mod panels;
+mod power;
 mod shared;
 mod status;
 
@@ -15,9 +17,9 @@ use embassy_time::{Duration, Instant, Timer};
 use crate::board::Board;
 use crate::boot::{faults, ticket, watchdog};
 use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
-use crate::drivers::buttons::ButtonEvent;
 use crate::drivers::cypress::Link;
 use crate::services::gestures::{Gesture, Gestures};
+use controls::{Action, Bindings, Button, Hold, Press, Taps};
 use motion::Motion;
 use pages::Page;
 
@@ -203,8 +205,6 @@ pub async fn run(spawner: Spawner, board: Board) {
 const BRIGHTNESS: [u8; 4] = [0x20, 0x60, 0x85, 0xFF];
 /// What the stock app's panel set-up leaves the brightness at.
 const START_BRIGHTNESS: u8 = 0x85;
-/// A press of the upper button shorter than this is a click.
-const CLICK_MS: u64 = 800;
 /// Automatic brightness moves the panel by at most `FADE_STEP` every
 /// `FADE_INTERVAL`: from darkest to brightest in about two seconds.
 const FADE_STEP: u8 = 4;
@@ -731,6 +731,11 @@ struct Screen {
     /// The frame the panel was sent last, whole; `None` before the first
     /// picture.
     on_screen: Option<usize>,
+    /// The power page: the row tapped once, the row tapped twice (to be
+    /// done by `display_task`), and whether a restart comes back here.
+    power_chosen: Option<power::Choice>,
+    power_do: Option<power::Choice>,
+    stays: bool,
     /// A change of page under the finger or running out by itself.
     pull: Option<Pull>,
     /// The bulky part of what the screen keeps track of (see `Tracking`).
@@ -777,6 +782,9 @@ impl Screen {
             last_touch: None,
             page: Page::Face,
             on_screen: None,
+            power_chosen: None,
+            power_do: None,
+            stays: false,
             pull: None,
             t: Tracking::take(),
             next_frame: Instant::now(),
@@ -796,41 +804,77 @@ impl Screen {
         }
     }
 
-    /// React to a click: the upper button blanks and shows the picture,
-    /// the lower one steps the brightness (automatic, then the fixed steps).
-    async fn click(&mut self, upper: bool, log: &mut Log) {
-        let taken = if upper {
-            self.visible = !self.visible;
-            self.visible_since = Instant::now();
-            self.shown_by_raise = false;
-            self.last_button = "upper: click";
-            let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
-            self.panel.set_visible(self.visible).await
-        } else {
-            self.last_button = "lower: click";
-            self.fixed = match self.fixed {
-                None => Some(0),
-                Some(n) if n + 1 < BRIGHTNESS.len() => Some(n + 1),
-                Some(_) => None,
-            };
-            match self.fixed {
-                Some(n) => {
-                    let _ = writeln!(log.stamp(), "display: brightness fixed, step {} of {}", n + 1, BRIGHTNESS.len());
-                    self.level = BRIGHTNESS[n];
-                    self.level_logged = self.level;
-                    self.panel.set_brightness(self.level).await
-                }
-                None => {
-                    let _ = writeln!(log.stamp(), "display: brightness automatic");
-                    true // `fade` takes it from here
+    /// Do what a press of a button stands for (`controls::Bindings`).
+    async fn act(&mut self, action: Action, log: &mut Log) {
+        let taken = match action {
+            Action::HomeOrSleep => {
+                self.last_button = "button: home / sleep";
+                if self.visible && self.page != Page::Face {
+                    // Lit, on another page: back to the watch face.
+                    self.pull = None;
+                    self.go_to(Page::Face, log);
+                    true
+                } else {
+                    self.visible = !self.visible;
+                    self.visible_since = Instant::now();
+                    self.shown_by_raise = false;
+                    let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
+                    self.panel.set_visible(self.visible).await
                 }
             }
+            Action::PowerMenu => {
+                self.last_button = "button: power page";
+                self.open(Page::Power, log).await
+            }
+            Action::Open(page) => {
+                self.last_button = "button: open a page";
+                // On that page already: back to the watch face.
+                let page = if self.visible && self.page == page { Page::Face } else { page };
+                self.open(page, log).await
+            }
+            Action::StepBrightness => {
+                self.last_button = "button: brightness";
+                self.fixed = match self.fixed {
+                    None => Some(0),
+                    Some(n) if n + 1 < BRIGHTNESS.len() => Some(n + 1),
+                    Some(_) => None,
+                };
+                match self.fixed {
+                    Some(n) => {
+                        let _ = writeln!(log.stamp(), "display: brightness fixed, step {} of {}", n + 1, BRIGHTNESS.len());
+                        self.level = BRIGHTNESS[n];
+                        self.level_logged = self.level;
+                        self.panel.set_brightness(self.level).await
+                    }
+                    None => {
+                        let _ = writeln!(log.stamp(), "display: brightness automatic");
+                        true // `fade` takes it from here
+                    }
+                }
+            }
+            // Done by the main task, never sent here.
+            Action::Nothing | Action::ToggleHeartRate | Action::Restart => true,
         };
         if !taken {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
         self.last_touch = None;
         self.drawn_for = None; // show the change at once
+    }
+
+    /// Show `page`, lighting the display if it is dark. False if the
+    /// panel did not take the command to light up.
+    async fn open(&mut self, page: Page, log: &mut Log) -> bool {
+        self.pull = None;
+        self.go_to(page, log);
+        if self.visible {
+            return true;
+        }
+        self.visible = true;
+        self.visible_since = Instant::now();
+        self.shown_by_raise = false;
+        let _ = writeln!(log.stamp(), "display: shown");
+        self.panel.set_visible(true).await
     }
 
     /// React to a wrist gesture from the Apollo. Raising the wrist shows a
@@ -942,6 +986,18 @@ impl Screen {
                 if let (Some(page), None) = (pages::tap(self.page), self.pull) {
                     self.go_to(page, log);
                 }
+                if self.page == Page::Power {
+                    // The first tap on a row chooses it, the second
+                    // does it; a tap anywhere else takes the choice back.
+                    let hit = power::choice_at(x, y);
+                    if hit.is_some() && hit == self.power_chosen {
+                        self.power_do = hit;
+                    } else {
+                        self.power_chosen = hit;
+                    }
+                    self.t.damage[Page::Power.index()].add(face::whole());
+                    self.changed = true;
+                }
             }
             Gesture::LongPress { x, y } => {
                 let _ = writeln!(log.stamp(), "touch: long press at {}, {}", x, y);
@@ -956,6 +1012,10 @@ impl Screen {
     /// Show `page` from the next picture on, without a move in between.
     fn go_to(&mut self, page: Page, log: &mut Log) {
         let _ = writeln!(log.stamp(), "display: {:?} -> {:?}", self.page, page);
+        // A row chosen on the power page does not outlast the page.
+        if self.power_chosen.take().is_some() {
+            self.t.damage[Page::Power.index()].add(face::whole());
+        }
         // The page's own frames hold its picture as it was last drawn;
         // the next picture brings it up to date and shows it.
         self.page = page;
@@ -1157,6 +1217,19 @@ impl Screen {
                     }
                 }
                 self.stages[2] += lap(&mut stage);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Power {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                power::draw(&mut canvas, &area, self.power_chosen, self.stays);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -1404,6 +1477,11 @@ impl Screen {
 }
 
 /// How often the light sensor is read.
+/// How long after the message to the Apollo the STM32 switches itself
+/// off: time for the Apollo's acknowledgement (31 ms when measured) and
+/// for the log file.
+const POWER_OFF_MS: u64 = 500;
+
 const LIGHT_INTERVAL: Duration = Duration::from_millis(250);
 /// The sensor reads 0 until its first measurement is finished (measured:
 /// 0 after 22 ms, a real value after 270 ms), so wait this long after
@@ -1491,9 +1569,9 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         let state = shared::state();
         while let Some(event) = shared::next_event() {
             match event {
-                shared::Event::Click { upper } => {
+                shared::Event::Act(action) => {
                     let _turn = crate::services::turn::take().await;
-                    screen.click(upper, &mut log).await
+                    screen.act(action, &mut log).await
                 }
                 shared::Event::Wrist(gesture) => {
                     let _turn = crate::services::turn::take().await;
@@ -1503,6 +1581,26 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             }
         }
         shared::set_visible(screen.visible);
+        if screen.stays != state.stays {
+            // The power page says where a restart leads.
+            screen.stays = state.stays;
+            screen.t.damage[Page::Power.index()].add(face::whole());
+        }
+        match screen.power_do.take() {
+            Some(power::Choice::PowerOff) => {
+                // The Apollo switches the watch off, and the main task
+                // talks to the Apollo. Dark first: the picture would
+                // otherwise stand until the power goes.
+                let _ = writeln!(log.stamp(), "power: power off chosen on the watch");
+                screen.power_chosen = None;
+                screen.t.damage[Page::Power.index()].add(face::whole());
+                screen.visible = false;
+                screen.panel.set_visible(false).await;
+                shared::request_power_off();
+            }
+            Some(choice) => power_do(choice, &mut log),
+            None => {}
+        }
         if state.transferring {
             Timer::after_millis(20).await;
             continue;
@@ -1535,6 +1633,28 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
     }
 }
 
+/// Do what was chosen on the power page. Comes back only if it could
+/// not be done.
+fn power_do(choice: power::Choice, log: &mut Log) {
+    match choice {
+        power::Choice::Restart => {
+            let _ = writeln!(log.stamp(), "power: restart chosen on the watch");
+        }
+        power::Choice::Stock => {
+            let _ = writeln!(log.stamp(), "power: return to the stock firmware chosen on the watch");
+            if ticket::request_install(ticket::Source::PacketA, 0x8C).is_err() {
+                let _ = writeln!(log.stamp(), "power: could not book the stock firmware; staying");
+                let _ = log.flush();
+                return;
+            }
+        }
+        // Done by the display task's loop: it needs the main task.
+        power::Choice::PowerOff => return,
+    }
+    let _ = log.flush();
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
 /// Everything besides the display, once the hardware is up: the Apollo,
 /// Bluetooth, the buttons, the sensors and the log file. Each pass takes
 /// at most about 20 ms unless a packet is being dealt with. Ends only in a
@@ -1551,6 +1671,10 @@ async fn main_loop(
     let mut log = Log::get();
     let mut last_save = Instant::now();
     let mut measuring_heart = false;
+    let bindings = Bindings::new();
+    let (mut hold, mut taps) = (Hold::new(), Taps::new());
+    // When the STM32 switches itself off, after the Apollo was asked to.
+    let mut power_off_at: Option<u64> = None;
     loop {
         // The Apollo's handshake cannot wait long, so look after it on every
         // pass - but not while a package is streaming in.
@@ -1562,8 +1686,12 @@ async fn main_loop(
 
         let lux = if server.transferring() { None } else { sensors.poll(&mut log) };
 
-        // Buttons: the upper one is ours, the lower one comes through the Apollo.
-        let upper_click = matches!(buttons.poll(&mut log), Some(ButtonEvent::Released { held_ms }) if held_ms < CLICK_MS);
+        // Buttons: the upper one is ours, the lower one comes through the
+        // Apollo. Up to two presses can come out of one pass.
+        let now_ms = Instant::now().as_millis();
+        let mut presses: [Option<(Button, Press)>; 3] = [None; 3];
+        let _ = buttons.poll(&mut log);
+        presses[0] = hold.feed(buttons.upper_pressed(), now_ms).map(|press| (Button::Upper, press));
         if clock::take_changed() {
             if let Some(apollo) = apollo.as_mut() {
                 apollo.time_changed();
@@ -1574,22 +1702,74 @@ async fn main_loop(
         // the Apollo's own "clicked" comes 300 ms late and not for every
         // press (see `messages::KeyEvent`).
         let lower_presses = apollo.as_mut().map_or(0, |a| a.take_short_presses());
-        // Feedback through the vibration motor: one short pulse for a
-        // click, three for a long press.
-        if let Some(apollo) = apollo.as_mut() {
-            if lower_presses > 0 {
-                apollo.vibrate(200, 0, 1, &mut log).await;
+        // Short presses of the lower button are told apart as click and
+        // double click here; long ones the Apollo reports.
+        for _ in 0..lower_presses {
+            if let Some(press) = taps.pressed(now_ms, bindings.waits_for_double(Button::Lower)) {
+                presses[1] = Some((Button::Lower, press));
             }
-            match lower {
-                Some(KeyEvent::LongPressed) => {
-                    // A long press starts and stops a heart-rate
-                    // measurement: three pulses for start, two for stop.
-                    measuring_heart = !measuring_heart;
-                    apollo.measure_heart_rate(measuring_heart, &mut log).await;
-                    apollo.vibrate(200, 100, if measuring_heart { 3 } else { 2 }, &mut log).await;
+        }
+        if let (None, Some(press)) = (presses[1], taps.tick(now_ms)) {
+            presses[1] = Some((Button::Lower, press));
+        }
+        presses[2] = match lower {
+            Some(KeyEvent::LongPressed) => Some((Button::Lower, Press::Long)),
+            Some(KeyEvent::VeryLongPressed) => Some((Button::Lower, Press::VeryLong)),
+            _ => None,
+        };
+        // Feedback through the vibration motor: one short pulse for a
+        // short press of the lower button.
+        if let (Some(apollo), true) = (apollo.as_mut(), lower_presses > 0) {
+            apollo.vibrate(200, 0, 1, &mut log).await;
+        }
+        for (button, press) in presses.into_iter().flatten() {
+            let action = bindings.action(button, press);
+            let _ = writeln!(log.stamp(), "button: {:?} {:?} -> {:?}", button, press, action);
+            match action {
+                Action::Nothing => {}
+                Action::ToggleHeartRate => {
+                    // Three pulses for start, two for stop.
+                    if let Some(apollo) = apollo.as_mut() {
+                        measuring_heart = !measuring_heart;
+                        apollo.measure_heart_rate(measuring_heart, &mut log).await;
+                        apollo.vibrate(200, 100, if measuring_heart { 3 } else { 2 }, &mut log).await;
+                    }
                 }
+                Action::Restart => {
+                    // The way out, done here and not by the display task.
+                    let _ = writeln!(log.stamp(), "button: restarting");
+                    let _ = log.flush();
+                    cortex_m::peripheral::SCB::sys_reset();
+                }
+                _ if has_screen => shared::send(shared::Event::Act(action)),
                 _ => {}
             }
+        }
+        if shared::take_power_off() {
+            let sent = match apollo.as_mut() {
+                Some(apollo) => {
+                    let _ = log.flush();
+                    apollo.power_off(&mut log).await
+                }
+                None => false,
+            };
+            if sent {
+                let _ = writeln!(log.stamp(), "power: the Apollo was asked to switch the watch off");
+                // The Apollo acknowledges and then goes to sleep; the
+                // STM32 follows a moment later (below).
+                power_off_at = Some(now_ms + POWER_OFF_MS);
+            } else {
+                // Without the Apollo asleep nothing would start the watch
+                // again: stay on.
+                let _ = writeln!(log.stamp(), "power: the Apollo did not take the message; staying on");
+                shared::send(shared::Event::Act(Action::PowerMenu));
+            }
+            let _ = log.flush();
+        }
+        if power_off_at.is_some_and(|at| now_ms >= at) {
+            let _ = writeln!(log.stamp(), "power: entering the STM32's Shutdown mode");
+            let _ = log.flush();
+            crate::hal::power::shutdown();
         }
         // What the display task needs to know, and what happened for it.
         if has_screen {
@@ -1599,15 +1779,10 @@ async fn main_loop(
                 bluetooth_connected: server.connected,
                 measuring_heart,
                 transferring: server.transferring(),
+                stays: server.staying(),
             });
             if let Some(lux) = lux {
                 shared::send(shared::Event::Light(lux));
-            }
-            if upper_click {
-                shared::send(shared::Event::Click { upper: true });
-            }
-            for _ in 0..lower_presses {
-                shared::send(shared::Event::Click { upper: false });
             }
             if let Some(apollo) = apollo.as_mut() {
                 if let Some(gesture) = apollo.take_gesture() {

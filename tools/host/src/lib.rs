@@ -375,7 +375,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 6] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards];
+    const PAGES: [Page; 7] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -442,7 +442,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Above, Page::Below, Page::Faces, Page::Cards] {
+        for page in [Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -452,7 +452,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Status, Page::Above, Page::Below] {
+        for page in [Page::Face, Page::Status, Page::Above, Page::Below, Page::Power] {
             assert_eq!(tap(page), None);
         }
     }
@@ -502,5 +502,170 @@ mod touch_report {
         assert_eq!(parse(&report), None);
         assert_eq!(parse(&FINGER[..6]), None);
         assert_eq!(parse(&[]), None);
+    }
+}
+
+/// `app::controls`: what the buttons do.
+#[cfg(test)]
+mod controls {
+    use crate::app::controls::{Action, Bindings, Button, Hold, Press, Taps, DOUBLE_MS, LONG_MS, VERY_LONG_MS};
+    use crate::app::pages::Page;
+
+    #[test]
+    fn the_table_at_start() {
+        let b = Bindings::new();
+        assert_eq!(b.action(Button::Upper, Press::Click), Action::HomeOrSleep);
+        assert_eq!(b.action(Button::Upper, Press::DoubleClick), Action::Nothing);
+        assert_eq!(b.action(Button::Upper, Press::Long), Action::PowerMenu);
+        assert_eq!(b.action(Button::Upper, Press::VeryLong), Action::Restart);
+        assert_eq!(b.action(Button::Lower, Press::Click), Action::Open(Page::Status));
+        assert_eq!(b.action(Button::Lower, Press::DoubleClick), Action::StepBrightness);
+        assert_eq!(b.action(Button::Lower, Press::Long), Action::ToggleHeartRate);
+        assert_eq!(b.action(Button::Lower, Press::VeryLong), Action::Nothing);
+    }
+
+    #[test]
+    fn changing_the_table() {
+        let mut b = Bindings::new();
+        assert!(b.set(Button::Lower, Press::Click, Action::StepBrightness));
+        assert_eq!(b.action(Button::Lower, Press::Click), Action::StepBrightness);
+        // The rest is as it was.
+        assert_eq!(b.action(Button::Upper, Press::Click), Action::HomeOrSleep);
+        assert_eq!(b.action(Button::Lower, Press::Long), Action::ToggleHeartRate);
+        // The way out stays where it is, and nowhere else.
+        assert!(!b.set(Button::Upper, Press::VeryLong, Action::Nothing));
+        assert_eq!(b.action(Button::Upper, Press::VeryLong), Action::Restart);
+        assert!(!b.set(Button::Lower, Press::Click, Action::Restart));
+        assert_eq!(b.action(Button::Lower, Press::Click), Action::StepBrightness);
+    }
+
+    #[test]
+    fn double_clicks_are_waited_for_only_if_they_do_something() {
+        let mut b = Bindings::new();
+        assert!(!b.waits_for_double(Button::Upper));
+        assert!(b.waits_for_double(Button::Lower));
+        assert!(b.set(Button::Lower, Press::DoubleClick, Action::Nothing));
+        assert!(!b.waits_for_double(Button::Lower));
+    }
+
+    #[test]
+    fn upper_click() {
+        let mut h = Hold::new();
+        assert_eq!(h.feed(false, 0), None);
+        assert_eq!(h.feed(true, 100), None);
+        assert_eq!(h.feed(true, 100 + LONG_MS - 1), None);
+        assert_eq!(h.feed(false, 100 + LONG_MS - 1), Some(Press::Click));
+        assert_eq!(h.feed(false, 5000), None);
+    }
+
+    /// A long press comes while the button is down, once, and no click
+    /// when it comes up.
+    #[test]
+    fn upper_long() {
+        let mut h = Hold::new();
+        h.feed(true, 0);
+        assert_eq!(h.feed(true, LONG_MS - 1), None);
+        assert_eq!(h.feed(true, LONG_MS), Some(Press::Long));
+        assert_eq!(h.feed(true, LONG_MS + 500), None);
+        assert_eq!(h.feed(false, LONG_MS + 600), None);
+        // The next press starts clean.
+        h.feed(true, 20_000);
+        assert_eq!(h.feed(false, 20_100), Some(Press::Click));
+    }
+
+    #[test]
+    fn upper_very_long() {
+        let mut h = Hold::new();
+        h.feed(true, 0);
+        assert_eq!(h.feed(true, LONG_MS), Some(Press::Long));
+        assert_eq!(h.feed(true, VERY_LONG_MS - 1), None);
+        assert_eq!(h.feed(true, VERY_LONG_MS), Some(Press::VeryLong));
+        assert_eq!(h.feed(true, VERY_LONG_MS + 5000), None);
+        assert_eq!(h.feed(false, VERY_LONG_MS + 6000), None);
+        // Seen only after ten seconds (the firmware was busy): the very
+        // long press, not the long one after it.
+        let mut h = Hold::new();
+        h.feed(true, 0);
+        assert_eq!(h.feed(true, VERY_LONG_MS + 1), Some(Press::VeryLong));
+        assert_eq!(h.feed(true, VERY_LONG_MS + 2), None);
+    }
+
+    #[test]
+    fn lower_clicks_without_waiting() {
+        let mut t = Taps::new();
+        assert_eq!(t.pressed(0, false), Some(Press::Click));
+        assert_eq!(t.pressed(100, false), Some(Press::Click));
+        assert_eq!(t.tick(1000), None);
+    }
+
+    #[test]
+    fn lower_click_and_double_click() {
+        let mut t = Taps::new();
+        // One press: a click once the time for a second has passed.
+        assert_eq!(t.pressed(0, true), None);
+        assert_eq!(t.tick(DOUBLE_MS), None);
+        assert_eq!(t.tick(DOUBLE_MS + 1), Some(Press::Click));
+        assert_eq!(t.tick(DOUBLE_MS + 500), None);
+        // Two presses in time: a double click and no click.
+        assert_eq!(t.pressed(1000, true), None);
+        assert_eq!(t.pressed(1000 + DOUBLE_MS, true), Some(Press::DoubleClick));
+        assert_eq!(t.tick(5000), None);
+        // Two presses too far apart, with nothing looking in between:
+        // the first one's click is lost to nobody, it comes with the
+        // tick; the second starts over.
+        assert_eq!(t.pressed(6000, true), None);
+        assert_eq!(t.tick(6000 + DOUBLE_MS + 1), Some(Press::Click));
+        assert_eq!(t.pressed(6000 + DOUBLE_MS + 50, true), None);
+        assert_eq!(t.tick(6000 + 2 * DOUBLE_MS + 60), Some(Press::Click));
+        // Three quick presses: a double click, then a click.
+        assert_eq!(t.pressed(9000, true), None);
+        assert_eq!(t.pressed(9100, true), Some(Press::DoubleClick));
+        assert_eq!(t.pressed(9200, true), None);
+        assert_eq!(t.tick(9200 + DOUBLE_MS + 1), Some(Press::Click));
+    }
+}
+
+/// `app::power`: the rows of the power page.
+#[cfg(test)]
+mod power {
+    use crate::app::power::{choice_at, row_rect, Choice, CHOICES};
+    use embedded_graphics::prelude::*;
+
+    #[test]
+    fn a_tap_finds_its_row() {
+        for (n, &choice) in CHOICES.iter().enumerate() {
+            let middle = row_rect(n).center();
+            assert_eq!(choice_at(middle.x, middle.y), Some(choice));
+        }
+        // Between and beside the rows: nothing.
+        assert_eq!(choice_at(227, 20), None);
+        assert_eq!(choice_at(227, 400), None);
+        assert_eq!(choice_at(10, row_rect(0).center().y), None);
+        let gap = row_rect(0).top_left.y + row_rect(0).size.height as i32 + 2;
+        assert_eq!(choice_at(227, gap), None);
+    }
+
+    /// The rows lie inside the round screen and do not overlap.
+    #[test]
+    fn rows_fit() {
+        for n in 0..CHOICES.len() {
+            let r = row_rect(n);
+            for corner in [r.top_left, r.top_left + Point::new(r.size.width as i32 - 1, 0), r.top_left + Point::new(0, r.size.height as i32 - 1), r.top_left + Point::new(r.size.width as i32 - 1, r.size.height as i32 - 1)] {
+                let (dx, dy) = (corner.x - 227, corner.y - 227);
+                assert!(dx * dx + dy * dy <= 227 * 227, "row {n} corner {corner:?}");
+            }
+            if n > 0 {
+                assert!(row_rect(n - 1).intersection(&r).is_zero_sized());
+            }
+        }
+    }
+
+    #[test]
+    fn every_choice_has_a_row() {
+        for (n, &choice) in CHOICES.iter().enumerate() {
+            let centre = row_rect(n).center();
+            assert_eq!(choice_at(centre.x, centre.y), Some(choice));
+        }
+        assert!(CHOICES.contains(&Choice::PowerOff));
     }
 }

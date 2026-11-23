@@ -132,6 +132,14 @@ impl Server {
         matches!(self.state, State::Receiving { .. })
     }
 
+    /// Whether a reset comes back to this firmware: the bootloader is
+    /// booked to install it again, which happens once a PC has been in
+    /// touch since the start. Otherwise a reset goes to the stock
+    /// firmware.
+    pub fn staying(&self) -> bool {
+        self.staying
+    }
+
     /// Wait up to 20 ms for a packet from the Bluetooth chip and deal with
     /// it. An install or a return request ends in a reset from in here.
     pub async fn step(&mut self, link: &mut Link, log: &mut Log) -> Activity {

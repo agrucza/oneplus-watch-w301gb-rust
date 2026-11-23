@@ -33,7 +33,6 @@ impl Buttons {
     }
 
     /// Is the upper button held down right now?
-    #[allow(dead_code)]
     pub fn upper_pressed(&self) -> bool {
         self.pressed
     }
