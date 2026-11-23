@@ -873,6 +873,25 @@ on the watch.
 The time zone is kept in backup register 3 as signed minutes, as the
 stock app keeps it; `AT^W301TIME` takes an optional zone (`+0100`).
 
+**The clock loses time at every start, through the stock bootloader**
+(found 2026-11-23). Measured with `tools/ota.sh clock`, which compares
+the watch's clock with the PC's to a few milliseconds: no drift while
+the watch runs (5 ms in 61 minutes), and 0.73 s and 0.44 s lost at two
+restarts. Read in the bootloader: at every start it calls its
+`HAL_RTC_Init` (`0x0800C034`, `0x0800AB28`), which enters the clock's
+initialisation mode and rewrites the prescalers whether or not the clock
+is running; the part of the current second that has passed is dropped.
+The clock's calibration register holds 0x000081E8 from the stock
+firmware (512 pulses added, 488 dropped in 2^20: about 23 ppm faster);
+it is left alone. Our own resets are therefore timed
+(`hal::rtc::reset_on_the_second`): made at the start of a second, four
+restarts each cost 0.261 to 0.271 s, the bootloader's time to its clock
+set-up, so they are now made 756 ms into the second. Measured: four
+restarts cost 15 to 23 ms each; two more, between two readings, cost
+151 ms together, so one of those lost more than the rest, for a reason
+not found. Resets after a
+fault and a start by the Apollo cannot be timed and lose up to a second.
+
 Remaining:
 1. Daylight saving changes: nothing switches the zone by itself.
 2. Alarm and wake-up timer, when low power is done.
@@ -888,7 +907,7 @@ Would give a live log without Bluetooth.
 
 | Topic | Why it matters | Effort |
 |---|---|---|
-| Low power (sleep, stop) | Done: display switch-off timer, touch chip sleep, panel power-down (3.1, 3.3). The processor still only idles between loop passes, at 120 MHz. The stock app goes into Stop 2 whenever its tasks are idle (FreeRTOS tickless idle, `0x080237C8` in B.70: before stopping it checks that no frame is travelling, switches off eight DMA channels and their interrupts and, under conditions, the eMMC; its modules can forbid Stop through two masks it logs as "PM Sin" and "PM Din"). The HAL's Stop-mode support does not restore a PLL clock on this chip family, so ours is to be our own. Stages: (1) baseline drain from the log's battery line: measured 2026-11-23 over 2.13 h off the charger, off the wrist, display dark (panel powered down, touch chip asleep), Bluetooth not connected: 79 % to 71 %, 4186 to 4104 mV, 4.06 % an hour by a line through the 128 one-minute readings, which is about 25 h for a full battery; (2) the wake lines as interrupts and both loops waiting for events while dark (`hal::wake`; done and measured: dark and quiet, the main loop makes 150 passes in 30 s and the display task 75, against about 1000 to 1500 and 11,000 to 21,000 lit; upper button, lower button and wrist gesture wake the display as before. The line counts: the button gives 2 changes a click; the Apollo's request line none in a quiet dark 30 s and 5 to 15 otherwise; the Bluetooth chip's line PC7 none while nothing is connected and 472 during one log pull, so it moves with the chip's traffic); (3) Stop 2 while dark with clock restore; (4) sleeping until the next thing is due; (5) Bluetooth across a stop; (6) eMMC, PSRAM, PLLSAI2, touch interrupt pin | L |
+| Low power (sleep, stop) | Done: display switch-off timer, touch chip sleep, panel power-down (3.1, 3.3). The processor still only idles between loop passes, at 120 MHz. The stock app goes into Stop 2 whenever its tasks are idle (FreeRTOS tickless idle, `0x080237C8` in B.70: before stopping it checks that no frame is travelling, switches off eight DMA channels and their interrupts and, under conditions, the eMMC; its modules can forbid Stop through two masks it logs as "PM Sin" and "PM Din"). The HAL's Stop-mode support does not restore a PLL clock on this chip family, so ours is to be our own. Stages: (1) baseline drain from the log's battery line: measured 2026-11-23 over 2.13 h off the charger, off the wrist, display dark (panel powered down, touch chip asleep), Bluetooth not connected: 79 % to 71 %, 4186 to 4104 mV, 4.06 % an hour by a line through the 128 one-minute readings, which is about 25 h for a full battery; (2) the wake lines as interrupts and both loops waiting for events while dark (`hal::wake`; done and measured: dark and quiet, the main loop makes 150 passes in 30 s and the display task 75, against about 1000 to 1500 and 11,000 to 21,000 lit; upper button, lower button and wrist gesture wake the display as before. The line counts: the button gives 2 changes a click; the Apollo's request line none in a quiet dark 30 s and 5 to 15 otherwise; the Bluetooth chip's line PC7 none while nothing is connected and 472 during one log pull, so it moves with the chip's traffic); (3) Stop 2 while dark with clock restore. For this the embassy pin moved from the commit of 2026-09-04 to that of 2026-11-18 (Rust 1.95 to 1.100): upstream's LPTIM time base did not build for this chip family before 2026-11-17, and since then upstream also restores an L4+ clock set-up above 80 MHz after a stop, which makes its own Stop-mode support usable here after all. The jump is 1713 upstream commits, with rewrites of the DMA ring buffers, the UART and the I2C driver, so it is tested on its own first (built, not yet tried on the watch; two calls had to follow changed interfaces: the Bluetooth UART's pin order and the ADC constructor). Then: the time base on LPTIM1 from the 32 kHz crystal, then Stop 2; (4) sleeping until the next thing is due; (5) Bluetooth across a stop; (6) eMMC, PSRAM, PLLSAI2, touch interrupt pin | L |
 | 120 MHz system clock | **done and measured (2026-11-22):** 120 MHz with all bus dividers 1, as in the stock app; flash latency 5 and boost mode read back in the log. The embassy crates are pinned to upstream commit e1b23ae for this (see `Cargo.toml`): the 0.6.0 release sets at most latency 4 | done |
 | Resource files `stm32_res1.bin` (279 MB), `stm32_res2.bin` | Stock fonts and images; format unknown | M |
 | Robust update path | Today a broken image falls back to stock; a second slot (`packetB`) could hold a known-good Rust image | M |

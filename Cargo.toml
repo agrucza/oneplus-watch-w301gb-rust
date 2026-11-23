@@ -41,23 +41,25 @@ lto = "fat"
 codegen-units = 1
 debug = 2              # debug info stays in the ELF, never reaches the flash
 
-# The embassy crates come from one upstream commit instead of the 0.6.0
-# release: "rcc: fix L4+ and L5 high-speed clock setup" (2026-09-05). The
-# release sets at most flash wait setting 4 for this chip family, which is
-# only valid up to 100 MHz; the stock firmware runs at 120 MHz, which needs
-# 5. This commit also switches boost mode on and steps the bus divider as
-# the chip requires. It is the newest upstream state that builds with Rust
-# 1.95. Go back to a release once one contains the fix.
+# The embassy crates come from one upstream commit instead of a release.
+# The 0.6.0 release sets at most flash wait setting 4 for this chip family,
+# which is only valid up to 100 MHz; the stock firmware runs at 120 MHz,
+# which needs 5. Upstream fixed that on 2026-09-05 ("rcc: fix L4+ and L5
+# high-speed clock setup"), with boost mode and the bus-divider step the
+# chip requires. The commit pinned here (2026-11-18) also has what the
+# processor's Stop mode needs on this family: a time base on LPTIM that
+# builds for it (2026-11-17) and the clock restore after a stop. It needs
+# Rust 1.100. Go back to a release once one contains these.
 [patch.crates-io]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-hal-internal = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
-embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy", rev = "e1b23ae02ad9d315d8fdb90973fc0992e6234e18" }
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-hal-internal = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }
+embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy", rev = "9d4235376d04eb0d836a2e8b1cc35f78dd184388" }

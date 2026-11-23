@@ -150,7 +150,7 @@ impl RevisionPin {
     /// from the system clock divided by 128, 12 bits, channel 15, the
     /// shortest sampling time.
     pub fn measure(mut self) -> (u8, u16) {
-        let mut adc = Adc::new(self.adc);
+        let mut adc = Adc::new_blocking(self.adc, Default::default());
         // The HAL calibrates at the full system clock, which is above the
         // converter's limit. Divide the clock by 128 as the stock app does
         // and calibrate again.

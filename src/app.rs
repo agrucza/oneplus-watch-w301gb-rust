@@ -1732,7 +1732,7 @@ fn power_do(choice: power::Choice, log: &mut Log) {
         power::Choice::PowerOff => return,
     }
     let _ = log.flush();
-    cortex_m::peripheral::SCB::sys_reset();
+    crate::hal::rtc::reset_on_the_second();
 }
 
 /// Everything besides the display, once the hardware is up: the Apollo,
@@ -1822,7 +1822,7 @@ async fn main_loop(
                     // The way out, done here and not by the display task.
                     let _ = writeln!(log.stamp(), "button: restarting");
                     let _ = log.flush();
-                    cortex_m::peripheral::SCB::sys_reset();
+                    crate::hal::rtc::reset_on_the_second();
                 }
                 _ if has_screen => shared::send(shared::Event::Act(action)),
                 _ => {}

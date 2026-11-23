@@ -22,6 +22,7 @@ const RTC_ISR: *mut u32 = 0x4000_280C as *mut u32;
 const RTC_PRER: *mut u32 = 0x4000_2810 as *mut u32;
 const RTC_WPR: *mut u32 = 0x4000_2824 as *mut u32;
 const RTC_SSR: *mut u32 = 0x4000_2828 as *mut u32;
+const RTC_CALR: *const u32 = 0x4000_283C as *const u32;
 /// Backup register 3: the stock app keeps the time zone here (see
 /// `time_zone`).
 const RTC_BKP3R: *mut u32 = 0x4000_285C as *mut u32;
@@ -87,8 +88,22 @@ fn to_bcd(value: u8) -> u32 {
     ((value / 10) << 4 | value % 10) as u32
 }
 
+/// The clock's calibration register: how many of the crystal's pulses
+/// the clock is told to skip (bits 8:0, out of every 2^20) or to add
+/// (bit 15: 512 more), to correct a crystal that runs fast or slow. Kept
+/// in the backup domain, so whatever the stock firmware wrote is still
+/// in force.
+pub fn calibration() -> u32 {
+    unsafe { read_volatile(RTC_CALR) }
+}
+
 /// The current date and time, or `None` if the clock was never set.
 pub fn now() -> Option<DateTime> {
+    now_ms().map(|(time, _)| time)
+}
+
+/// The current date and time with the milliseconds into the second.
+pub fn now_ms() -> Option<(DateTime, u16)> {
     unsafe {
         if read_volatile(RTC_ISR) & ISR_INITS == 0 {
             return None;
@@ -96,10 +111,11 @@ pub fn now() -> Option<DateTime> {
         // Time and date are read one after the other; read again if the
         // clock ticked in between. Reading the sub-seconds first and the
         // date last is the order the chip's register latching expects.
-        let (mut tr, mut dr);
+        let (mut tr, mut dr, mut ss);
         let mut tries = 0;
         loop {
             let before = read_volatile(RTC_SSR);
+            ss = before;
             tr = read_volatile(RTC_TR);
             dr = read_volatile(RTC_DR);
             if read_volatile(RTC_SSR) == before && read_volatile(RTC_TR) == tr {
@@ -116,7 +132,10 @@ pub fn now() -> Option<DateTime> {
         if read_volatile(RTC_CR) & CR_FMT_12H != 0 {
             hour = hour % 12 + if tr & TR_PM != 0 { 12 } else { 0 };
         }
-        Some(DateTime {
+        // The sub-second counter runs down from the prescaler's value.
+        let steps = (read_volatile(RTC_PRER) & 0x7FFF) + 1;
+        let ms = (steps.saturating_sub(1).saturating_sub(ss & 0xFFFF) * 1000 / steps).min(999) as u16;
+        let time = DateTime {
             year: 2000 + bcd((dr >> 16) & 0xFF) as u16,
             month: bcd((dr >> 8) & 0x1F),
             day: bcd(dr & 0x3F),
@@ -124,7 +143,8 @@ pub fn now() -> Option<DateTime> {
             hour,
             minute: bcd((tr >> 8) & 0x7F),
             second: bcd(tr & 0x7F),
-        })
+        };
+        Some((time, ms))
     }
 }
 
@@ -190,4 +210,40 @@ pub fn set(t: &DateTime) -> bool {
         write_volatile(RTC_WPR, 0xFF);
         entered
     }
+}
+
+/// Where in the second a deliberate reset is made, in milliseconds.
+///
+/// The stock bootloader sets the clock up afresh at every start
+/// (0x0800C034 calls its `HAL_RTC_Init` at 0x0800AB28, which enters the
+/// clock's initialisation mode and rewrites the prescalers without
+/// looking whether the clock is already running). That drops the part of
+/// the current second that has passed. Measured: the clock does not
+/// drift while the watch runs (5 ms in an hour), and one restart cost
+/// 0.73 s. The bootloader cannot be changed, but the moment of our own
+/// resets can: made so that the bootloader's set-up falls just after the
+/// start of a second, there is next to nothing to drop.
+///
+/// Measured with resets made at the start of a second: each of four
+/// restarts cost 0.261 to 0.271 s, which is the time the bootloader takes
+/// to reach its clock set-up. A reset 20 ms later than 1000 minus that
+/// puts the set-up about 20 ms into the next second: late enough never
+/// to fall before the second's start, which would cost a whole second.
+const RESET_AT_MS: u16 = 1000 - 264 + 20;
+
+/// Reset the processor at the moment in the second that costs the clock
+/// least (`RESET_AT_MS`); at once if the clock is not running. Waits up
+/// to a second, with everything else standing still.
+pub fn reset_on_the_second() -> ! {
+    // Several seconds' worth of looking at the clock, should it stand.
+    // Generous on purpose: giving up before the moment has come would
+    // reset at an arbitrary one.
+    for _ in 0..20_000_000u32 {
+        match now_ms() {
+            Some((_, ms)) if (ms + 1000 - RESET_AT_MS) % 1000 < 8 => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    cortex_m::peripheral::SCB::sys_reset()
 }

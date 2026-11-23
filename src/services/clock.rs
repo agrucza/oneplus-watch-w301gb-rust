@@ -72,6 +72,41 @@ pub fn now() -> Option<DateTime> {
     rtc::now()
 }
 
+/// The clock as text for the PC, which compares it with its own
+/// (`tools/clock.py`): local time to the millisecond, the time since
+/// this firmware started, and the clock's calibration register. Returns
+/// how many bytes of `out` were written.
+pub fn report(out: &mut [u8]) -> usize {
+    struct Cursor<'a>(&'a mut [u8], usize);
+    impl core::fmt::Write for Cursor<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut w = Cursor(out, 0);
+    let up_ms = embassy_time::Instant::now().as_millis();
+    let _ = match rtc::now_ms() {
+        Some((t, ms)) => write!(
+            w,
+            "W301TIME:{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} up={} calr={:#010x}\r\n",
+            t.year,
+            t.month,
+            t.day,
+            t.hour,
+            t.minute,
+            t.second,
+            ms,
+            up_ms,
+            rtc::calibration()
+        ),
+        None => write!(w, "W301TIME:unset up={}\r\n", up_ms),
+    };
+    w.1
+}
+
 fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         4 | 6 | 9 | 11 => 30,

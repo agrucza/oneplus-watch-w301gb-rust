@@ -40,7 +40,6 @@
 
 use core::fmt::Write;
 
-use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::drivers::cypress::{self, Link};
@@ -154,7 +153,7 @@ impl Server {
             if !self.handshaken && Instant::now() > self.first_contact_deadline {
                 let _ = writeln!(log.stamp(), "ota: no PC within 30 minutes of boot, returning to stock");
                 let _ = log.flush();
-                SCB::sys_reset();
+                crate::hal::rtc::reset_on_the_second();
             }
             return Activity::Idle;
         };
@@ -188,6 +187,9 @@ impl Server {
     
         // What to answer, decided while `packet` (borrowed from the link) is alive.
         let mut answer: &[u8] = b"";
+        // An answer that is put together here, where `answer` is fixed text.
+        let mut report = [0u8; 96];
+        let mut report_len = 0;
         let mut install = false;
         let mut to_stock = false;
         let mut export: Option<([u8; 128], usize)> = None; // "<volume>:<path>" to send to the PC
@@ -264,6 +266,8 @@ impl Server {
                 } else if text.contains("FI^OTAUPDATE") {
                     install = self.ready_image.is_some();
                     answer = if install { b"OK\r\n" } else { b"ERROR\r\n" };
+                } else if text.contains("AT^W301TIME?") {
+                    report_len = clock::report(&mut report);
                 } else if let Some((_, time)) = text.split_once("AT^W301TIME=") {
                     answer = if clock::set_from_text(time.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if text.contains("AT^W301STOCK") {
@@ -310,8 +314,11 @@ impl Server {
             }
         }
     
+        if report_len > 0 {
+            answer = &report[..report_len];
+        }
         if !answer.is_empty() {
-            let mut out = [0u8; 16];
+            let mut out = [0u8; 100];
             out[..2].copy_from_slice(&handle);
             out[2..2 + answer.len()].copy_from_slice(answer);
             if !link.send(CMD_SPP_DATA, &out[..2 + answer.len()]).await {
@@ -355,7 +362,7 @@ impl Server {
                     return Activity::Handled;
                 }
             }
-            SCB::sys_reset();
+            crate::hal::rtc::reset_on_the_second();
         }
         Activity::Handled
     }

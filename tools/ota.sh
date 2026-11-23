@@ -9,6 +9,7 @@
 #   tools/ota.sh time     set the watch's clock to this computer's local time (Rust app only)
 #   tools/ota.sh log        fetch 3:log/rust.log into target/rust.log and show its end
 #   tools/ota.sh oldlog     fetch 3:log/rust.old (the log before the last fresh start) into target/rust.old
+#   tools/ota.sh clock      compare the watch's clock with this computer's (appends to target/clock.txt)
 #
 # `send` finds out which firmware is running. To the Rust app it sends a
 # compact package over a single connection (a few seconds). To the stock app
@@ -82,6 +83,9 @@ oldlog) # the previous generation of the log, kept when the log was started afre
     ;;
 time) # Rust app is running: set its clock to this computer's local time
     python3 tools/settime.py
+    ;;
+clock) # Rust app is running: how far its clock is from this computer's
+    python3 tools/clock.py
     ;;
 stock) # Rust app is running: ask it to hand back to the stock firmware
     bt cmd "AT^W301STOCK"

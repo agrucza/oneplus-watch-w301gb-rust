@@ -116,7 +116,7 @@ impl Link {
         config.baudrate = 3_000_000;
         config.stop_bits = StopBits::STOP2;
         let uart =
-            Uart::new_with_rtscts(r.usart, r.rx, r.tx, r.rts, r.cts, r.tx_dma, r.rx_dma, Irqs, config).ok()?;
+            Uart::new_with_rtscts(r.usart, r.tx, r.rx, r.rts, r.cts, r.tx_dma, r.rx_dma, Irqs, config).ok()?;
         let (tx, rx) = uart.split();
         let ring = cortex_m::singleton!(: [u8; 16384] = [0; 16384])?;
         let buf = cortex_m::singleton!(: [u8; 5 + MAX_PAYLOAD + 256] = [0; 5 + MAX_PAYLOAD + 256])?;
