@@ -314,7 +314,7 @@ TouchGFX, as its assertion texts show):
   controller pointed at the new frame, immediate reload, host on, frame
   requested. The link carries 58 frames a second.
 - **Two frames in the PSRAM**, the second where the stock app has its
-  own, and two spare frames behind them for kept pictures. A picture is
+  own. A picture is
   drawn into the frame that is not shown, then presented;
   `Panel::present` returns while the frame travels.
 - **Only what changed is drawn** (`services::damage`): a list of changed
@@ -341,11 +341,8 @@ TouchGFX, as its assertion texts show):
   status line, two dials and moving marks. About 5 to 6 ms of drawing a
   picture, a picture every 66 ms by choice; its first full picture takes
   about 100 ms.
-- **Page changes follow the finger** (`app.rs`): the picture on screen
-  and the other page are kept in the spare frames, and every picture of
-  the change is put together from the two with two blitter copies. After
-  the finger lets go, the change runs out or falls back at the panel's
-  rate (16 to 22 ms a picture).
+- **Page changes follow the finger** (`app.rs`); how the pictures of a
+  move are made is described below.
 
 **The limit: the frame memory must be left alone while a frame travels.**
 Measured on the watch, 2026-11-23:
@@ -373,20 +370,28 @@ Measured on the watch, 2026-11-23:
   without a flag is inferred from what it looks like.
 
 So `Panel::settle` waits for the travelling frame before every access,
-and that is now a rule, not a diagnosis. What fits into the free 6.6 ms
-runs at the panel's full rate. Putting a page change together does not:
-two blitter copies of one frame's worth take about 10 ms, so under the
-finger a picture comes on every second pulse (34 ms).
+and that is a rule, not a diagnosis. What fits into the free 6.6 ms runs
+at the panel's full rate.
 
-The way out that is planned: let the display controller do the moving.
-It has two layers, each with its own frame and its own window on the
-screen; a page change is then the old page in one layer and the new one
-in the other, and every picture of the move is a handful of register
-writes at the frame's start, with nothing copied. That would give every
-pulse a picture and remove the copies that prepare a move as well.
+**Moves are made by the display controller** (measured on the watch,
+2026-11-23). It has two layers, each showing a rectangle of a frame
+somewhere on the screen. During a move the page on the screen stays in
+its frame, the page coming is drawn once into the other frame, and every
+picture of the move is a piece of each (`app::motion::Motion::pieces`),
+set at the frame's start in the DSI interrupt with the layers' windows
+and addresses (`hal::dsi::refresh_layers`). Nothing is copied for a
+picture. After a move one blitter copy makes the two frames equal again.
+
+- Under the finger a picture comes every 17.5 ms (135 pictures in
+  2365 ms), where copying gave one every 34 ms; after letting go the run
+  takes 17 to 19 ms a picture.
+- Preparing a move is now only drawing the page coming: 9 to 17 ms
+  towards the status page (29 before), 100 ms towards the face (121).
+- 43 moves of all kinds (pages, both panels in and out, the give, falling
+  back): no missed pulse, no starved frame, nothing displaced.
+- The two spare frames in the PSRAM are no longer used.
 
 Remaining:
-1. Page changes with the display controller's two layers (see above).
 2. The pause before a pulled page starts to move: 29 ms towards the
    status page, about 120 ms towards the face (its 180 soft ring
    segments drawn from scratch). Keeping page pictures would remove it.

@@ -102,6 +102,17 @@ pub async fn init(c: &Config) -> Result<(), Error> {
     layer.cfblr().write_value(lt::Cfblr((c.width * 2) << 16 | (c.width * 2 + 3)));
     layer.cfblnr().write_value(lt::Cfblnr(c.height));
     layer.cr().write_value(lt::Cr(1)); // layer on
+    // The second layer: the same fixed settings, off until a picture is
+    // put together from two frames (`refresh_layers`).
+    let second = LTDC.layer(1);
+    second.pfcr().write_value(lt::Pfcr(2));
+    second.dccr().write_value(lt::Dccr(0));
+    second.cacr().write_value(lt::Cacr(0xFF));
+    second.bfcr().write_value(lt::Bfcr(0x600 | 0x7));
+    second.cr().write_value(lt::Cr(0));
+    BACK_PORCH.store(bp, core::sync::atomic::Ordering::Relaxed);
+    PITCH.store(c.width * 2, core::sync::atomic::Ordering::Relaxed);
+    WHOLE.store(c.width << 16 | c.height, core::sync::atomic::Ordering::Relaxed);
     LTDC.srcr().write_value(lt::Srcr(1)); // load the layer settings now
     LTDC.gcr().modify(|w| w.0 |= 1); // LTDC on
 
@@ -251,35 +262,61 @@ pub struct RefreshStatus {
     pub psr: u32,
 }
 
+/// What one of the display controller's two layers shows: a rectangle of
+/// a frame, at its own size, somewhere on the screen.
+#[derive(Clone, Copy)]
+pub struct Layer {
+    /// Where the rectangle's first pixel lies in memory.
+    pub address: u32,
+    /// Where on the screen its top left corner goes, and its size.
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Start sending the frame at `framebuffer` to the panel and return while
 /// it is on its way, so the next picture can be drawn into the other
 /// frame meanwhile. `done` in the answer is about the frame before: it
 /// had gone out when this one was started.
+pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
+    let whole = WHOLE.load(core::sync::atomic::Ordering::Relaxed);
+    refresh_layers([Some(Layer { address: framebuffer, x: 0, y: 0, width: whole >> 16, height: whole & 0xFFFF }), None]).await
+}
+
+/// Start sending a picture made of up to two layers to the panel, and
+/// return while it is on its way. A layer given as `None` is off; where
+/// no layer is, the picture is black. The layers must not overlap (the
+/// second would lie over the first, but each pixel would then be read
+/// from memory twice).
 ///
 /// As the stock app (0x080ABC0A in B.70): on the tearing-effect pulse the
-/// DSI host is stopped, the layer's frame address is changed and loaded
-/// at once, and the host is started again; then the frame is requested.
+/// DSI host is stopped, the layer settings are changed and loaded at
+/// once, and the host is started again; then the frame is requested.
+/// Stock changes only the frame's address that way; here the layers'
+/// windows go the same way.
 ///
 /// The pulse is answered in the interrupt handler, as in the stock app,
 /// and not by looking for it from the task: the frame has to start within
 /// a fraction of a millisecond of the pulse, and a task that waits can be
 /// kept waiting for many milliseconds by the firmware's other task.
-pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
+pub async fn refresh_layers(layers: [Option<Layer>; 2]) -> RefreshStatus {
     use core::sync::atomic::Ordering;
     let done = frame_out().await;
     DSIHOST.wifcr().write_value(dsi::Wifcr(0b11)); // clear "tearing effect" and "refresh done"
-    // Hand the frame to the interrupt handler and let the pulse call it
+    // Hand the picture to the interrupt handler and let the pulse call it
     // (WIER bit 0).
-    ARMED.store(framebuffer, Ordering::Relaxed);
+    cortex_m::interrupt::free(|cs| NEXT.borrow(cs).set(layers));
+    ARMED.store(true, Ordering::Relaxed);
     DSIHOST.wier().modify(|w| w.0 |= 1);
-    let in_step = wait_for(Duration::from_millis(40), || ARMED.load(Ordering::Relaxed) == 0).await;
+    let in_step = wait_for(Duration::from_millis(40), || !ARMED.load(Ordering::Relaxed)).await;
     if !in_step {
         // No pulse: send the frame anyway, unless the pulse comes this
         // very moment.
         cortex_m::interrupt::free(|_| {
             DSIHOST.wier().modify(|w| w.0 &= !1);
-            if ARMED.swap(0, Ordering::Relaxed) != 0 {
-                start_frame(framebuffer);
+            if ARMED.swap(false, Ordering::Relaxed) {
+                start_frame(layers);
             }
         });
     }
@@ -293,23 +330,47 @@ pub async fn refresh_from(framebuffer: u32) -> RefreshStatus {
     }
 }
 
-/// The frame the next tearing-effect pulse starts: its address, or 0 for
-/// none.
-static ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// A picture is waiting for the next tearing-effect pulse (`NEXT`).
+static ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The layers of the picture the next pulse starts.
+static NEXT: cortex_m::interrupt::Mutex<core::cell::Cell<[Option<Layer>; 2]>> = cortex_m::interrupt::Mutex::new(core::cell::Cell::new([None, None]));
+/// From `init`: the display controller's back porch, the bytes from one
+/// line of a frame to the next, and the picture's size (width << 16 |
+/// height).
+static BACK_PORCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PITCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WHOLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Make `framebuffer` the frame the panel is sent and send it once.
-fn start_frame(framebuffer: u32) {
+/// Make `layers` what the panel is sent and send it once.
+fn start_frame(layers: [Option<Layer>; 2]) {
+    use core::sync::atomic::Ordering;
+    let (bp, pitch) = (BACK_PORCH.load(Ordering::Relaxed), PITCH.load(Ordering::Relaxed));
     DSIHOST.cr().write_value(dsi::Cr(0)); // host off
     DSIHOST.wcr().modify(|w| w.0 &= !(1 << 3)); // wrapper off
-    LTDC.layer(0).cfbar().write_value(lt::Cfbar(framebuffer));
+    for (n, layer) in layers.iter().enumerate() {
+        let registers = LTDC.layer(n);
+        match layer {
+            Some(l) if l.width != 0 && l.height != 0 => {
+                // Window: first and last pixel, counted from the start
+                // of the line and of the picture including the porch.
+                registers.whpcr().write_value(lt::Whpcr((bp + l.x + l.width) << 16 | (bp + l.x + 1)));
+                registers.wvpcr().write_value(lt::Wvpcr((bp + l.y + l.height) << 16 | (bp + l.y + 1)));
+                registers.cfbar().write_value(lt::Cfbar(l.address));
+                registers.cfblr().write_value(lt::Cfblr(pitch << 16 | (l.width * 2 + 3)));
+                registers.cfblnr().write_value(lt::Cfblnr(l.height));
+                registers.cr().write_value(lt::Cr(1));
+            }
+            _ => registers.cr().write_value(lt::Cr(0)),
+        }
+    }
     LTDC.srcr().write_value(lt::Srcr(1)); // load the layer settings now
     DSIHOST.cr().write_value(dsi::Cr(1)); // host on
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 3); // wrapper on
     DSIHOST.wcr().modify(|w| w.0 |= 1 << 2); // request one frame
-    IN_FLIGHT.store(true, core::sync::atomic::Ordering::Relaxed);
+    IN_FLIGHT.store(true, Ordering::Relaxed);
     // Diagnosis: time the frame. The "end of refresh" interrupt (WIER
     // bit 1) notes when it has gone out.
-    STARTED_US.store(Instant::now().as_micros() as u32, core::sync::atomic::Ordering::Relaxed);
+    STARTED_US.store(Instant::now().as_micros() as u32, Ordering::Relaxed);
     DSIHOST.wier().modify(|w| w.0 |= 1 << 1);
 }
 
@@ -343,9 +404,8 @@ unsafe fn DSI() {
     if enabled & flags & 1 != 0 {
         DSIHOST.wier().modify(|w| w.0 &= !1);
         DSIHOST.wifcr().write_value(dsi::Wifcr(1));
-        let framebuffer = ARMED.swap(0, Ordering::Relaxed);
-        if framebuffer != 0 {
-            start_frame(framebuffer);
+        if ARMED.swap(false, Ordering::Relaxed) {
+            start_frame(cortex_m::interrupt::free(|cs| NEXT.borrow(cs).get()));
         }
     }
 }

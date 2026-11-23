@@ -37,9 +37,6 @@ pub const FRAMEBUFFER: usize = BASE + 0x00C0_0000;
 /// The second frame, where the stock app has its own: 0x71800 bytes (512 x
 /// 454 pixels of two bytes) after the first (0x080ABBD8 in B.70).
 pub const FRAMEBUFFER_2: usize = FRAMEBUFFER + 0x0007_1800;
-/// Two more frames behind those, never shown themselves: pictures kept
-/// for sliding from one page to another.
-pub const SPARE_FRAMES: [usize; 2] = [FRAMEBUFFER + 2 * 0x0007_1800, FRAMEBUFFER + 3 * 0x0007_1800];
 
 const GPIOE: usize = 0x4800_1000;
 const CRE_PIN: u32 = 2;

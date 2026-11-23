@@ -270,6 +270,104 @@ mod motion {
     }
 }
 
+/// `app::motion`, the pictures of a move: what the screen shows, built
+/// from the pieces as the display controller would show them.
+#[cfg(test)]
+mod pieces {
+    use crate::app::motion::{Motion, Piece};
+
+    const S: i32 = 454;
+    const MOTIONS: [Motion; 8] = [
+        Motion::Pages { leftwards: true },
+        Motion::Pages { leftwards: false },
+        Motion::PanelIn { from_top: true },
+        Motion::PanelIn { from_top: false },
+        Motion::PanelOut { to_top: true },
+        Motion::PanelOut { to_top: false },
+        Motion::Give { leftwards: true },
+        Motion::Give { leftwards: false },
+    ];
+
+    /// What a screen pixel shows: which page's picture and which pixel
+    /// of it; `None` is black. Panics if two pieces claim one pixel or a
+    /// piece reaches outside the screen or the picture.
+    fn screen(pieces: [Option<Piece>; 2]) -> Vec<Option<(bool, i32, i32)>> {
+        let mut out = vec![None; (S * S) as usize];
+        for p in pieces.into_iter().flatten() {
+            assert!(p.width > 0 && p.height > 0, "{p:?}");
+            for (start, size) in [(p.from_x, p.width), (p.from_y, p.height), (p.to_x, p.width), (p.to_y, p.height)] {
+                assert!(start >= 0 && start + size <= S, "{p:?}");
+            }
+            for y in 0..p.height {
+                for x in 0..p.width {
+                    let at = &mut out[((p.to_y + y) * S + p.to_x + x) as usize];
+                    assert!(at.is_none(), "overlap in {p:?}");
+                    *at = Some((p.coming, p.from_x + x, p.from_y + y));
+                }
+            }
+        }
+        out
+    }
+
+    /// At the start all of the page being left, at the end all of the
+    /// page coming (a page that gives only ever shows itself).
+    #[test]
+    fn start_and_end() {
+        for motion in MOTIONS {
+            let start = screen(motion.pieces(0));
+            let end = screen(motion.pieces(motion.extent()));
+            for y in 0..S {
+                for x in 0..S {
+                    assert_eq!(start[(y * S + x) as usize], Some((false, x, y)), "{motion:?}");
+                    if !matches!(motion, Motion::Give { .. }) {
+                        assert_eq!(end[(y * S + x) as usize], Some((true, x, y)), "{motion:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every pixel of every picture on the way, against what the move is
+    /// meant to look like.
+    #[test]
+    fn on_the_way() {
+        for motion in MOTIONS {
+            for o in [1, 7, 50, 151, 227, 300, 453].into_iter().filter(|&o| o as usize <= motion.extent()) {
+                let got = screen(motion.pieces(o as usize));
+                for y in 0..S {
+                    for x in 0..S {
+                        let expected = match motion {
+                            // Two pages side by side, moved o pixels.
+                            Motion::Pages { leftwards: true } => Some(if x + o < S { (false, x + o, y) } else { (true, x + o - S, y) }),
+                            Motion::Pages { leftwards: false } => Some(if x >= o { (false, x - o, y) } else { (true, x - o + S, y) }),
+                            // A panel o rows in, its far end first, over a
+                            // face that does not move.
+                            Motion::PanelIn { from_top: true } => Some(if y < o { (true, x, y + S - o) } else { (false, x, y) }),
+                            Motion::PanelIn { from_top: false } => Some(if y >= S - o { (true, x, y - (S - o)) } else { (false, x, y) }),
+                            // A panel o rows out, over a face that does
+                            // not move.
+                            Motion::PanelOut { to_top: true } => Some(if y < S - o { (false, x, y + o) } else { (true, x, y) }),
+                            Motion::PanelOut { to_top: false } => Some(if y >= o { (false, x, y - o) } else { (true, x, y) }),
+                            // One page moved aside, black behind it.
+                            Motion::Give { leftwards: true } => (x + o < S).then_some((false, x + o, y)),
+                            Motion::Give { leftwards: false } => (x >= o).then_some((false, x - o, y)),
+                        };
+                        assert_eq!(got[(y * S + x) as usize], expected, "{motion:?} at {o}: pixel {x}, {y}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Asking for more than the whole way is the whole way.
+    #[test]
+    fn beyond_the_end() {
+        for motion in MOTIONS {
+            assert_eq!(motion.pieces(motion.extent() + 100), motion.pieces(motion.extent()), "{motion:?}");
+        }
+    }
+}
+
 /// `app::pages`: which gesture leads from which page to which.
 #[cfg(test)]
 mod pages {

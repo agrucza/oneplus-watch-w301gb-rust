@@ -148,8 +148,7 @@ pub async fn run(spawner: Spawner, board: Board) {
             let frames = unsafe {
                 [&mut *(psram::FRAMEBUFFER as *mut panel::Frame), &mut *(psram::FRAMEBUFFER_2 as *mut panel::Frame)]
             };
-            let spare = unsafe { psram::SPARE_FRAMES.map(|address| &mut *(address as *mut panel::Frame)) };
-            let mut panel = panel::Panel::start(board.display, frames, spare, &mut log).await;
+            let mut panel = panel::Panel::start(board.display, frames, &mut log).await;
             if let (true, Some(panel)) = (BLITTER_TIMING, panel.as_mut()) {
                 time_blitter(panel, &mut log).await;
                 let _ = log.flush();
@@ -1266,12 +1265,13 @@ impl Screen {
 
     /// Carry a change of page forward.
     ///
-    /// On the first call the picture on the screen is kept, the page being
-    /// pulled in is drawn completely (into the frame to draw into, which is
-    /// not shown) and kept as well. From then on every picture is put
-    /// together from the two with two blitter copies (`move_to`): while
-    /// the finger is down, at wherever the finger is; once it has let go,
-    /// in a short run to the end or back to the start.
+    /// On the first call the page being pulled in is drawn completely
+    /// into the frame to draw into, which is not shown. From then on the
+    /// display controller makes every picture from the two frames as they
+    /// are, a piece of each (`move_to`); nothing is copied. While the
+    /// finger is down the picture is wherever the finger is; once it has
+    /// let go, a short run takes it to the end or back to the start. Then
+    /// the frame that is not shown is made a copy of the one that is.
     #[allow(clippy::too_many_arguments)]
     async fn pull_on(&mut self, now: Instant, readings: Option<&Readings>, lux: Option<u32>, bluetooth_connected: bool, measuring_heart: bool, log: &mut Log) {
         let Some(mut pull) = self.pull.take() else {
@@ -1279,14 +1279,11 @@ impl Screen {
         };
         let gives = matches!(pull.motion, Motion::Give { .. });
         if pull.shown.is_none() && gives {
-            // Only the picture on the screen is needed, and the page
-            // stays the one it is.
-            pull.good &= self.panel.keep(0, false).await;
+            // The page stays the one it is; nothing is drawn.
             pull.shown = Some(0);
         }
         if pull.shown.is_none() {
             let began = Instant::now();
-            pull.good &= self.panel.keep(0, false).await;
             // What is known about the page being left, in case the finger
             // lets it fall back. Copied field by field inside the screen's
             // own memory: these are several kilobytes, and a value of that
@@ -1304,8 +1301,8 @@ impl Screen {
             self.t.lines = None;
             self.t.face_keys = [None; face::ELEMENTS];
             self.drawn_for = Some(now.as_secs());
+            self.panel.settle().await;
             let _ = self.draw(now, true, readings, lux, bluetooth_connected, measuring_heart, log);
-            pull.good &= self.panel.keep(1, true).await;
             pull.shown = Some(0);
             pull.prepared = began.elapsed();
         }
@@ -1314,7 +1311,6 @@ impl Screen {
             // Under the finger: one picture, where the finger is now.
             if pull.wanted != shown {
                 pull.good &= self.move_to(pull.motion, pull.wanted).await;
-                pull.good &= self.panel.present().await.in_step;
                 pull.shown = Some(pull.wanted);
                 pull.pictures += 1;
             }
@@ -1334,13 +1330,14 @@ impl Screen {
             let eased = 1024 - (1024 - t) * (1024 - t) / 1024;
             let offset = if step == steps { end } else if finish { shown + distance * eased / 1024 } else { shown - distance * eased / 1024 };
             pull.good &= self.move_to(pull.motion, offset).await;
-            pull.good &= self.panel.present().await.in_step;
             watchdog::feed();
         }
-        // The frame shown is right. Bring the other one to the same
-        // picture; then both are as the page was drawn.
-        pull.good &= self.move_to(pull.motion, end).await;
-        self.t.damage.clear();
+        if !gives {
+            // The screen shows one of the two pages whole. Make the other
+            // frame the same picture; then both are as the page was drawn.
+            pull.good &= self.panel.end_move(finish).await;
+            self.t.damage.clear();
+        }
         if !finish && !gives {
             self.page = self.t.left_page;
             self.t.lines = self.t.left_lines;
@@ -1362,18 +1359,21 @@ impl Screen {
         );
     }
 
-    /// Put together the picture of a change of page that has got `offset`
-    /// pixels on its way, from the kept pictures of the page being left
-    /// (0) and the page coming (1), in the frame to draw into.
+    /// Show the picture of a change of page that has got `offset` pixels
+    /// on its way: pieces of the page on the screen and of the page
+    /// drawn into the other frame, which the display controller shows
+    /// from where they are (`Motion::pieces`). False if the panel's pulse
+    /// was missed.
     async fn move_to(&mut self, motion: Motion, offset: usize) -> bool {
-        match motion {
-            Motion::Pages { leftwards } => self.panel.slide(offset, leftwards).await,
-            // The panel is the page coming: it reaches `offset` rows in.
-            Motion::PanelIn { from_top } => self.panel.cover(offset, from_top, 1).await,
-            // The panel is the page being left: so much of it remains.
-            Motion::PanelOut { to_top } => self.panel.cover(panel::HEIGHT.saturating_sub(offset), to_top, 0).await,
-            Motion::Give { leftwards } => self.panel.shift(offset, leftwards).await,
-        }
+        let pieces = motion.pieces(offset).map(|piece| {
+            piece.map(|p| panel::Piece {
+                coming: p.coming,
+                from: (p.from_x as u32, p.from_y as u32),
+                to: (p.to_x as u32, p.to_y as u32),
+                size: (p.width as u32, p.height as u32),
+            })
+        });
+        self.panel.present_move(pieces).await.in_step
     }
 
     /// Present the picture that was just drawn (drawing began at

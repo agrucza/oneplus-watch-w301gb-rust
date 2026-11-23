@@ -21,6 +21,24 @@ pub enum Motion {
     Give { leftwards: bool },
 }
 
+/// One of the up to two pieces a picture of a move is made of: a
+/// rectangle of a page's picture, shown at its own size somewhere on the
+/// screen. The display controller shows each piece straight from the
+/// page's frame, so a picture of a move costs no copying.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Piece {
+    /// Whose picture: the page being left (`false`) or the one coming.
+    pub coming: bool,
+    /// The rectangle's top left corner in that picture.
+    pub from_x: i32,
+    pub from_y: i32,
+    /// Where on the screen it goes.
+    pub to_x: i32,
+    pub to_y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// How far a page gives when nothing lies that way. The stock app's
 /// number (`0x80F8CFE`).
 pub const GIVE: i32 = 50;
@@ -49,6 +67,34 @@ impl Motion {
             Motion::Pages { leftwards: false } | Motion::Give { leftwards: false } => x,
             Motion::PanelIn { from_top: true } | Motion::PanelOut { to_top: false } => y,
             Motion::PanelIn { from_top: false } | Motion::PanelOut { to_top: true } => -y,
+        }
+    }
+
+    /// The pieces of the picture when the move has got `offset` pixels
+    /// on its way (0: all of the page being left; `extent`: all of the
+    /// page coming). The pieces never overlap; a piece that would be
+    /// empty is left out. Where no piece is, the screen is black.
+    pub fn pieces(self, offset: usize) -> [Option<Piece>; 2] {
+        let o = (offset.min(self.extent())) as i32;
+        // A piece as wide or as high as the screen, cut to `width` x
+        // `height`; nothing if that is empty.
+        let piece = |coming, from_x, from_y, to_x, to_y, width, height| (width > 0 && height > 0).then_some(Piece { coming, from_x, from_y, to_x, to_y, width, height });
+        match self {
+            // Side by side: the page being left moves out, the other
+            // follows it in.
+            Motion::Pages { leftwards: true } => [piece(false, o, 0, 0, 0, SIZE - o, SIZE), piece(true, 0, 0, SIZE - o, 0, o, SIZE)],
+            Motion::Pages { leftwards: false } => [piece(false, 0, 0, o, 0, SIZE - o, SIZE), piece(true, SIZE - o, 0, 0, 0, o, SIZE)],
+            // The panel's far end comes in first; the face under it
+            // stays where it is and shows as far as it is not covered.
+            Motion::PanelIn { from_top: true } => [piece(false, 0, o, 0, o, SIZE, SIZE - o), piece(true, 0, SIZE - o, 0, 0, SIZE, o)],
+            Motion::PanelIn { from_top: false } => [piece(false, 0, 0, 0, 0, SIZE, SIZE - o), piece(true, 0, 0, 0, SIZE - o, SIZE, o)],
+            // The same pictures backwards: the panel is the page being
+            // left, and so much of it has gone already.
+            Motion::PanelOut { to_top: true } => [piece(false, 0, o, 0, 0, SIZE, SIZE - o), piece(true, 0, SIZE - o, 0, SIZE - o, SIZE, o)],
+            Motion::PanelOut { to_top: false } => [piece(false, 0, 0, 0, o, SIZE, SIZE - o), piece(true, 0, 0, 0, 0, SIZE, o)],
+            // One page, moved aside.
+            Motion::Give { leftwards: true } => [piece(false, o, 0, 0, 0, SIZE - o, SIZE), None],
+            Motion::Give { leftwards: false } => [piece(false, 0, 0, o, 0, SIZE - o, SIZE), None],
         }
     }
 

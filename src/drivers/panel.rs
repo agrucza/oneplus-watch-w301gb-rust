@@ -88,14 +88,24 @@ pub struct Resources {
     pub blitter: Peri<'static, peripherals::DMA2D>,
 }
 
+/// A piece of a picture of a move (`Panel::present_move`): a rectangle of
+/// the frame with the page coming (`coming`) or of the frame on the
+/// screen, with its top left corner at `from` in that frame, shown at
+/// `to` on the screen; all as (x, y), `size` as (width, height).
+#[derive(Clone, Copy)]
+pub struct Piece {
+    pub coming: bool,
+    pub from: (u32, u32),
+    pub to: (u32, u32),
+    pub size: (u32, u32),
+}
+
 pub struct Panel {
     /// Two frames, as in the stock app: one is on its way to the panel or
     /// was sent last, the other is free to be drawn into.
     frames: [&'static mut Frame; 2],
     /// Which of the two the panel was sent last.
     shown: usize,
-    /// Two frames that are never shown: kept pictures (see `slide`).
-    spare: [&'static mut Frame; 2],
     blitter: Dma2d<'static, peripherals::DMA2D>,
     _pins: [Output<'static>; 4],
 }
@@ -104,7 +114,7 @@ impl Panel {
     /// Power the panel, set up LTDC and DSI with `frame` as the picture
     /// source, switch the panel on. Every stage is logged; `None` if one of
     /// them does not complete.
-    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], spare: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
+    pub async fn start(r: Resources, frames: [&'static mut Frame; 2], log: &mut Log) -> Option<Self> {
         // Power-up, as in the stock app.
         let pg5 = Output::new(r.supply_pg5, Level::High, Speed::Low);
         let pf12 = Output::new(r.supply_pf12, Level::High, Speed::Low);
@@ -161,7 +171,7 @@ impl Panel {
         dsi::enable();
         let _ = writeln!(log.stamp(), "display: panel switched on");
         let blitter = Dma2d::new(r.blitter, Irqs);
-        Some(Self { frames, shown: 0, spare, blitter, _pins: [pg5, pf12, power, reset] })
+        Some(Self { frames, shown: 0, blitter, _pins: [pg5, pf12, power, reset] })
     }
 
     /// Send the framebuffer to the panel. `done` is false if the transfer
@@ -210,87 +220,37 @@ impl Panel {
         self.frames[0][..] == self.frames[1][..]
     }
 
-    /// Copy the columns `from_x .. from_x + width` of one frame, top to
-    /// bottom, to the columns starting at `to_x` of another, with the
-    /// blitter. False if it reported an error.
-    async fn copy_columns(&mut self, from: *const Frame, from_x: usize, to: *mut Frame, to_x: usize, width: usize) -> bool {
-        if width == 0 {
-            return true;
+    /// Show one picture of a move from the page on the screen to the page
+    /// that has been drawn into the frame to draw into: each piece is a
+    /// rectangle of one of the two frames, which the display controller
+    /// shows straight from there. Nothing is copied and no frame is
+    /// changed; which frame is which stays as it is until `end_move`.
+    pub async fn present_move(&mut self, pieces: [Option<Piece>; 2]) -> dsi::RefreshStatus {
+        let layers = pieces.map(|piece| {
+            piece.map(|p| {
+                let frame = if p.coming { 1 - self.shown } else { self.shown };
+                dsi::Layer {
+                    address: self.frames[frame].as_ptr() as u32 + (p.from.1 * WIDTH as u32 + p.from.0) * 2,
+                    x: p.to.0,
+                    y: p.to.1,
+                    width: p.size.0,
+                    height: p.size.1,
+                }
+            })
+        });
+        dsi::refresh_layers(layers).await
+    }
+
+    /// A move is over, with the page that came on the screen (`arrived`)
+    /// or the old one back. The frame with the page that is not shown is
+    /// made a copy of the other, so that both hold the page shown, as
+    /// drawing expects. False if the blitter reported an error.
+    pub async fn end_move(&mut self, arrived: bool) -> bool {
+        if arrived {
+            self.shown = 1 - self.shown;
         }
-        let source = Buffer2D::new(unsafe { (from as *mut u16).add(from_x) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, width as u16, HEIGHT as u16);
-        let target = Buffer2D::new(unsafe { (to as *mut u16).add(to_x) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, width as u16, HEIGHT as u16);
-        self.blitter.copy(&source, &target).await.is_ok()
-    }
-
-    /// Keep a copy of a picture in spare frame `slot`: of the frame the
-    /// panel was sent last (`of_back` false) or of the frame that has just
-    /// been drawn into (`of_back` true).
-    pub async fn keep(&mut self, slot: usize, of_back: bool) -> bool {
         self.settle().await;
-        let from: *const Frame = self.frames[if of_back { 1 - self.shown } else { self.shown }];
-        let to: *mut Frame = self.spare[slot];
-        self.copy_columns(from, 0, to, 0, WIDTH).await
-    }
-
-    /// Put together, in the frame to draw into, a picture of two kept
-    /// ones side by side: kept picture 0 moved `offset` pixels out to the
-    /// left (`leftwards`) or right, and kept picture 1 following it in
-    /// from the other side. `offset` 0 is all of picture 0, `WIDTH` all of
-    /// picture 1. Two blitter copies, together one frame's worth.
-    pub async fn slide(&mut self, offset: usize, leftwards: bool) -> bool {
-        self.settle().await;
-        let offset = offset.min(WIDTH);
-        let (old, new): (*const Frame, *const Frame) = (self.spare[0], self.spare[1]);
-        let back: *mut Frame = self.frames[1 - self.shown];
-        if leftwards {
-            self.copy_columns(old, offset, back, 0, WIDTH - offset).await && self.copy_columns(new, 0, back, WIDTH - offset, offset).await
-        } else {
-            self.copy_columns(old, 0, back, offset, WIDTH - offset).await && self.copy_columns(new, WIDTH - offset, back, 0, offset).await
-        }
-    }
-
-    /// Put, in the frame to draw into, kept picture 0 moved `offset`
-    /// pixels to the left (`leftwards`) or right, with black where it
-    /// has moved away from. A blitter copy and a blitter fill.
-    pub async fn shift(&mut self, offset: usize, leftwards: bool) -> bool {
-        self.settle().await;
-        let offset = offset.min(WIDTH);
-        let old: *const Frame = self.spare[0];
-        let back: *mut Frame = self.frames[1 - self.shown];
-        let (to_x, gap_x) = if leftwards { (0, WIDTH - offset) } else { (offset, 0) };
-        self.copy_columns(old, if leftwards { offset } else { 0 }, back, to_x, WIDTH - offset).await
-            && (offset == 0 || self.blitter_fill(gap_x as u16, 0, offset as u16, HEIGHT as u16, 0).await)
-    }
-
-    /// Copy the rows `from_y .. from_y + height` of one frame, over the
-    /// whole width, to the rows starting at `to_y` of another, with the
-    /// blitter. False if it reported an error.
-    async fn copy_rows(&mut self, from: *const Frame, from_y: usize, to: *mut Frame, to_y: usize, height: usize) -> bool {
-        if height == 0 {
-            return true;
-        }
-        let source = Buffer2D::new(unsafe { (from as *mut u16).add(from_y * WIDTH) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, height as u16);
-        let target = Buffer2D::new(unsafe { (to as *mut u16).add(to_y * WIDTH) } as *mut u8, PixelFormat::Rgb565, WIDTH as u16, WIDTH as u16, height as u16);
-        self.blitter.copy(&source, &target).await.is_ok()
-    }
-
-    /// Put together, in the frame to draw into, a picture of one kept
-    /// picture lying over the other: the picture in spare frame
-    /// `panel_slot` reaches `amount` rows in from the top edge (`top`) or
-    /// the bottom edge, its far end first, and the other kept picture
-    /// shows in the rest, where it always is. `amount` 0 is all of the
-    /// other picture, `HEIGHT` all of the panel. Two blitter copies,
-    /// together one frame's worth.
-    pub async fn cover(&mut self, amount: usize, top: bool, panel_slot: usize) -> bool {
-        self.settle().await;
-        let amount = amount.min(HEIGHT);
-        let (panel, under): (*const Frame, *const Frame) = (self.spare[panel_slot], self.spare[1 - panel_slot]);
-        let back: *mut Frame = self.frames[1 - self.shown];
-        if top {
-            self.copy_rows(panel, HEIGHT - amount, back, 0, amount).await && self.copy_rows(under, amount, back, amount, HEIGHT - amount).await
-        } else {
-            self.copy_rows(under, 0, back, 0, HEIGHT - amount).await && self.copy_rows(panel, 0, back, HEIGHT - amount, amount).await
-        }
+        self.blitter_copy().await
     }
 
     /// Wait until the frame on its way to the panel has gone out, before
