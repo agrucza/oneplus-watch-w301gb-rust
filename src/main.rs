@@ -39,7 +39,7 @@ use boot::{ticket, watchdog};
 /// Watchdog period; a hang returns to the stock app after this long.
 const WATCHDOG_SECS: u32 = 20;
 
-#[embassy_executor::main]
+#[embassy_executor::main(executor = "embassy_stm32::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
     // 1. Return ticket - before anything that could go wrong.
     let booked = ticket::report(ticket::STAGE_BOOTED, 0);
@@ -57,7 +57,16 @@ async fn main(spawner: Spawner) {
     let mut config = Config::default();
     config.rcc.ls = hal::clocks::adopt_low_speed_clocks();
     hal::clocks::configure(&mut config);
+    // No debug clocks in the low-power modes (the stock app clears the
+    // same register before it stops).
+    config.enable_debug_during_sleep = false;
     let p = embassy_stm32::init(config);
+    // The HAL's executor stops the processor whenever nothing it knows of
+    // is busy. It knows nothing of the drivers that work on the registers
+    // themselves (Apollo link, eMMC, PSRAM, display), so stopping is
+    // forbidden from the first moment and only allowed where the
+    // firmware says so.
+    hal::stop::forbid();
 
     match booked {
         Ok(existing) => defmt::info!("return ticket booked (existing flag block: {})", existing),

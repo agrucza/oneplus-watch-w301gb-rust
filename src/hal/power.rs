@@ -36,6 +36,7 @@ const DBGMCU_CR: *mut u32 = 0xE004_2004 as *mut u32;
 /// wakes and restarts the STM32 through the reset line.
 pub fn shutdown() -> ! {
     cortex_m::interrupt::disable();
+    super::rtc::hand_back();
     unsafe {
         // A pending interrupt would end the wait at once: none may be
         // left enabled or pending.

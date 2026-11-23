@@ -231,6 +231,23 @@ pub fn set(t: &DateTime) -> bool {
 /// to fall before the second's start, which would cost a whole second.
 const RESET_AT_MS: u16 = 1000 - 264 + 20;
 
+/// Put back the one setting of the clock that the HAL changes for its
+/// Stop-mode support: it reads the clock's registers directly
+/// (RTC_CR.BYPSHAD) instead of through their shadow copies, which lag
+/// after a stop. The setting lives in the backup domain and would stay
+/// for the stock firmware, which did not choose it. Called before the
+/// firmware hands over on purpose; after a fault it stays.
+pub fn hand_back() {
+    const CR_BYPSHAD: u32 = 1 << 5;
+    unsafe {
+        modify(PWR_CR1, 0, PWR_CR1_DBP);
+        write_volatile(RTC_WPR, 0xCA);
+        write_volatile(RTC_WPR, 0x53);
+        modify(RTC_CR, CR_BYPSHAD, 0);
+        write_volatile(RTC_WPR, 0xFF);
+    }
+}
+
 /// Reset the processor at the moment in the second that costs the clock
 /// least (`RESET_AT_MS`); at once if the clock is not running. Waits up
 /// to a second, with everything else standing still.
@@ -245,5 +262,6 @@ pub fn reset_on_the_second() -> ! {
             None => break,
         }
     }
+    hand_back();
     cortex_m::peripheral::SCB::sys_reset()
 }

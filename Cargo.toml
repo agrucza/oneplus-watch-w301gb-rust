@@ -13,8 +13,11 @@ bench = false
 [dependencies]
 # HAL. We supply our own memory.x (app lives behind the bootloader), so the
 # `memory-x` feature is deliberately NOT enabled.
-embassy-stm32 = { version = "0.6", features = ["stm32l4r9zi", "dual-bank", "time-driver-any", "defmt", "unstable-pac"] }
-embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+# `low-power` and `executor-thread`: the HAL's own executor, which can put
+# the processor into Stop mode when the firmware allows it (`hal::stop`),
+# with the real-time clock keeping time across a stop.
+embassy-stm32 = { version = "0.6", features = ["stm32l4r9zi", "dual-bank", "time-driver-any", "defmt", "unstable-pac", "low-power", "executor-thread"] }
+embassy-executor = { version = "0.10", features = ["defmt"] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
 # What the tasks share: a guarded value and a short queue.
 embassy-sync = "0.8"

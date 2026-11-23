@@ -268,7 +268,6 @@ version = "0.10.0"
 source = "git+https://github.com/embassy-rs/embassy?rev=9d4235376d04eb0d836a2e8b1cc35f78dd184388#9d4235376d04eb0d836a2e8b1cc35f78dd184388"
 dependencies = [
  "cordyceps",
- "cortex-m",
  "critical-section",
  "defmt",
  "document-features",
@@ -333,6 +332,7 @@ dependencies = [
  "dsp-fixedpoint",
  "embassy-crypto",
  "embassy-embedded-hal",
+ "embassy-executor",
  "embassy-futures",
  "embassy-hal-internal",
  "embassy-ptp-driver",
