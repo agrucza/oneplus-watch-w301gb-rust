@@ -27,7 +27,7 @@ runs its own stack. Each chip below hangs off one of them.
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: frames in step with the panel, two frame buffers, only what changed is drawn, hardware blitter, watch face and status page, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
 | 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags act in all 4 of the stock app's directions (pages left and right, two panels up and down, the panels with placeholder content). covering hand blanks the display. Open: what the panels and the long-press pages hold, sleep and wake (see 3.1) |
-| 7 | Audio codec Cirrus CS47Lxx with DSP | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
+| 7 | Audio codec Cirrus CS47L15 with DSP (by the user's datasheet; ID register not read yet) | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
 | 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
 | 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: calibrated lux, automatic brightness as in the stock app |
@@ -65,7 +65,7 @@ their callers, and every GPIO setup call in the app), unless marked.
 | I2C2 | PF1 clock, PF0 data | light sensor STK31800 (**measured**) | 0x45 |
 | I2C2 | | second light-sensor driver, for a part with a Lite-On style register map (alternative fitting, **guess**) | 0x53 |
 | I2C2 | | NFC controller SN100T; silent in a bus scan (**measured**), so unpowered or in reset until enabled | 0x28 |
-| I2C2 | | device with 16-bit registers, most likely the speaker amplifier (**guess**, see 3.6); also silent in a bus scan (**measured**) | 0x36 |
+| I2C2 | | device with 16-bit registers: the speaker amplifier, an Awinic AW8896 by the user's datasheet (address range 0x34 to 0x37, 16-bit data; see section 7); silent in a bus scan (**measured**) | 0x36 |
 | I2C3 | PC0 clock, PB4 data | touch controller (**measured**) | 0x24 |
 | I2C4 | PF14, PF15 (pull-ups) | the Apollo, for its firmware update only | 0x20 |
 | SPI1 | PA5, PA6, PA7 | Apollo message link (STM32 is the slave) | |
@@ -200,7 +200,7 @@ right goes back to the watch face (`0x8118852`, one reading).
 | Long press | 60 ticks, opens a screen | 0.6 s (our own number); opens a page of its own on the face and on the status page, left again by a tap (measured on the watch 2026-11-23: 12 of 12 long presses opened their page, 12 of 12 taps led back, clean). Both pages are placeholders: there is one face to choose from and one page to arrange. That a tap leaves them, and that they appear without a move, are our choices |
 | Tap | per dial | dots on the status page |
 | Covering hand | display off | the bit is read and blanks the display (measured on the watch 2026-11-23: 9 of 9 covers blanked it, 14 taps and 11 swipes did not; a thumb pressed flat counts as a large object too); it comes back by button or wrist raise. While the display is dark, gestures are not acted on |
-| Touch restarts the switch-off timer | yes | no such timer yet |
+| Touch restarts the switch-off timer | yes | done and measured: dark 15.0 s after the display came on, after a button, after the wrist gesture, and after the finger lifted (`DISPLAY_TIMEOUT`, a value of our own). A touch on the dark display does nothing |
 | Chip sleeps with the display | yes | never |
 
 The recogniser's tests run on the PC (`tools/host`).
@@ -720,8 +720,9 @@ and a "tfa" voice path, which suggests a separate speaker amplifier
 
 SPI2 (PB10, PC1, PC2, chip select PB12) is the only free SPI and the likely
 control bus (**guess**). A device at 0x36 on I2C2 with 16-bit registers,
-whose revision register 3 is read at start, fits an NXP TFA98xx speaker
-amplifier (**guess**).
+whose register 3 is read at start, is the speaker amplifier: an Awinic
+AW8896 by the user's datasheet (section 7), not an NXP part as first
+guessed. The "tfa" in a file name is then only a name.
 
 Steps:
 1. Confirm SPI2 as the codec's bus; find the reset and sleep pins.
@@ -961,3 +962,91 @@ before adding new chips.
 - Whether OCTOSPI2 is really used: one reference exists in the stock app,
   but no clock selection for it and no flash chip strings.
 - Format of the 279 MB resource file.
+
+## 7. Datasheet check (2026-11-23)
+
+Each chip's feature list from its datasheet, set against what this
+firmware uses. Sources: **sheet** = the manufacturer's datasheet from the
+user's collection (ten sheets, kept outside the repository), read for
+its feature pages and the sections named here, not cover to cover;
+**research** = a web research pass over a sister part's datasheet or a
+public driver, not read by me; **none** = no document.
+
+Part names checked against the firmware texts: the Apollo's image names
+BQ25618, LSM6DSO, AW8695, CW2015, SX932x, MMC5603, ICP101xx and MT6670;
+the stock app names only "CS47L".
+
+### On the STM32
+
+| Chip | Source | What the sheet settles | Not used yet |
+|---|---|---|---|
+| STM32L4R9 | sheet (for the L4R5: same family without DSI) | Stop 2 with RTC 2.8 uA, Standby 125 nA, Shutdown 33 nA, 5 wake-up pins, 5 us wake from Stop | Sleep and Stop modes; RTC alarm and wake-up timer; internal temperature and battery-voltage ADC channels; GFXMMU (round-display frame storage: one frame could live in internal RAM; an idea, untested); random number generator; USB (not known whether the charging contacts carry data) |
+| eMMC Kingston EMMC04G-M657-K03U | sheet | the part: its sector count 7,405,568 is the one measured. The sheet gives settings revision 8, measured is 7, so the fitted card is an earlier revision of it. Write cache 512 KB, off by default (`CACHE_CTRL` 0): no flush needed as long as nobody switches it on. Standby 0.13 mA; goes to low power by itself 50 ms after idle | sleep (CMD5), power-off notification (3.10); health report; background operations; TRIM. HS200 / HS400 need 1.8 V signalling and 8 lines |
+| Bluetooth CYW20721 | sheet; host protocol from research (vendor header) | Bluetooth 5.1, classic and LE, LE 2M. DEV_WAKE and HOST_WAKE lines let chip and host sleep (our PB9 and PC7 fit these; not confirmed). One I2S / PCM port, shared: A2DP audio or call voice, not both at once. PDM microphone input. Lowest mode 0.4 uA, wake by pin | pairing, visibility, name; BLE advertising, connections, GATT; notifications (ANCS), media control; hands-free and audio streaming; battery level to the phone; sleep through the wake lines. Which protocol groups the chip's firmware implements is not known |
+| Audio codec CS47L15 | sheet | the user's sheet is the CS47L15; the stock app says only "CS47L". Device ID 0x6370 in register 0 settles it on the watch. One DSP (150 MIPS) with always-on voice trigger and speaker protection; up to four microphones; headphone / earpiece and speaker outputs; three audio interfaces; SPI control; sleep mode 25 uW (DSP memory is lost in it) | everything |
+| Speaker amplifier AW8896 | sheet (a scan; pages 1, 2, 18 to 26 read) | replaces the earlier guess of an NXP part. I2C 0x34 to 0x37 by two pins, 8-bit register address, 16-bit data: fits the unknown device at 0x36 on I2C2. I2S input (8 to 48 kHz), own boost converter, volume 0 to -96 dB, four programmable filters, clip control, receiver mode, reset pin, interrupt pin. Software reset: 0x55AA to the ID register | everything |
+| Touch controller (TrueTouch) | research (drivers) | | power command on / sleep / standby and deep sleep; easy-wake gestures (double tap, tap, slides, palm); glove, stylus, proximity modes; more than one finger, pressure, contact size; self tests and recalibration; noise report; configuration read and write. Parameter numbers for water mode are not public |
+| Light sensor STK31800 | Sensortek's product table (from the user) for the family STK318x0; registers from research on the sister part STK31862 | type "ALS + Flicker": 16-bit light value, no proximity, an interrupt output, supply 1.7 to 2.0 V, 6 pins. So flicker detection is a function of this part, which fits the sister part's FIFO and its integration times down to 192 us | flicker detection (FIFO, short integration); standby (3 uA against 200 uA measuring on the sister part); window interrupt with thresholds; saturation flag; wait time. Whether the interrupt pin is wired to the STM32 is not known (PG2, an unexplained interrupt input, is a candidate) |
+| PSRAM | research (smaller Micron part) | | deep power-down, partial array refresh; synchronous burst; device ID register |
+| Panel | research (RM69330 and SH8601 as candidates) | our start-up uses the page-select command 0xFE, which RM69330 has; reading 0x04 / 0xA1 would settle the driver IC | sleep in, deep standby; idle mode and partial mode (always-on face); high-brightness mode; read-back of ID, power state, self-diagnosis |
+| NFC SN100T | none | | everything |
+
+### Behind the Apollo
+
+"Not used" here means: not reported to us by the Apollo, or not decoded.
+What the Apollo itself does with each chip is mostly not read.
+
+| Chip | Source | What the sheet settles | Not used yet |
+|---|---|---|---|
+| Apollo3 Blue | sheet | modes Sleep, Deep Sleep, Shutdown. It has a Bluetooth LE radio of its own; whether the watch uses it is not known. It has a reset pin (RSTN); measured here, the pulse on PG12 does not wake it from its sleep, so PG12 is probably not that pin | nothing for the host to use directly |
+| Charger BQ25618 | sheet (one sheet for BQ25618 and BQ25619; they differ in switch resistance) | Ship mode: the battery switch opens, at once or after 10 to 15 s (`BATFET_DLY`); the charger plugged in or the QON input pulled low closes it again. QON held low for 8 to 12 s cuts the battery for at least 250 ms: a full power cycle without any firmware (can be switched off by `BATFET_RST_EN`). Whether a button is wired to QON is not known. No ADC: voltages come from the fuel gauge | charge state (pre-charge, fast, done), fault bits (watchdog, input, thermal, timer, battery, NTC), input and charge limits |
+| Fuel gauge CW2015 | sheet | percent, cell voltage, remaining run time in minutes (13 bits, updated every second), low-battery alert at 0 to 31 % (default 3 %) with an interrupt pin, sleep mode under 1 uA (it restarts its estimate on waking) | remaining run time, alert threshold, sleep |
+| Haptic driver AW8695 | sheet | 8 KB waveform memory, 4 KB FIFO for streaming, playback by memory, stream, three trigger pins or continuous drive; resonance (F0) detection and tracking; coil fault check by resistance; standby 8 uA, shutdown 0.2 uA | stored effects and sequencer, streaming, resonance calibration, diagnostics; we send plain pulses |
+| LSM6DSO | sheet (for the LSM6DSOX; the X adds a machine-learning core) | step detector and counter, significant motion, tilt, free fall, wake-up, 6D / 4D orientation, tap and double tap, state machine, 9 KB FIFO, temperature | all of these; only the Apollo's raise-to-wake gesture is used. Which the Apollo uses or forwards is not read |
+| MediaTek MT6670 | none public | the name is the Apollo's own (driver functions `MT6670_*`, "MTK library version", MediaTek heart-rate and stress algorithms in its image). Green, red and infrared LEDs and three ambient readings by its log texts | SpO2 (red and infrared), stress, continuous monitoring, raw data |
+| MMC5603 | research (vendor sheet) | | all: field (compass), temperature, self test |
+| ICP-101xx | research (vendor sheet) | | the choice among its four accuracy modes (the Apollo's choice is not read); it also gives temperature |
+| SX932x | research (driver) | | proximity data per phase, body / table detection, doze and sleep modes; only the Apollo's worn / not worn is used |
+| GPS AG3335 | research (related module's spec) | | everything: start modes, power modes, assistance data, rates |
+
+Sheets still missing: touch controller, light sensor STK31800, panel or
+its driver IC, PSRAM, NFC SN100T, MMC5603, ICP-101xx, SX932x, AG3335,
+MT6670.
+
+### Narrowing down the parts without a sheet
+
+Three ways, none of which needs a datasheet:
+
+1. **What the chip says about itself** (already in our log).
+   - Touch controller, system information (decoded with the field
+     layout of the public cyttsp5 driver, from memory): protocol version
+     1.6, firmware 1.10, configuration version 0x24, bootloader 2.0,
+     silicon ID 0x0B20229B, 8 x 8 electrodes over 35.6 mm, 454 x 454.
+     Its description gives vendor 0x04B4 (Cypress). Protocol 1.x means
+     the older command set (PIP1), not the file-based PIP2. The silicon
+     ID has not been matched to a part number.
+   - Light sensor: product ID 0x82.
+2. **How the stock app uses it.**
+   - Light sensor: the stock settings table writes registers 0x02,
+     0x04, 0x05, 0x10, 0x4E, 0x6F, 0xA1, 0xA5 and 0x60 to 0x63. Those
+     are the sister part STK31862's ALSCTRL1, INTCTRL1, WAIT, FLAG,
+     GAINCTRL, ALSCTRL2, PDCTRL1, INTCTRL2 and its four FIFO registers,
+     so that sheet's register map applies to our part. Read with it:
+     both interrupts off (0x04 = 0, 0xA5 = 0), wait 0x40 (about 100 ms
+     between measurements), no short integration (0x6F = 0), FIFO
+     control 2. Registers 0xDB and 0xF6 are not in that sheet.
+   - Panel: the start-up switches register pages with 0xFE (pages 1
+     and 5), the scheme of Raydium's RM69xxx drivers.
+   - NFC: the stock app names `sn100t_i2c_write` and also a firmware
+     library `libpn548ad_fw.so`; the second name belongs to an older NXP
+     family, so the part number wants checking on the chip itself.
+3. **Asking.** The stock app answers factory queries over the same
+   Bluetooth serial port we use; its answer texts include `^LCDID:`,
+   `^TPVER:`, `^GETEMMC:`, `^GETRAM:`, `^PSRAM_STATUS_GET:`,
+   `^APOLLOID:`, `^GPSVER:`, `^BATID:`, `^R_SUPPLIER:` and a device
+   check (`AT^DEVCHECK=all`). Not tried: the exact query for each has
+   to be read first, and the same list holds commands that write or
+   reset (`^FTYRESET`, `^RESET_ALL`, `^SHIPMODE`, `^W_...`, `^SET_...`),
+   which must not be sent. From our own firmware the panel's ID
+   registers (0x04, 0xA1) and the PSRAM's ID register could be read
+   directly.

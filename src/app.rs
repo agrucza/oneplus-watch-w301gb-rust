@@ -590,6 +590,10 @@ impl WearView {
     }
 }
 
+/// The display goes dark after this long without a finger or a button.
+/// A value of our own; it becomes a setting once there are settings.
+const DISPLAY_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How often the watch face is looked at for something that moved: about
 /// 15 times a second.
 const FACE_PERIOD: Duration = Duration::from_millis(66);
@@ -722,6 +726,8 @@ struct Screen {
     shown_by_raise: bool,
     /// Since when the display has been on.
     visible_since: Instant,
+    /// When a finger or a button was last used.
+    active_at: Instant,
     wear: WearView,
     last_button: &'static str,
     /// Where the glass was last touched, if that is newer than the button.
@@ -777,6 +783,7 @@ impl Screen {
             faded_at: Instant::now(),
             shown_by_raise: false,
             visible_since: Instant::now(),
+            active_at: Instant::now(),
             wear: WearView::new(),
             last_button: "no button yet",
             last_touch: None,
@@ -806,6 +813,7 @@ impl Screen {
 
     /// Do what a press of a button stands for (`controls::Bindings`).
     async fn act(&mut self, action: Action, log: &mut Log) {
+        self.active_at = Instant::now();
         let taken = match action {
             Action::HomeOrSleep => {
                 self.last_button = "button: home / sleep";
@@ -898,6 +906,23 @@ impl Screen {
         }
         self.drawn_for = None;
         true
+    }
+
+    /// The display's switch-off timer: dark after `DISPLAY_TIMEOUT`
+    /// without a finger or a button, counted from the display coming on
+    /// if that was later. Not while a page is under the finger.
+    async fn idle(&mut self, log: &mut Log) {
+        if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < DISPLAY_TIMEOUT {
+            return;
+        }
+        self.visible = false;
+        self.visible_since = Instant::now();
+        self.shown_by_raise = false;
+        let _ = writeln!(log.stamp(), "display: blanked after {} s without a finger or a button", DISPLAY_TIMEOUT.as_secs());
+        if !self.panel.set_visible(false).await {
+            let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+        }
+        self.drawn_for = None;
     }
 
     /// A hand covers the glass: blank the display, as the stock app does
@@ -1612,6 +1637,9 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         }
         let gesture = gestures.feed(touched, Instant::now());
         if screen.visible {
+            if touched.is_some() {
+                screen.active_at = Instant::now();
+            }
             if let Some(gesture) = gesture {
                 screen.touch_gesture(gesture, &mut log);
             }
@@ -1626,6 +1654,7 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             // `services::turn`.
             let _turn = crate::services::turn::take().await;
             screen.fade(&mut log).await;
+            screen.idle(&mut log).await;
             screen.update(state.readings.as_ref(), state.lux, state.bluetooth_connected, state.measuring_heart, &mut log).await;
         }
         // Let the main task have its turn even when nothing was presented.
