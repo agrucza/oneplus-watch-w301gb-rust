@@ -10,7 +10,10 @@ use crate::services::gestures::Direction;
 pub enum Page {
     /// The watch face: the first of the pages side by side.
     Face,
-    /// The page of status text beside it: the last of them.
+    /// The launcher beside it (`super::launcher`): the last of them.
+    /// Every other page is opened from it.
+    Launcher,
+    /// The page of status text, opened from the launcher.
     Status,
     /// The panel pulled over the face from the top edge.
     Above,
@@ -36,7 +39,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -47,6 +50,7 @@ impl Page {
             Page::Cards => 5,
             Page::Power => 6,
             Page::Picker => 7,
+            Page::Launcher => 8,
         }
     }
 
@@ -58,9 +62,9 @@ impl Page {
     /// the power page, which changes only on a tap: its frame is drawn
     /// into between two pictures, and the panel shows what it was sent
     /// until the next one. The same goes for the page a time is set on.
-    /// The two pages opened by a long press share a frame: only one of
-    /// them can be on the screen, and whichever is opened is drawn
-    /// afresh (`shared_frame`).
+    /// The two pages opened by a long press and the page a time is set
+    /// on share a frame: only one of them can be on the screen, and
+    /// whichever is opened is drawn afresh (`shared_frame`).
     pub fn frames(self) -> (usize, usize) {
         match self {
             Page::Face => (0, 2),
@@ -69,7 +73,8 @@ impl Page {
             Page::Below => (5, 1),
             Page::Faces => (6, 1),
             Page::Cards => (6, 1),
-            Page::Picker => (7, 1),
+            Page::Picker => (6, 1),
+            Page::Launcher => (7, 1),
             Page::Power => (8, 1),
         }
     }
@@ -79,7 +84,7 @@ impl Page {
     /// True for a page whose frame another page uses too: its picture
     /// may be gone when it is opened.
     pub fn shared_frame(self) -> bool {
-        matches!(self, Page::Faces | Page::Cards)
+        matches!(self, Page::Faces | Page::Cards | Page::Picker)
     }
 }
 
@@ -87,8 +92,8 @@ impl Page {
 /// the picture moves on the way there. `None` if nothing lies that way.
 pub fn drag(page: Page, direction: Direction) -> Option<(Page, Motion)> {
     Some(match (page, direction) {
-        (Page::Face, Direction::Left) => (Page::Status, Motion::Pages { leftwards: true }),
-        (Page::Status, Direction::Right) => (Page::Face, Motion::Pages { leftwards: false }),
+        (Page::Face, Direction::Left) => (Page::Launcher, Motion::Pages { leftwards: true }),
+        (Page::Launcher, Direction::Right) => (Page::Face, Motion::Pages { leftwards: false }),
         (Page::Face, Direction::Down) => (Page::Above, Motion::PanelIn { from_top: true }),
         (Page::Face, Direction::Up) => (Page::Below, Motion::PanelIn { from_top: false }),
         (Page::Above, Direction::Up) => (Page::Face, Motion::PanelOut { to_top: true }),
@@ -96,7 +101,7 @@ pub fn drag(page: Page, direction: Direction) -> Option<(Page, Motion)> {
         // The first and the last of the pages side by side: nothing lies
         // further out, the page only gives.
         (Page::Face, Direction::Right) => (Page::Face, Motion::Give { leftwards: false }),
-        (Page::Status, Direction::Left) => (Page::Status, Motion::Give { leftwards: true }),
+        (Page::Launcher, Direction::Left) => (Page::Launcher, Motion::Give { leftwards: true }),
         _ => return None,
     })
 }

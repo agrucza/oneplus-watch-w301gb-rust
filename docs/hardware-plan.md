@@ -549,6 +549,25 @@ any size (`Art`), both blended by the blitter like text.
   `drivers::apollo::messages`. Not read: how often the motion
   library repeats a reminder, and whether the Apollo holds message 40
   back while it was told the screen is off.
+- Launcher (`app::launcher`; built 2026-11-24; on the watch the same
+  evening, two minutes in the log: fifteen swipes between face and
+  launcher, all four apps opened, the upper button back to the launcher
+  and on to the face, no starved frame. Seen once: the touch controller
+  reported one touch as two taps 54 ms apart, which chose a tile and
+  opened it at once; still to be dealt with): the page beside the watch face, after the design's radial
+  launcher, from which every other page is opened. The apps are tiles
+  on a ring; a tap chooses one (its piece of the outer ring lights up,
+  the middle names it), a tap on the chosen tile or the middle opens
+  it. Four apps so far, those there are pages for: settings (the quick
+  settings panel), alerts, status, power. The status page is no longer
+  beside the face but one of them. The upper button leads from a page
+  opened here back to the launcher, and from there to the face. The
+  ring has room for eight tiles; for more it is to turn under the
+  finger (worked out in the code, not switched on: turning and swiping
+  back to the face have to be told apart first). Next: a settings app
+  with a list that scrolls, and the design's vitals page. The launcher
+  has a frame of its own; the picker now shares the frame of the two
+  long-press pages.
 - Setting a time (`app::picker`; built 2026-11-24, not yet tried on
   the watch): a page of its own with a wheel for the hours and one for
   the minutes, "cancel" and "save". A wheel follows the finger from where
@@ -585,7 +604,10 @@ vignette; glows only where a bitmap exists (the big digits); no status
 strip along the top of every page (on a round screen that strip is a
 few characters wide); the face's ticks are shorter and the bent text
 sits right inside them; the bent lines say what is true of this watch.
-Shown as dimmed dashes until there is data: steps and unread messages.
+Shown as dimmed dashes until there is data: unread messages, and the
+steps before the Apollo's first summary. The steps (2026-11-24; on
+the watch the first summary after a start said 7629) are the count as
+of the last time the display was lit, with the arc full at 10,000.
 Not built yet, for lack of anything to show in them: the design's
 launcher, vitals, call, the brightness bar.
 For later, the size of the image (616 KB of the 1,974 KB there are,
@@ -666,7 +688,7 @@ names as text, which makes it readable as the other half of every message.
 | Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), screen status (130) | **done and measured:** raise-to-wake (on, all day) and screen status. **Built from the user's settings, not yet tried on the watch (2026-11-24):** raise-to-wake off, do-not-disturb, sedentary reminder with its incoming reminder (kind 40). **Not read through:** heart-rate monitoring, stress, kind 142, SpO2 |
 | Board revision | Apollo asks "get pin 11" (kind 7) once after its start; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`) | **measured: reading 3411 of 4095 (1.50 V), revision 3, which the Apollo calls B281_DVT.** Answered with the stock app's bytes. The Apollo's handler (`0x3F020`) takes an answer with field 4 = 2 and field 2 = 0, stores field 3 and sends nothing back, so the watch cannot show that it was taken. For revision 3 it only prints its banner; revision 1 would reconfigure two of its pins, revision 0 changes a pull on its link pin 9 |
 | Battery identification | kept inside the Apollo (its stored item 0x25); together with its revision question it sends the value to the STM32 (kind 7, field 2 = 0x25, field 4 = 2; measured: value 0) and it can be set or read with kind 24 | the value is logged; nothing else done with it |
-| Sensor switches | stock switches sensors with kind 120 (field 1: 0 compass, 1 barometer, 2 battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 power control; field 2 on/off; field 3 interval) | **not done** |
+| Sensor switches | stock switches sensors with kind 120 (see "Sensor switches and what arrives unasked" below) | **not sent; read through 2026-11-24** |
 
 **Wear detection** (read through in the Apollo's `lcAlgoWearWristCheckExe`
 and around it; the Apollo's own log texts name the inputs):
@@ -777,6 +799,55 @@ normal image. Whether
 the stock firmware sees the same cannot be checked (it does not log wear
 changes).
 
+**Sensor switches and what arrives unasked** (read in the Apollo's
+image 0704 and the stock app B.70, 2026-11-24; nothing of it tried on
+the watch):
+
+- Kind 120 has five fields: 1 the sensor (0 compass, 1 barometer, 2
+  battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 the optical
+  sensor's test switch, which was taken for "power control" before),
+  2 on or off, 3 the gap between samples in ms, 4 a sub-command, 5 a
+  value for it. "On" sets the gap to field 3 as it stands and counts
+  one user of the sensor; "off" takes the user away again. An "on"
+  without field 3 sets the gap to 0, and the encoder here leaves zero
+  fields out: every "on" has to carry a gap. The gaps are kept in the
+  Apollo's flash once it flushes (start values: motion 40, barometer
+  600,000, compass 20, battery 8000, temperature 15,000).
+- Never to be sent in passing: sensor 2 with sub-command 1 (ship mode)
+  or 3 (charging off), and sensor 7 (takes the heart-rate algorithms
+  down and sets them up again).
+- In normal use the stock app sends kind 120 only for: the barometer
+  page (gap 1000 on entering, 600,000 on leaving, never "off"), the
+  compass page (on with gap 20, off on leaving), GPS, ship mode and
+  the charging switch. Motion, temperature, capacitive and optical are
+  only switched by its test pages.
+- Battery (kind 47): sampled every 8 s; every sample is sent while the
+  screen is reported on, and while it is reported off only when the
+  percent or the USB flag changed (as measured). Temperatures (kind
+  50): every 15 s while on; while off only outside 5 to 40 degrees.
+  Barometer (kind 43): one record every 540 s through the record
+  store, which holds records back while the screen is off; with the
+  gap at 1000 one a second, which every "screen off" undoes. There is
+  no message that asks for one fresh value: after "screen on" battery
+  follows within 8 s and temperatures within 15 s.
+- Kind 54 counts the users of compass, barometer, accelerometer,
+  gyroscope, GPS, capacitive and optical, and is sent when a count
+  changes: it shows what is really switched on.
+- Steps: the Apollo's daily-activity algorithm runs from its start
+  unasked, counts in RAM, and starts at zero with a new day (it needs
+  the time) and with an Apollo restart. Its summary is kind 81, whose
+  field 3 begins with the step count (four bytes); it is sent when
+  something changed and only while the screen is reported on. Kinds
+  92 and 95 can hand a count back after a restart (not read).
+  Measured 2026-11-24: 11 s after a restart of this firmware the
+  summary said 7629 steps, in the evening of a worn day, so the count
+  outlasts our restart, against what the reading suggested.
+- Compass: kind 120 sensor 0 on gives kind 42 (a word that is probably
+  the heading, an accuracy byte, the field vector); to be switched off
+  on leaving. Raw motion: kind 48, test pages only.
+- Not read: what the drivers do to the chips (pins, modes), GPS, the
+  other fields of kinds 47, 43 and 81.
+
 **How the Apollo detects a raised wrist** (read in its image 0704,
 2026-11-24): `OPPO_API_lift_wrist_input` (0x23E88) feeds every
 acceleration sample and the screen state to a detector (0x488E8) that
@@ -821,6 +892,50 @@ with the stress measurement, 0xFF test), results kind 44 (field 2 = beats
 per minute, 5 SpO2, 7 stress, 8 type, 25 status). The Apollo's
 `lcAlgoHeartRateEnable` does nothing unless its wear state is "on the
 wrist", so this depends on wear detection.
+
+Read in the Apollo's image 0704 and the stock app B.70 (2026-11-24;
+addresses in `drivers::apollo::messages` and below):
+
+- Kind 123, field 8 is the mode: 0 off, 1 periodic, 2 continuous, 3 one
+  measurement by hand (counted: every "on" needs its "off", nothing
+  ends it by itself), 4 sport (the Apollo's own), 0xFF factory test
+  (sets a flag that stays; not to be sent). Field 1 switches mode 3 and
+  decides for every mode whether results are reported; 7 is the seconds
+  between reports; 2 and 4 are the switch and the limit of the warning
+  for a high heart rate; 3, 5 and 6 are never read.
+- Periodic monitoring cannot be given an interval: the Apollo lights
+  the green light for 30 in every 630 s while worn, both constants
+  (`lcAlgoHeartRateMonitor`, 0x31AB0), about 5 % of the time.
+  Continuous keeps it on while worn. Neither looks at the screen
+  status, do-not-disturb or sleep. The stock app's start values:
+  monitoring off, warning limit 100; from the phone it sets mode 1 or 2
+  and always field 1 = 0, so it gets no live reports while monitoring.
+- Warning for a high heart rate: kind 55 from the Apollo (start time,
+  lowest, highest) after 30 quiet samples at or above the limit, with
+  cooldowns of 600 and 1800. No warning for a low one was found.
+- Stress, kind 135 (`lcSensorStressSet`, 0x149BC): 1 on (reports), 2
+  and 3 warning switch and limit, 4 seconds between reports, 5 mode
+  (0 off, 1 and 2 follow the heart mode, 3 by hand, counted). Uses the
+  heart rate's green light and only runs with it: by hand the stock app
+  first sends kind 123 with field 1 = 1, 7 = 1, 8 = 2, then kind 135
+  with 1 = 1, 4 = 1, 5 = 3, and at the end both back. Result: kind 44
+  with field 8 = 1, the value (1 to 100) in 7. Warning: kind 56.
+- SpO2, kind 124 (`lcSensorSpO2Set`, 0x148E0): 1 on, 2 seconds between
+  reports, 3 mode (1 every 720 for 30 while asleep, 2 all through
+  sleep, 3 by hand, counted). Red light. Result: kind 44 with field
+  8 = 2, the value in 5 once field 25 says valid (3 = not worn, 4 =
+  arm held wrong); values of the night come later with field 8 = 4 and
+  their own time. An oddity in the code (0x38F12): a value of 91 or
+  more with algorithm status 0 is replaced by 97 or 98 at random.
+- Kind 142 hands the Apollo back today's resting heart rate after a
+  restart (bpm, day number); the stock app keeps it in
+  `2:temp_info.txt`. Not acknowledged.
+- Kind 58 from the Apollo says when a light goes on or off (4 green
+  on, 5 green off, 6 red on, 7 red off): the way to check on the watch
+  what a message switched on.
+- Nothing of this is kept by the Apollo across its restart.
+- Not read: how the monitor's "seconds" are counted (tick count /
+  1024), the Apollo's sleep state, the raw-sample fields of kind 44.
 
 Measured: a long press of the lower button starts a measurement, the
 green light comes on, and one report a second arrives. No value for the

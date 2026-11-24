@@ -3,6 +3,7 @@
 mod alerts;
 mod controls;
 mod face;
+mod launcher;
 mod motion;
 mod pages;
 mod picker;
@@ -820,6 +821,10 @@ struct Screen {
     last_touch: Option<(u16, u16)>,
     /// What the alerts page lists.
     alerts: alerts::Alerts,
+    /// The launcher, and whether the page shown was opened from it: the
+    /// button then leads back to it.
+    launcher: launcher::Launcher,
+    from_launcher: bool,
     /// The page for setting a time, while it is open, and what for.
     picker: Option<(picker::Picker, PickFor)>,
     /// Which page is shown.
@@ -878,6 +883,8 @@ impl Screen {
             last_button: "no button yet",
             last_touch: None,
             alerts: alerts::Alerts::new(),
+            launcher: launcher::Launcher::new(),
+            from_launcher: false,
             picker: None,
             page: Page::Face,
             on_screen: None,
@@ -910,9 +917,11 @@ impl Screen {
             Action::HomeOrSleep => {
                 self.last_button = "button: home / sleep";
                 if self.visible && self.page != Page::Face {
-                    // Lit, on another page: back to the watch face.
+                    // Lit, on another page: back to the launcher if the
+                    // page was opened from it, to the watch face otherwise.
                     self.pull = None;
-                    self.go_to(Page::Face, log);
+                    let back = if self.from_launcher && self.page != Page::Launcher { Page::Launcher } else { Page::Face };
+                    self.go_to(back, log);
                     true
                 } else {
                     self.visible = !self.visible;
@@ -1117,6 +1126,31 @@ impl Screen {
             }
             Gesture::Tap { x, y } => {
                 let _ = writeln!(log.stamp(), "touch: tap at {}, {}", x, y);
+                if self.page == Page::Launcher {
+                    if self.pull.is_some() {
+                        return;
+                    }
+                    match self.launcher.tap(x, y) {
+                        launcher::Outcome::Nothing => {}
+                        launcher::Outcome::Chosen => {
+                            self.t.damage[Page::Launcher.index()].add(face::whole());
+                            self.changed = true;
+                        }
+                        launcher::Outcome::Open(app) => {
+                            let page = match app {
+                                launcher::App::Settings => Page::Above,
+                                launcher::App::Alerts => Page::Below,
+                                launcher::App::Status => Page::Status,
+                                launcher::App::Power => Page::Power,
+                            };
+                            self.go_to(page, log);
+                            self.from_launcher = true;
+                        }
+                    }
+                    // The tap is used up: it is not also a tap on the
+                    // page it opened.
+                    return;
+                }
                 if self.page == Page::Status {
                     self.dot(x as u16, y as u16);
                 }
@@ -1234,6 +1268,11 @@ impl Screen {
         // A row chosen on the power page does not outlast the page.
         if self.power_chosen.take().is_some() {
             self.t.damage[Page::Power.index()].add(face::whole());
+        }
+        // Back at the watch face or the launcher, the next page is not
+        // one opened from the launcher until the launcher says so.
+        if matches!(page, Page::Face | Page::Launcher) {
+            self.from_launcher = false;
         }
         // Two pages share a frame: what it holds may be the other one.
         if page.shared_frame() {
@@ -1418,6 +1457,7 @@ impl Screen {
                 bluetooth: bluetooth_connected,
                 worn,
                 temperature: readings.and_then(|r| r.temperatures).map(|t| (t[0] * 10.0) as i16),
+                steps: readings.and_then(|r| r.steps),
             };
             let mut stage = cycles();
             for n in 0..face::ELEMENTS {
@@ -1478,6 +1518,20 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Launcher {
+            // Changes on a tap only.
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                launcher::draw(&mut canvas, &area, &self.launcher);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));

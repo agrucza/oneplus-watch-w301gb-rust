@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
+//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|launcher|launcher-chosen|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -67,6 +67,7 @@ fn main() {
         bluetooth: true,
         worn: Some(true),
         temperature: Some(268),
+        steps: Some(6_412),
     };
     let whole = face::whole();
     match args.get(2).map(String::as_str) {
@@ -74,6 +75,13 @@ fn main() {
         Some("above-set") => {
             let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
+        }
+        Some("launcher") => w301_host::app::launcher::draw(&mut frame, &whole, &w301_host::app::launcher::Launcher::new()),
+        Some("launcher-chosen") => {
+            let mut launcher = w301_host::app::launcher::Launcher::new();
+            let tile = launcher.tile_rect(2).unwrap().center();
+            launcher.tap(tile.x, tile.y);
+            w301_host::app::launcher::draw(&mut frame, &whole, &launcher)
         }
         Some("picker") => w301_host::app::picker::draw(&mut frame, &whole, &w301_host::app::picker::Picker::new("QUIET FROM", 22 * 60)),
         Some("picker-seconds") => w301_host::app::picker::draw(&mut frame, &whole, &w301_host::app::picker::Picker::with_seconds("TIMER", 25 * 60 + 30)),

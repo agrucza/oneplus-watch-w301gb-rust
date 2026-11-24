@@ -22,3 +22,5 @@ pub mod settings;
 pub mod alerts;
 #[path = "../../../src/app/picker.rs"]
 pub mod picker;
+#[path = "../../../src/app/launcher.rs"]
+pub mod launcher;

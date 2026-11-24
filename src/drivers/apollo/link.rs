@@ -163,6 +163,8 @@ pub struct Apollo {
     move_reminder_told: Option<Option<(u16, u16)>>,
     /// The Apollo reminded the wearer to move.
     move_reminder_pending: bool,
+    /// The step count last written to the log.
+    steps_logged: Option<u32>,
     /// The screen state the Apollo should know, and the one it was last
     /// told (`None`: not told since its start).
     screen_on: bool,
@@ -258,6 +260,7 @@ impl Apollo {
             move_reminder: None,
             move_reminder_told: None,
             move_reminder_pending: false,
+            steps_logged: None,
             screen_on: true,
             screen_told: None,
             raise_to_wake: true,
@@ -849,6 +852,10 @@ impl Apollo {
                         messages::WristGesture::Other(_) => "gesture with an unknown value",
                     }
                 );
+            }
+            if kind == Some(messages::DAILY) && self.readings.steps != self.steps_logged {
+                self.steps_logged = self.readings.steps;
+                let _ = writeln!(log.stamp(), "apollo: {} steps today", self.readings.steps.unwrap_or(0));
             }
             if kind == Some(messages::MOVE_REMINDER) {
                 self.move_reminder_pending = true;

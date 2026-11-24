@@ -375,7 +375,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 8] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker];
+    const PAGES: [Page; 9] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -384,12 +384,12 @@ mod pages {
         for page in PAGES {
             for direction in DIRECTIONS {
                 let expected = match (page, direction) {
-                    (Page::Face, Left) => Some((Page::Status, Motion::Pages { leftwards: true })),
+                    (Page::Face, Left) => Some((Page::Launcher, Motion::Pages { leftwards: true })),
                     (Page::Face, Right) => Some((Page::Face, Motion::Give { leftwards: false })),
                     (Page::Face, Down) => Some((Page::Above, Motion::PanelIn { from_top: true })),
                     (Page::Face, Up) => Some((Page::Below, Motion::PanelIn { from_top: false })),
-                    (Page::Status, Right) => Some((Page::Face, Motion::Pages { leftwards: false })),
-                    (Page::Status, Left) => Some((Page::Status, Motion::Give { leftwards: true })),
+                    (Page::Launcher, Right) => Some((Page::Face, Motion::Pages { leftwards: false })),
+                    (Page::Launcher, Left) => Some((Page::Launcher, Motion::Give { leftwards: true })),
                     (Page::Above, Up) => Some((Page::Face, Motion::PanelOut { to_top: true })),
                     (Page::Below, Down) => Some((Page::Face, Motion::PanelOut { to_top: false })),
                     _ => None,
@@ -445,7 +445,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -455,7 +455,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Status, Page::Above, Page::Below, Page::Power] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker] {
             assert_eq!(tap(page), None);
         }
     }
@@ -718,6 +718,7 @@ mod face {
                     bluetooth: true,
                     worn: Some(true),
                     temperature: Some(268),
+                    steps: battery.map(|(percent, _)| percent as u32 * 123),
                 });
             }
         }
@@ -1129,5 +1130,71 @@ mod picker {
                 assert_eq!(picker.wheel_rect(n).intersection(&all), picker.wheel_rect(n));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod apollo_messages {
+    use crate::drivers::apollo_messages::{Readings, DAILY};
+
+    /// The summary of the day's activity as it arrived on the watch
+    /// (2026-11-24, 12 s after a start): time, 42, and 180 bytes that
+    /// begin with the step count.
+    #[test]
+    fn the_step_count_is_the_first_four_bytes_of_the_summary() {
+        let mut payload = vec![0x08, 0xd9, 0xcd, 0x94, 0xd8, 0x06, 0x10, 0x2a, 0x1a, 0xb4, 0x01];
+        let mut bytes = [0u8; 180];
+        let mut readings = Readings::default();
+        readings.update(DAILY, &[payload.clone(), bytes.to_vec()].concat());
+        assert_eq!(readings.steps, Some(0));
+        bytes[..4].copy_from_slice(&8_412u32.to_le_bytes());
+        payload.extend_from_slice(&bytes);
+        readings.update(DAILY, &payload);
+        assert_eq!(readings.steps, Some(8_412));
+        // A summary cut short changes nothing.
+        readings.update(DAILY, &[0x1a, 0x02, 0x01, 0x02]);
+        assert_eq!(readings.steps, Some(8_412));
+    }
+}
+
+#[cfg(test)]
+mod launcher {
+    use crate::app::launcher::{Launcher, Outcome, APPS};
+    use crate::app::theme::{C, SIZE};
+
+    #[test]
+    fn a_tap_chooses_and_a_second_one_opens() {
+        let mut launcher = Launcher::new();
+        // The first app is chosen from the start: a tap on it opens it.
+        let first = launcher.tile_rect(0).unwrap().center();
+        assert_eq!(launcher.tap(first.x, first.y), Outcome::Open(APPS[0]));
+        for n in 1..APPS.len() {
+            let tile = launcher.tile_rect(n).unwrap().center();
+            assert_eq!(launcher.tap(tile.x, tile.y), Outcome::Chosen, "app {n}");
+            assert_eq!(launcher.tap(tile.x, tile.y), Outcome::Open(APPS[n]), "app {n}");
+            // The middle opens the chosen one too.
+            assert_eq!(launcher.tap(C, C), Outcome::Open(APPS[n]), "app {n}");
+        }
+        // Between the tiles and the middle nothing happens.
+        assert_eq!(launcher.tap(C, C + 100), Outcome::Nothing);
+    }
+
+    #[test]
+    fn the_tiles_stand_apart_and_on_the_glass() {
+        let launcher = Launcher::new();
+        let tiles: Vec<_> = (0..APPS.len()).map(|n| launcher.tile_rect(n).unwrap()).collect();
+        for (n, r) in tiles.iter().enumerate() {
+            let (x0, y0) = (r.top_left.x, r.top_left.y);
+            let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "tile {n}: {r:?}");
+            }
+            for other in &tiles[n + 1..] {
+                assert!(r.intersection(other).is_zero_sized(), "tiles overlap: {r:?} {other:?}");
+            }
+        }
+        // The first one stands at the top.
+        assert_eq!(tiles[0].center().x, C);
+        assert!(tiles[0].center().y < C);
     }
 }

@@ -12,3 +12,7 @@ pub mod touch {
 
 #[path = "../../../src/drivers/touch_report.rs"]
 pub mod touch_report;
+
+/// The Apollo's messages: what is sent and what its reports hold.
+#[path = "../../../src/drivers/apollo/messages.rs"]
+pub mod apollo_messages;

@@ -36,7 +36,7 @@ use crate::services::font_data::{
 };
 
 pub use super::theme::{whole, SIZE};
-use super::theme::{self, rgb, BONE, C, CHROME, CYAN, INK, SIGNAL, SIGNAL_HOT, STEEL, STEEL_2};
+use super::theme::{self, rgb, BONE, C, CHROME, CYAN, GREEN, INK, SIGNAL, SIGNAL_HOT, STEEL, STEEL_2};
 
 /// The minutes' soft white glow: the design's 25 % of the text colour.
 const BONE_GLOW: Rgb565 = rgb(0x3A3B3C);
@@ -61,6 +61,8 @@ pub struct State {
     pub worn: Option<bool>,
     /// Temperature in tenths of a degree.
     pub temperature: Option<i16>,
+    /// Steps today, as far as known.
+    pub steps: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -233,6 +235,9 @@ pub fn key(n: usize, s: &State) -> u32 {
         FIRST_TICK..SECOND_DOT => s.time.is_some_and(|t| (n - FIRST_TICK) as u8 <= t.second) as u32,
         SECOND_DOT => s.time.map_or(60, |t| t.second as u32),
         BATTERY_ARC | BATTERY_TEXT => s.battery.map_or(u32::MAX, |(percent, _)| percent as u32),
+        // The arc only changes with its share of the goal.
+        STEP_ARC => s.steps.map_or(u32::MAX, |steps| step_share(steps) as u32),
+        STEP_TEXT => s.steps.unwrap_or(u32::MAX),
         FIRST_GLOW..DATE => digit(n - FIRST_GLOW, s).map_or(10, |d| d as u32),
         DATE => s.time.map_or(0, |t| (t.weekday as u32) << 16 | (t.month as u32) << 8 | t.day as u32),
         FIRST_DIGIT..HEART_PILL => digit(n - FIRST_DIGIT, s).map_or(10, |d| d as u32),
@@ -276,8 +281,13 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
             }
         }
         STEP_ARC => {
-            // No step count yet: the track only.
             ring_segment(target, clip, C, C, ARC.0, ARC.1, STEP_SPAN.0, STEP_SPAN.1, INK);
+            // Filled from the bottom end upwards, as far as the day's
+            // goal is reached.
+            if let Some(steps) = s.steps {
+                let from = STEP_SPAN.1 - step_share(steps);
+                dashes(target, clip, from, STEP_SPAN.1, GREEN);
+            }
         }
         BATTERY_TEXT => {
             target.text(clip, SIDE_X.0, SIDE_Y.0, &NW_LABEL, "BAT", CYAN);
@@ -295,9 +305,19 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
         STEP_TEXT => {
             // Right-aligned; the label's last letter carries its spacing.
             let label = "STEP";
-            target.text(clip, SIDE_X.1 - NW_LABEL.measure(label) + 3, SIDE_Y.0, &NW_LABEL, label, STEEL_2);
-            let value = "----";
-            target.text(clip, SIDE_X.1 - NW_MONO.measure(value), SIDE_Y.1, &NW_MONO, value, STEEL_2);
+            let mut value = Label::new();
+            let (label_color, value_color) = match s.steps {
+                Some(steps) => {
+                    let _ = write!(value, "{}", steps.min(99_999));
+                    (GREEN, BONE)
+                }
+                None => {
+                    let _ = write!(value, "----");
+                    (STEEL_2, STEEL_2)
+                }
+            };
+            target.text(clip, SIDE_X.1 - NW_LABEL.measure(label) + 3, SIDE_Y.0, &NW_LABEL, label, label_color);
+            target.text(clip, SIDE_X.1 - NW_MONO.measure(value.as_str()), SIDE_Y.1, &NW_MONO, value.as_str(), value_color);
         }
         FIRST_GLOW..DATE => {
             let i = n - FIRST_GLOW;
@@ -334,6 +354,15 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
             pill(target, clip, PILL_X[1], &NW_MESSAGE, "x--", STEEL_2);
         }
     }
+}
+
+/// The steps the arc is full at. A fixed number until the wearer can
+/// set a goal.
+const STEP_GOAL: u32 = 10_000;
+
+/// How much of the steps' arc `steps` fill, as an angle.
+fn step_share(steps: u32) -> i32 {
+    ((STEP_SPAN.1 - STEP_SPAN.0) as u32 * steps.min(STEP_GOAL) / STEP_GOAL) as i32
 }
 
 /// The lit part of an arc, from `from` to `to`, in dashes.
@@ -373,7 +402,7 @@ fn sine(tenths: i32) -> i32 {
 
 /// The direction of an angle (tenths of a degree, clockwise from twelve
 /// o'clock) as a vector times 16384.
-fn direction(tenths: i32) -> (i32, i32) {
+pub(super) fn direction(tenths: i32) -> (i32, i32) {
     (sine(tenths), -sine(tenths + 900))
 }
 
@@ -417,7 +446,7 @@ fn segment_box(cx: i32, cy: i32, inner: i32, outer: i32, from: i32, to: i32) -> 
 /// on the black background. Without that, curved and slanted edges show
 /// as stairs.
 #[allow(clippy::too_many_arguments)]
-fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, cx: i32, cy: i32, inner: i32, outer: i32, from: i32, to: i32, color: Rgb565) {
+pub(super) fn ring_segment<D: DrawTarget<Color = Rgb565>>(target: &mut D, clip: &Rectangle, cx: i32, cy: i32, inner: i32, outer: i32, from: i32, to: i32, color: Rgb565) {
     if to <= from {
         return;
     }

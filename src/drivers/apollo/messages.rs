@@ -33,7 +33,7 @@
 //! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
 //! |   130 | screen status (to the Apollo)   | see `screen_status`                           |
 //! |   140 | setup status (to the Apollo)    | see `setup_finished`                          |
-//! |    81 | daily-activity record, type 42  | 1 time s, 2 type, 3 bytes                     |
+//! |    81 | the day's activity so far      | 1 time s, 2 = 42, 3 bytes; see `Readings::steps` |
 //!
 //! Times are the watch's real-time clock as Unix time.
 
@@ -50,6 +50,7 @@ pub const PIN: u32 = 7;
 pub const VERSION: u32 = 6;
 pub const SENSOR_NAMES: u32 = 52;
 pub const MOVE_REMINDER: u32 = 40;
+pub const DAILY: u32 = 81;
 pub const WRIST_GESTURE: u32 = 41;
 pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
@@ -299,16 +300,40 @@ pub fn sedentary(window: Option<(Minutes, Minutes)>, lunch_break: bool) -> Encod
 
 /// Start or stop a single heart-rate measurement.
 ///
-/// The stock app sends kind 123 from `sendHeartRateSet` (0x0806D70A); the
-/// Apollo hands it to `lcSensorHeartRateSet`. Field 8 is the mode: the
-/// stock app's measurement screen uses 3 (0x0805289A); 2 belongs to the
-/// stress measurement, which sends a second message with it, and the other
-/// values to automatic monitoring. Measured: with mode 2 alone the Apollo
-/// acknowledges and measures nothing.
+/// The stock app sends kind 123 from `sendHeartRateSet` (B.70:
+/// 0x0806D85E); the Apollo's `lcSensorHeartRateSet` (0x147DC in its image
+/// 0704) stores the fields and acknowledges. What the Apollo does with
+/// them (read there, 2026-11-24):
 ///
-/// The fields for mode 3: 1 = on, 3 = 40, 7 = 1, 8 = 3, and 2 and 4 from
-/// the stock app's heart-rate settings, sent as zero here. What 3, 2 and 4
-/// mean is not known. Results come back as kind `HEART`.
+/// - 8, the mode (`lcAlgoHeartRateSetMonitorMode`, 0x30E54): 0 = no
+///   monitoring; 1 = periodic, the green light on for 30 in every 630
+///   seconds while worn, both numbers constants in the code
+///   (`lcAlgoHeartRateMonitor`, 0x31AB0); 2 = continuous; 3 = one
+///   measurement by hand, which is what this sends; 4 = sport, used by
+///   the Apollo itself; 0xFF = factory test, which sets a flag that
+///   stays, and is not to be sent. Modes 0 to 2 ignore field 1.
+/// - 1: for mode 3, on or off. The Apollo counts these: two "on" need
+///   two "off", and nothing in it ends a measurement by itself. For
+///   every mode it also says whether results are reported at all (only
+///   while worn).
+/// - 7: seconds between two reports.
+/// - 2 and 4: the warning for a high heart rate, switch and limit in
+///   beats a minute (`lcAlgoHeartReteEarlyWarnning`, 0x322A8); the
+///   warning comes as kind 55 (start time, lowest, highest). Zero here.
+/// - 3, 5, 6: never read by the Apollo. The stock app sends 40 in 3.
+///
+/// Results come back as kind `HEART`, field 8 = 3 for the heart rate:
+/// 2 = beats a minute (0 until there is one), 3 = the day's resting
+/// rate, 4 = the algorithm's quality, 25 = 0 nothing yet, 1 valid,
+/// 2 failed, 3 not worn. The Apollo keeps none of this across its
+/// restart. Not read here yet, all in docs/hardware-plan.md: stress
+/// (kind 135), SpO2 (124), the resting rate handed back (142), the
+/// light's own report (58).
+///
+/// Measured earlier: with mode 2 alone and field 1 = 0 the Apollo
+/// acknowledged and no report came, which fits the above (field 1
+/// decides about reports), though it was taken then for "measures
+/// nothing".
 pub fn heart_rate(on: bool) -> Encoder {
     Encoder::new().number(1, on as u32).number(3, 40).number(7, 1).number(8, 3)
 }
@@ -419,6 +444,23 @@ pub struct Readings {
     /// `HEART`, field 2; the stock app logs that field as "hr" at
     /// 0x0806CB8A). 0 while the Apollo has no result yet.
     pub heart_bpm: Option<u32>,
+    /// Steps today, from the latest summary of the day's activity (kind
+    /// `DAILY`): the first four bytes of its field 3, which the stock
+    /// app's decoder (B.70: 0x08053D56) logs as `rpt->step_number`.
+    ///
+    /// Read in the Apollo's image 0704: its daily-activity algorithm
+    /// runs from start without being asked, counts in RAM and starts at
+    /// zero when the day changes (`lcAlgoDaily_pre_cal`, 0x26058). By
+    /// that reading a restart of the Apollo starts it at zero too, but
+    /// measured (2026-11-24) the count was still there 11 s after a
+    /// restart of this firmware: 7629 steps in the evening of a worn
+    /// day. Either the Apollo is not restarted with the STM32 or it
+    /// gets the count back; not looked into. The summary is sent
+    /// (`lcAlgoDaily_send_report_internal`, 0x2847A) when something
+    /// changed and only while the Apollo was told the screen is on;
+    /// there is no message to ask for it. So this is the count as of
+    /// the last time the display was lit.
+    pub steps: Option<u32>,
 }
 
 impl Readings {
@@ -465,6 +507,11 @@ impl Readings {
                 // kind with field 1 = 0 is our own setting.
                 if field(1).and_then(|v| v.as_u32()) == Some(1) {
                     self.off_wrist_long = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0) != 0);
+                }
+            }
+            DAILY => {
+                if let Some(Value::Bytes(&[a, b, c, d, ..])) = field(3) {
+                    self.steps = Some(u32::from_le_bytes([a, b, c, d]));
                 }
             }
             HEART => {
