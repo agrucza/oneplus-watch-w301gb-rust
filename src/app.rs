@@ -651,8 +651,12 @@ const DARK_WAIT: Duration = Duration::from_secs(10);
 /// is dark and quiet.
 const STOP_WHILE_DARK: bool = true;
 /// How long it has to be quiet, with nobody connected, before the
-/// Bluetooth link is closed and the processor may stop.
-const STOP_AFTER: Duration = Duration::from_secs(10);
+/// Bluetooth link is closed and the processor may stop. It was 10 s
+/// while the sleeping was being tried out. Worn for a day (2026-11-24)
+/// the display went dark about 700 times, and those waits came to 1.4 h
+/// of running at full power in the dark, about a third of the day's
+/// drain. The stock app waits 6 or 24 ms (0x08096946 in B.70).
+const STOP_AFTER: Duration = Duration::from_secs(2);
 /// How long the main loop waits between passes while the processor may
 /// stop; a button or the Apollo ends the wait at once.
 const STOP_WAIT: Duration = Duration::from_secs(5);
