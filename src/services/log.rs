@@ -66,6 +66,11 @@ impl Log {
         Log
     }
 
+    /// The volume the log file lives on, once `start` has set it.
+    pub fn partition(&self) -> Option<Partition> {
+        buffer().and_then(|b| b.partition)
+    }
+
     /// True if there is text that `flush` has not written out yet.
     pub fn pending(&self) -> bool {
         buffer().is_some_and(|b| b.len > 0)

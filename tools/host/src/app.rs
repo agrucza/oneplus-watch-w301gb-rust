@@ -16,3 +16,5 @@ pub mod power;
 pub mod status;
 #[path = "../../../src/app/theme.rs"]
 pub mod theme;
+#[path = "../../../src/app/settings.rs"]
+pub mod settings;

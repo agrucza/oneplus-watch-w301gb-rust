@@ -14,6 +14,8 @@
 //! - Whether the picture is visible, for the main task to tell the Apollo.
 //! - A request to switch the watch off, which the main task passes to the
 //!   Apollo.
+//! - The settings: read from their file before the tasks start, changed
+//!   by the display task, written back to the file by the main task.
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +25,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 use super::controls::Action;
+use super::settings::Settings;
 use crate::drivers::apollo::messages::{Readings, WristGesture};
 
 #[derive(Clone, Copy)]
@@ -107,4 +110,30 @@ pub fn request_power_off() {
 /// Whether switching off was asked for since the last call.
 pub fn take_power_off() -> bool {
     POWER_OFF.swap(false, Ordering::Relaxed)
+}
+
+static SETTINGS: Mutex<CriticalSectionRawMutex, Cell<Settings>> = Mutex::new(Cell::new(Settings::START));
+static SETTINGS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// The settings as they are now.
+pub fn settings() -> Settings {
+    SETTINGS.lock(|cell| cell.get())
+}
+
+/// Take the settings read from the file at start.
+pub fn load_settings(settings: Settings) {
+    SETTINGS.lock(|cell| cell.set(settings));
+}
+
+/// Change the settings; the main task writes them to their file.
+pub fn change_settings(settings: Settings) {
+    SETTINGS.lock(|cell| cell.set(settings));
+    SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    // The main task may be waiting for a long while.
+    crate::hal::wake::nudge();
+}
+
+/// The settings, if they changed since the last call.
+pub fn take_changed_settings() -> Option<Settings> {
+    SETTINGS_CHANGED.swap(false, Ordering::Relaxed).then(settings)
 }

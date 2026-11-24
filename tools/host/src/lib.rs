@@ -814,3 +814,87 @@ mod round {
         }
     }
 }
+
+#[cfg(test)]
+mod settings {
+    use crate::app::settings::{brightness_rect, display_off_rect, raise_rect, tap_at, Settings, Tap, LEVELS, TIMEOUTS};
+    use crate::app::theme::{C, SIZE};
+
+    fn every() -> Vec<Settings> {
+        let mut all = Vec::new();
+        for brightness in std::iter::once(None).chain((0..LEVELS).map(Some)) {
+            for &display_off_s in &TIMEOUTS {
+                for raise_to_wake in [true, false] {
+                    all.push(Settings { brightness, display_off_s, raise_to_wake });
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn the_file_gives_back_what_was_written() {
+        for settings in every() {
+            let mut text = [0u8; 64];
+            let n = settings.text(&mut text);
+            assert!(n < text.len(), "the text of {settings:?} fills the buffer");
+            assert_eq!(Settings::parse(&text[..n]), settings);
+        }
+    }
+
+    #[test]
+    fn a_file_that_makes_no_sense_gives_the_start_values() {
+        assert_eq!(Settings::parse(b""), Settings::START);
+        assert_eq!(Settings::parse(&[0xFF; 64]), Settings::START);
+        assert_eq!(Settings::parse(b"brightness=9\ndisplay_off=7\nraise_to_wake=maybe\nnonsense\n=\n"), Settings::START);
+    }
+
+    #[test]
+    fn a_file_written_by_hand_is_understood() {
+        let text = b"  display_off = 60 \r\nraise_to_wake=off\r\nsomething_new=1\r\nbrightness=3";
+        assert_eq!(Settings::parse(text), Settings { brightness: Some(2), display_off_s: 60, raise_to_wake: false });
+    }
+
+    #[test]
+    fn a_tap_in_the_middle_of_a_button_sets_what_it_says() {
+        let middle = |r: embedded_graphics::primitives::Rectangle| r.center();
+        let at = middle(brightness_rect(0));
+        assert_eq!(tap_at(at.x, at.y), Some(Tap::Brightness(None)));
+        for step in 0..LEVELS {
+            let at = middle(brightness_rect(step as usize + 1));
+            assert_eq!(tap_at(at.x, at.y), Some(Tap::Brightness(Some(step))));
+        }
+        for (n, &seconds) in TIMEOUTS.iter().enumerate() {
+            let at = middle(display_off_rect(n));
+            assert_eq!(tap_at(at.x, at.y), Some(Tap::DisplayOff(seconds)));
+        }
+        let at = middle(raise_rect());
+        assert_eq!(tap_at(at.x, at.y), Some(Tap::RaiseToWake));
+        // The title, the hint and the handle set nothing.
+        for y in [40, 330, 425] {
+            assert_eq!(tap_at(C, y), None, "y = {y}");
+        }
+    }
+
+    #[test]
+    fn a_tap_changes_one_thing() {
+        let start = Settings::START;
+        assert_eq!(start.after(Tap::Brightness(Some(1))), Settings { brightness: Some(1), ..start });
+        assert_eq!(start.after(Tap::DisplayOff(60)), Settings { display_off_s: 60, ..start });
+        assert_eq!(start.after(Tap::RaiseToWake).after(Tap::RaiseToWake), start);
+    }
+
+    #[test]
+    fn everything_to_tap_is_on_the_glass() {
+        let mut rects = vec![raise_rect()];
+        rects.extend((0..=LEVELS as usize).map(brightness_rect));
+        rects.extend((0..TIMEOUTS.len()).map(display_off_rect));
+        for r in rects {
+            let (x0, y0) = (r.top_left.x, r.top_left.y);
+            let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "{r:?}");
+            }
+        }
+    }
+}

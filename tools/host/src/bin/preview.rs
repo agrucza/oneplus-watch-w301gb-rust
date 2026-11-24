@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|below|faces|cards|power|power-chosen|status
+//!   cargo run --bin preview -- OUT.ppm above|above-set|below|faces|cards|power|power-chosen|status
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -70,7 +70,11 @@ fn main() {
     };
     let whole = face::whole();
     match args.get(2).map(String::as_str) {
-        Some("above") => panels::draw(&mut frame, &whole, Page::Above),
+        Some("above") => w301_host::app::settings::draw(&mut frame, &whole, &w301_host::app::settings::Settings::START),
+        Some("above-set") => {
+            let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false };
+            w301_host::app::settings::draw(&mut frame, &whole, &set)
+        }
         Some("below") => panels::draw(&mut frame, &whole, Page::Below),
         Some("faces") => panels::draw(&mut frame, &whole, Page::Faces),
         Some("cards") => panels::draw(&mut frame, &whole, Page::Cards),

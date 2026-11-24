@@ -33,9 +33,6 @@ pub static NW_ICON_SYNC: Art = Art { width: 26, height: 26, coverage: include_by
 /// The design's double chevron (26 x 26).
 pub static NW_ICON_NEXT: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_next.bin") };
 
-/// The design's gear icon (44 x 44).
-pub static NW_ICON_GEAR: Art = Art { width: 44, height: 44, coverage: include_bytes!("fonts/nw_icon_gear.bin") };
-
 /// The design's bell icon (44 x 44).
 pub static NW_ICON_BELL: Art = Art { width: 44, height: 44, coverage: include_bytes!("fonts/nw_icon_bell.bin") };
 

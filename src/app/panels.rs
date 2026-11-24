@@ -1,20 +1,21 @@
-//! The pages that have nothing of their own to show yet: the two panels
-//! pulled over the watch face, and the two pages a long press opens.
+//! The pages that have nothing of their own to show yet: the panel
+//! pulled over the watch face from below, and the two pages a long press
+//! opens.
 //!
 //! The stock app has all four (see docs/hardware-plan.md, 3.1). What
 //! they hold there (notifications, quick settings, the faces to choose
 //! from, the pages to arrange) this firmware does not have yet, so each
 //! only says which one it is and how to leave it. The names and colours
-//! are the design's: quick access is pulled down from the top there.
+//! are the design's.
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 use super::pages::Page;
-use super::theme::{self, C, CHROME, CYAN, GREEN, SIGNAL, SIZE, YELLOW};
+use super::theme::{self, C, CHROME, GREEN, SIGNAL, SIZE, YELLOW};
 use crate::services::font::{Art, Paint};
-use crate::services::font_data::{NW_ICON_BELL, NW_ICON_DIAMOND, NW_ICON_GEAR, NW_ICON_GRID, NW_MONO};
+use crate::services::font_data::{NW_ICON_BELL, NW_ICON_DIAMOND, NW_ICON_GRID, NW_MONO};
 
 /// How one of these pages looks.
 struct Look {
@@ -30,11 +31,11 @@ struct Look {
 
 fn look(page: Page) -> Option<Look> {
     Some(match page {
-        Page::Above => Look { title: "QUICK.ACCESS", color: CYAN, icon: &NW_ICON_GEAR, leave: "PUSH UP TO CLOSE", handle: Some((SIZE - 34, SIZE - 2)) },
         Page::Below => Look { title: "ALERTS", color: YELLOW, icon: &NW_ICON_BELL, leave: "PUSH DOWN TO CLOSE", handle: Some((14, 0)) },
         Page::Faces => Look { title: "FACES", color: SIGNAL, icon: &NW_ICON_DIAMOND, leave: "TAP TO GO BACK", handle: None },
         Page::Cards => Look { title: "PAGES", color: GREEN, icon: &NW_ICON_GRID, leave: "TAP TO GO BACK", handle: None },
-        Page::Face | Page::Status | Page::Power => return None,
+        // The panel from above is the settings page (`super::settings`).
+        Page::Face | Page::Status | Page::Above | Page::Power => return None,
     })
 }
 

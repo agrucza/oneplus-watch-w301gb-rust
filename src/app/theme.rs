@@ -37,6 +37,8 @@ pub const YELLOW: Rgb565 = rgb(0xFFEE00);
 pub const GREEN: Rgb565 = rgb(0x00FF9C);
 /// A slightly lifted surface: the track of an arc.
 pub const INK: Rgb565 = rgb(0x0B0D12);
+/// A raised surface: a switch that is off.
+pub const INK_3: Rgb565 = rgb(0x14171E);
 /// Borders and dividers.
 pub const STEEL: Rgb565 = rgb(0x2A2F3A);
 /// Text that is switched off.
@@ -135,4 +137,21 @@ pub fn plate<D: Paint>(target: &mut D, clip: &Rectangle, rect: &Rectangle, cut: 
 pub fn handle<D: Paint>(target: &mut D, clip: &Rectangle, y: i32, color: Rgb565) {
     let bar = Rectangle::new(Point::new(C - 40, y), Size::new(80, 4));
     let _ = target.fill_solid(&bar.intersection(clip), color);
+}
+
+/// A switch of `size` (width, height) with its top left corner at (x, y):
+/// on, a red box with a black block at the right; off, a dark box with
+/// a grey block at the left.
+pub fn switch<D: Paint>(target: &mut D, clip: &Rectangle, x: i32, y: i32, size: (i32, i32), on: bool) {
+    let (width, height) = size;
+    let body = Rectangle::new(Point::new(x, y), Size::new(width as u32, height as u32));
+    let _ = target.fill_solid(&body.intersection(clip), if on { SIGNAL } else { STEEL });
+    if !on {
+        let inside = Rectangle::new(Point::new(x + 1, y + 1), Size::new(width as u32 - 2, height as u32 - 2));
+        let _ = target.fill_solid(&inside.intersection(clip), INK_3);
+    }
+    let block = height - 6;
+    let left = if on { x + width - 3 - block } else { x + 3 };
+    let knob = Rectangle::new(Point::new(left, y + 3), Size::new(block as u32, block as u32));
+    let _ = target.fill_solid(&knob.intersection(clip), if on { BLACK } else { STEEL_2 });
 }

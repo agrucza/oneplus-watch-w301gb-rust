@@ -6,6 +6,7 @@ mod motion;
 mod pages;
 mod panels;
 mod power;
+mod settings;
 mod shared;
 mod status;
 mod theme;
@@ -21,6 +22,7 @@ use crate::drivers::apollo::messages::{KeyEvent, Readings, WristGesture};
 use crate::drivers::cypress::Link;
 use crate::services::gestures::{Gesture, Gestures};
 use controls::{Action, Bindings, Button, Hold, Press, Taps};
+use settings::Settings;
 use motion::Motion;
 use pages::Page;
 
@@ -59,6 +61,7 @@ pub async fn run(spawner: Spawner, board: Board) {
     let rotated = rotate_log(log_partition);
     let mut log = Log::start(log_partition);
     let _ = writeln!(log.stamp(), "--- w301 rust app: ota server ---");
+    shared::load_settings(settings_load(log_partition, &mut log));
     match rotated {
         Some(Ok(len)) => {
             let _ = writeln!(log.stamp(), "log: the previous log ({} bytes) is now log/rust.old; this file starts afresh", len);
@@ -503,6 +506,51 @@ fn speed_up_card(log: &mut Log) -> bool {
     true
 }
 
+/// The settings file, beside the log.
+const SETTINGS_DIR: &str = "LOG";
+const SETTINGS_FILE: &str = "RUST.CFG";
+
+/// Read the settings from their file. A watch without the file, or with
+/// one that cannot be read, has the start values.
+fn settings_load(partition: storage::Partition, log: &mut Log) -> Settings {
+    let mut text = [0u8; 64];
+    match storage::read_tail(partition, SETTINGS_DIR, SETTINGS_FILE, &mut text) {
+        Ok((_, n)) => {
+            let settings = Settings::parse(&text[..n]);
+            let _ = writeln!(log.stamp(), "settings: read from the file ({} bytes): {:?}", n, settings);
+            settings
+        }
+        Err(step) => {
+            let _ = writeln!(log.stamp(), "settings: no file to read (step {}), start values", step);
+            Settings::START
+        }
+    }
+}
+
+/// Write the settings to their file. True if they are stored. Not
+/// folded into the main loop, whose stack frame it would enlarge for good.
+#[inline(never)]
+fn settings_save(partition: storage::Partition, settings: &Settings, log: &mut Log) -> bool {
+    let mut text = [0u8; 64];
+    let n = settings.text(&mut text);
+    let written = (|| {
+        // The file has to exist before it can be rewritten.
+        storage::append(partition, SETTINGS_DIR, SETTINGS_FILE, &[]).map_err(|_| 1u8)?;
+        let mut writer = storage::FileWriter::rewrite(partition, &[SETTINGS_DIR], SETTINGS_FILE).map_err(|_| 2u8)?;
+        writer.write(&text[..n]).map_err(|()| 3u8)?;
+        writer.finish().map_err(|()| 4u8)
+    })();
+    match written {
+        Ok(()) => {
+            let _ = writeln!(log.stamp(), "settings: stored: {:?}", settings);
+        }
+        Err(step) => {
+            let _ = writeln!(log.stamp(), "settings: could NOT be stored (step {})", step);
+        }
+    }
+    written.is_ok()
+}
+
 /// The log file is started afresh at a start that finds it larger than
 /// this; what was in it is kept as `log/rust.old` (one generation).
 const LOG_LIMIT: u32 = 256 * 1024;
@@ -613,7 +661,7 @@ const QUIET_WAIT: Duration = Duration::from_millis(200);
 
 /// The display goes dark after this long without a finger or a button.
 /// A value of our own; it becomes a setting once there are settings.
-const DISPLAY_TIMEOUT: Duration = Duration::from_secs(15);
+const _: () = assert!(settings::LEVELS as usize == BRIGHTNESS.len());
 
 /// How often the watch face is looked at for something that moved: about
 /// 15 times a second.
@@ -735,8 +783,9 @@ impl Tracking {
 struct Screen {
     panel: panel::Panel,
     visible: bool,
-    /// `None`: brightness follows the light. `Some(n)`: fixed at `BRIGHTNESS[n]`.
-    fixed: Option<usize>,
+    /// What the user has set (`settings`): the brightness, the time until
+    /// the display goes dark, whether raising the wrist lights it.
+    settings: Settings,
     auto: AutoBrightness,
     /// What the panel is set to now.
     level: u8,
@@ -797,7 +846,7 @@ impl Screen {
         Self {
             panel,
             visible: true,
-            fixed: None,
+            settings: shared::settings(),
             auto: AutoBrightness::new(START_BRIGHTNESS),
             level: START_BRIGHTNESS,
             level_logged: START_BRIGHTNESS,
@@ -863,23 +912,13 @@ impl Screen {
             }
             Action::StepBrightness => {
                 self.last_button = "button: brightness";
-                self.fixed = match self.fixed {
+                let brightness = match self.settings.brightness {
                     None => Some(0),
-                    Some(n) if n + 1 < BRIGHTNESS.len() => Some(n + 1),
+                    Some(n) if n + 1 < settings::LEVELS => Some(n + 1),
                     Some(_) => None,
                 };
-                match self.fixed {
-                    Some(n) => {
-                        let _ = writeln!(log.stamp(), "display: brightness fixed, step {} of {}", n + 1, BRIGHTNESS.len());
-                        self.level = BRIGHTNESS[n];
-                        self.level_logged = self.level;
-                        self.panel.set_brightness(self.level).await
-                    }
-                    None => {
-                        let _ = writeln!(log.stamp(), "display: brightness automatic");
-                        true // `fade` takes it from here
-                    }
-                }
+                self.set(settings::Tap::Brightness(brightness), log);
+                true // `fade` takes it from here
             }
             // Done by the main task, never sent here.
             Action::Nothing | Action::ToggleHeartRate | Action::Restart => true,
@@ -914,7 +953,7 @@ impl Screen {
     /// Returns true if the display changed.
     async fn gesture(&mut self, gesture: WristGesture, log: &mut Log) -> bool {
         let show = match gesture {
-            WristGesture::Raised if !self.visible => true,
+            WristGesture::Raised if !self.visible && self.settings.raise_to_wake => true,
             WristGesture::Lowered if self.visible && self.shown_by_raise => false,
             _ => return false,
         };
@@ -939,17 +978,18 @@ impl Screen {
         self.panel.set_visible(visible, log).await
     }
 
-    /// The display's switch-off timer: dark after `DISPLAY_TIMEOUT`
-    /// without a finger or a button, counted from the display coming on
+    /// The display's switch-off timer: dark after the time set
+    /// (`Settings::display_off_s`) without a finger or a button, counted from the display coming on
     /// if that was later. Not while a page is under the finger.
     async fn idle(&mut self, log: &mut Log) {
-        if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < DISPLAY_TIMEOUT {
+        let timeout = Duration::from_secs(self.settings.display_off_s as u64);
+        if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < timeout {
             return;
         }
         self.visible = false;
         self.visible_since = Instant::now();
         self.shown_by_raise = false;
-        let _ = writeln!(log.stamp(), "display: blanked after {} s without a finger or a button", DISPLAY_TIMEOUT.as_secs());
+        let _ = writeln!(log.stamp(), "display: blanked after {} s without a finger or a button", timeout.as_secs());
         if !self.panel_visible(false, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
         }
@@ -1042,6 +1082,11 @@ impl Screen {
                 if let (Some(page), None) = (pages::tap(self.page), self.pull) {
                     self.go_to(page, log);
                 }
+                if self.page == Page::Above && self.pull.is_none() {
+                    if let Some(tap) = settings::tap_at(x, y) {
+                        self.set(tap, log);
+                    }
+                }
                 if self.page == Page::Power {
                     // The first tap on a row chooses it, the second
                     // does it; a tap anywhere else takes the choice back.
@@ -1063,6 +1108,20 @@ impl Screen {
             }
             _ => {}
         }
+    }
+
+    /// Change a setting: it holds from now on, the settings page shows
+    /// it, and the main task writes it to the file.
+    fn set(&mut self, tap: settings::Tap, log: &mut Log) {
+        let new = self.settings.after(tap);
+        if new == self.settings {
+            return;
+        }
+        let _ = writeln!(log.stamp(), "settings: {:?}", tap);
+        self.settings = new;
+        shared::change_settings(new);
+        self.t.damage[Page::Above.index()].add(face::whole());
+        self.changed = true;
     }
 
     /// Show `page` from the next picture on, without a move in between.
@@ -1113,16 +1172,32 @@ impl Screen {
         self.auto.feed(lux);
     }
 
-    /// In automatic mode, move the panel one step towards the brightness
-    /// the light asks for. Call on every pass; does nothing most of the time.
+    /// Keep the panel at the brightness that is set: a fixed step at
+    /// once, and in automatic mode one step at a time towards what the
+    /// light asks for. Call on every pass; does nothing most of the time.
     async fn fade(&mut self, log: &mut Log) {
-        let wanted = self.auto.wanted();
-        if self.fixed.is_some() || !self.visible || self.level == wanted || self.faded_at.elapsed() < FADE_INTERVAL {
+        if !self.visible {
             return;
         }
-        self.faded_at = Instant::now();
-        let step = self.level.abs_diff(wanted).min(FADE_STEP);
-        self.level = if wanted > self.level { self.level + step } else { self.level - step };
+        let wanted = match self.settings.brightness {
+            Some(step) => BRIGHTNESS[step as usize % BRIGHTNESS.len()],
+            None => self.auto.wanted(),
+        };
+        if self.level == wanted {
+            return;
+        }
+        if self.settings.brightness.is_some() {
+            let _ = writeln!(log.stamp(), "display: brightness fixed at {}", wanted);
+            self.level = wanted;
+            self.level_logged = wanted;
+        } else {
+            if self.faded_at.elapsed() < FADE_INTERVAL {
+                return;
+            }
+            self.faded_at = Instant::now();
+            let step = self.level.abs_diff(wanted).min(FADE_STEP);
+            self.level = if wanted > self.level { self.level + step } else { self.level - step };
+        }
         if !self.panel.set_brightness(self.level).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take brightness {}", self.level);
         }
@@ -1277,6 +1352,20 @@ impl Screen {
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
         }
+        if self.page == Page::Above {
+            // Changes on a tap only, like the power page.
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
         if self.page == Page::Power {
             let changes = self.t.damage[page].take(back);
             if changes.is_empty() {
@@ -1326,7 +1415,7 @@ impl Screen {
             bluetooth_connected,
             worn,
             measuring_heart,
-            brightness_step: self.fixed.map(|n| (n + 1, BRIGHTNESS.len())),
+            brightness_step: self.settings.brightness.map(|n| (n as usize + 1, BRIGHTNESS.len())),
             brightness: self.level,
             last_button: self.last_button,
             last_touch: self.last_touch,
@@ -1531,7 +1620,7 @@ impl Screen {
 
     /// Where automatic brightness has arrived, at most once a second.
     fn log_brightness(&mut self, log: &mut Log) {
-        if self.fixed.is_none() && self.level == self.auto.wanted() && self.level != self.level_logged {
+        if self.settings.brightness.is_none() && self.level == self.auto.wanted() && self.level != self.level_logged {
             let _ = writeln!(
                 log.stamp(),
                 "display: automatic brightness {} -> {} at {} lux",
@@ -1859,6 +1948,9 @@ async fn main_loop(
                 _ if has_screen => shared::send(shared::Event::Act(action)),
                 _ => {}
             }
+        }
+        if let (Some(settings), Some(partition)) = (shared::take_changed_settings(), log.partition()) {
+            settings_save(partition, &settings, &mut log);
         }
         if shared::take_power_off() {
             let sent = match apollo.as_mut() {
