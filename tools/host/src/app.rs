@@ -18,3 +18,7 @@ pub mod status;
 pub mod theme;
 #[path = "../../../src/app/settings.rs"]
 pub mod settings;
+#[path = "../../../src/app/alerts.rs"]
+pub mod alerts;
+#[path = "../../../src/app/picker.rs"]
+pub mod picker;

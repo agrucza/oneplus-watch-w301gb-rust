@@ -12,6 +12,7 @@
 //! |     4 | 200-byte data block (dump?)     | 1, 2 counters, 4 bytes                        |
 //! |     7 | not known                       | 1..4 numbers                                  |
 //! |    20 | heartbeat                       | 2 = 0xA5A5A5A5 from the Apollo                |
+//! |    40 | reminder to move                | 1 time, 2 = 1; see `sedentary`                |
 //! |    41 | wrist gesture (raise to wake)   | see `WristGesture`                            |
 //! |    43 | barometer ("BAR")               | 1 time ms, 2 pressure Pa, 3 altitude m        |
 //! |    44 | heart rate, SpO2, stress        | 1 time ms, 2 bpm, 5 SpO2, 7 stress, 8 type, 25 status |
@@ -27,6 +28,8 @@
 //! |    84 | vibration motor (to the Apollo) | see `motor_pulses`                            |
 //! |   102 | system state (to the Apollo)    | see `power_off`                               |
 //! |   121 | raise to wake on/off (to the Apollo) | see `raise_to_wake`                      |
+//! |   122 | do-not-disturb (to the Apollo)  | see `do_not_disturb`                          |
+//! |   125 | sedentary reminder (to the Apollo) | see `sedentary`                            |
 //! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
 //! |   130 | screen status (to the Apollo)   | see `screen_status`                           |
 //! |   140 | setup status (to the Apollo)    | see `setup_finished`                          |
@@ -46,6 +49,7 @@ pub const OFF_WRIST: u32 = 11;
 pub const PIN: u32 = 7;
 pub const VERSION: u32 = 6;
 pub const SENSOR_NAMES: u32 = 52;
+pub const MOVE_REMINDER: u32 = 40;
 pub const WRIST_GESTURE: u32 = 41;
 pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
@@ -224,22 +228,31 @@ pub fn setup_finished() -> Encoder {
 
 // Settings. After the setup status the stock app sends its settings to the
 // Apollo, in this order (0x08033D38): do-not-disturb (kind 122), sedentary
-// reminder (125), a daily time window that switches the Apollo's algorithm
-// 13 (kind 121, probably raise-to-wake), heart-rate monitoring (123) with
-// stress monitoring (135), kind 142, SpO2 monitoring (124) and kind 130.
-// Only the first two are read through on both sides and sent here; the
-// values are "off" until this firmware has settings of its own.
+// reminder (125), raise-to-wake (121), heart-rate monitoring (123) with
+// stress monitoring (135), kind 142, SpO2 monitoring (124) and the screen
+// status (130). The first three and the last are read through on both
+// sides and sent here. The Apollo keeps none of them across its restart.
 
 /// A time of day in minutes since midnight.
 pub type Minutes = u16;
 
 /// Do-not-disturb: switched on or off, with up to two daily time windows.
 ///
-/// Stock sender 0x0806D6CE, called from 0x0803394A; the Apollo's
-/// `lcSensorDisturbSet` (0x146FC in its image) logs the fields as
-/// "onOff, 0: start~end, 1: start~end". With nothing set the stock app
-/// sends off, a first window of the whole day and an unused second one
-/// (0xFFFF).
+/// Stock sender 0x0806D822 (B.70), called from 0x0803394A. With nothing
+/// set the stock app sends off, a first window of the whole day and an
+/// unused second one (0xFFFF); with a schedule, on and its window.
+///
+/// In the Apollo (image 0704): `lcSensorDisturbSet` (0x146FC) stores the
+/// fields, logs them as "onOff, 0: start~end, 1: start~end" and
+/// acknowledges. `lcAlgoCheckDNDMode` (0x371C0) works out from them and
+/// the Apollo's clock whether do-not-disturb holds right now: on, and
+/// the minute of the day inside either window (from before to: both
+/// minutes included; otherwise over midnight; equal: all day). The one
+/// thing that looks at the result is the wrist gesture (0x12B8C): while
+/// it holds, "raised" is not reported, except during sport. Nothing
+/// comes back to the STM32, and the sedentary reminder is not held back
+/// by it: what else is to be quiet is the STM32's business. Start
+/// value: off.
 pub fn do_not_disturb(on: bool, first: (Minutes, Minutes), second: Option<(Minutes, Minutes)>) -> Encoder {
     let second = second.unwrap_or((0xFFFF, 0xFFFF));
     Encoder::new()
@@ -250,21 +263,38 @@ pub fn do_not_disturb(on: bool, first: (Minutes, Minutes), second: Option<(Minut
         .number(5, second.1 as u32)
 }
 
-/// Sedentary reminder: up to two daily time windows in which the Apollo
-/// reminds the wearer to move; `None` switches a window off.
+/// Sedentary reminder: the daily time window in which the Apollo reminds
+/// the wearer to move, `None` for off; with `lunch_break` not between
+/// 12:00 and 14:00.
 ///
-/// Stock sender 0x0806D840, called from 0x08033C16 with the stock setting
-/// 0xA8; the Apollo stores the message and switches its "sedentary"
-/// algorithm (number 7) by field 1 (its event 13, 0x1544E).
-pub fn sedentary(first: Option<(Minutes, Minutes)>, second: Option<(Minutes, Minutes)>) -> Encoder {
-    let (a, b) = (first.unwrap_or((0, 0)), second.unwrap_or((0, 0)));
+/// Stock sender 0x0806D994 (B.70), called from 0x08033C16 with the stock
+/// setting 0xA8, whose start values are on, 09:00 to 21:00, no lunch
+/// break. Field 1 = on, 2 and 3 = the window, 4 = the lunch break, 5 and
+/// 6 = its times, which the stock app sends as 720 and 840 and the
+/// Apollo never reads: the two hours are fixed in its code.
+///
+/// In the Apollo (image 0704): the handler (0x1544E) stores the fields
+/// and switches its algorithm 7 by field 1; it sends no acknowledgement.
+/// `lcAlgoSedentaryProcess` (0x377A8) keeps the algorithm on inside the
+/// window and off while the watch is off the wrist for a minute or more,
+/// during sport, and after ten minutes of what looks like its sleep
+/// state. The detection itself is the motion library's, set up for 60
+/// minutes without movement (`CWM_AP_Init`, 0x2040C). When it fires,
+/// `lcAlgo_send_sedentary_reminder` (0x379C4) sends kind
+/// `MOVE_REMINDER` (field 1 the Apollo's time, field 2 = 1) and nothing
+/// else: the vibration and whether the wearer is to be left alone are
+/// the STM32's business (the stock app's handler 0x0806CB8C plays its
+/// motor effect 6 unless its own do-not-disturb holds or the wearer
+/// sleeps).
+pub fn sedentary(window: Option<(Minutes, Minutes)>, lunch_break: bool) -> Encoder {
+    let (from, to) = window.unwrap_or((0, 0));
     Encoder::new()
-        .number(1, first.is_some() as u32)
-        .number(2, a.0 as u32)
-        .number(3, a.1 as u32)
-        .number(4, second.is_some() as u32)
-        .number(5, b.0 as u32)
-        .number(6, b.1 as u32)
+        .number(1, window.is_some() as u32)
+        .number(2, from as u32)
+        .number(3, to as u32)
+        .number(4, lunch_break as u32)
+        .number(5, 720)
+        .number(6, 840)
 }
 
 /// Start or stop a single heart-rate measurement.
@@ -518,6 +548,16 @@ impl WearReason {
 /// algorithm's two results are treated differently (0x23F7A): "lowered"
 /// is always reported, "raised" only while algorithm 13 is on. Both
 /// arrive as `WristGesture`.
+///
+/// "Off" is what the stock app sends when the user switches the feature
+/// off (its settings writer 0x08080290 calls the sender after storing).
+/// The Apollo then only clears the algorithm's bit (0x36E0C, 0x23DB4):
+/// the detection keeps running, the report is dropped. Its detector
+/// (0x488E8) looks for a raise only while it was told the screen is off,
+/// so with the feature off and the screen off nothing is sent at all.
+/// The detector has no setting for its sensitivity: every limit is a
+/// constant in its code, and it reads nothing but the three acceleration
+/// axes and the screen state.
 pub fn raise_to_wake(on: bool, window: (Minutes, Minutes)) -> Encoder {
     Encoder::new().number(1, on as u32).number(2, window.0 as u32).number(3, window.1 as u32)
 }

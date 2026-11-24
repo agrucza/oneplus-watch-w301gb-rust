@@ -116,6 +116,27 @@ def hero(name, size, glow_pad, glows):
     print("%-14s %3d x %3d  %7d bytes, glow %d x %d  %d bytes" % (name, width, height, len(digits), gw, gh, len(glow)))
 
 
+def numerals(name, size, weight, doc):
+    """The digits 0 to 9 and the colon of the display font, cut to the
+    height the digits really have, each centred in a cell as wide as the
+    widest digit."""
+    font = load(ORBITRON, size, weight)
+    chars = "0123456789:"
+    boxes = [font.getbbox(c) for c in chars]
+    top, bottom = min(b[1] for b in boxes), max(b[3] for b in boxes)
+    width = max(round(font.getlength(c)) for c in chars)
+    height = bottom - top
+    data = bytearray()
+    for c in chars:
+        cell = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(cell).text(((width - round(font.getlength(c))) // 2, -top), c, font=font, fill=255)
+        data += cell.tobytes()
+    rs.append("/// %s: the digits and the colon, each %d x %d." % (doc, width, height))
+    rs.append("pub static %s: Font = Font { width: %d, height: %d, first: 48, count: 11, coverage: %s, advance: &[] };" % (name, width, height, save(name.lower(), data)))
+    rs.append("")
+    print("%-14s %3d x %3d  %7d bytes" % (name, width, height, len(data)))
+
+
 def art(name, image, doc):
     """A drawing of any size."""
     rs.append("/// %s (%d x %d)." % (doc, image.width, image.height))
@@ -239,6 +260,7 @@ def rim_text(name, text, size, radius, centre_angle, inward, doc):
 text_font("NW_LABEL", RAJDHANI, 19, tracking=0.14, proportional=True, last=95, doc="Rajdhani Bold at 19 pixels, capitals only, spaced out by 0.14 em as the design's labels are")
 text_font("NW_TITLE", RAJDHANI, 28, tracking=0.12, proportional=True, last=95, doc="Rajdhani Bold at 28 pixels, capitals only, spaced out by 0.12 em: page titles and row titles")
 text_font("NW_MONO", JETBRAINS, 17, weight="Medium", doc="JetBrains Mono Medium at 17 pixels")
+numerals("NW_NUMBER", 46, "Bold", "Orbitron Bold at 46 pixels, for values to be set")
 # The design's large text shadow is 22 px at 45 % and 6 px at 90 %. On
 # the picture that is a lot of red around the hours; about half of it here.
 hero("NW_HERO", 104, 24, [(22, 0.22), (6, 0.45)])
@@ -249,7 +271,6 @@ icon("NW_MESSAGE", 18, "M3 5 H21 V17 H13 L8 21 V17 H3 Z", "The design's message 
 icon("NW_ICON_POWER", 26, "M12 3 V12 M7 7 A7 7 0 1 0 17 7", "The design's power icon")
 icon("NW_ICON_SYNC", 26, "M20 8 A8 8 0 0 0 6 6 M4 16 A8 8 0 0 0 18 18 M20 3 V8 H15 M4 21 V16 H9", "The design's sync icon")
 icon("NW_ICON_NEXT", 26, "M4 5 L11 12 L4 19 M11 5 L18 12 L11 19", "The design's double chevron")
-icon("NW_ICON_BELL", 44, "M5 17 H19 L17 14 V10 A5 5 0 0 0 7 10 V14 L5 17 Z M10 20 H14", "The design's bell icon")
 icon("NW_ICON_DIAMOND", 44, "M12 3 L21 12 L12 21 L3 12 Z", "The design's diamond icon")
 icon("NW_ICON_GRID", 44, "M3 3 H10 V10 H3 Z M14 3 H21 V10 H14 Z M3 14 H10 V21 H3 Z M14 14 H21 V21 H14 Z", "The design's grid icon")
 rim_text("NW_RIM_TOP", "NIGHTWATCH OS · W301 · RUST", 13, 192, 0, False, "The line of text along the top of the face")

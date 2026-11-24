@@ -12,6 +12,9 @@ pub static NW_TITLE: Font = Font { width: 26, height: 37, first: 32, count: 64, 
 /// JetBrains Mono Medium at 17 pixels: every character in a cell of 10 x 24.
 pub static NW_MONO: Font = Font { width: 10, height: 24, first: 32, count: 95, coverage: include_bytes!("fonts/nw_mono.bin"), advance: &[] };
 
+/// Orbitron Bold at 46 pixels, for values to be set: the digits and the colon, each 38 x 34.
+pub static NW_NUMBER: Font = Font { width: 38, height: 34, first: 48, count: 11, coverage: include_bytes!("fonts/nw_number.bin"), advance: &[] };
+
 /// Orbitron Black at 104 pixels, the digits 0 to 9 only, each 87 x 75.
 pub static NW_HERO: Font = Font { width: 87, height: 75, first: 48, count: 10, coverage: include_bytes!("fonts/nw_hero.bin"), advance: &[] };
 /// The same digits as a glow: cells of 135 x 123, reaching 24 pixels beyond the digit on every side.
@@ -32,9 +35,6 @@ pub static NW_ICON_SYNC: Art = Art { width: 26, height: 26, coverage: include_by
 
 /// The design's double chevron (26 x 26).
 pub static NW_ICON_NEXT: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_next.bin") };
-
-/// The design's bell icon (44 x 44).
-pub static NW_ICON_BELL: Art = Art { width: 44, height: 44, coverage: include_bytes!("fonts/nw_icon_bell.bin") };
 
 /// The design's diamond icon (44 x 44).
 pub static NW_ICON_DIAMOND: Art = Art { width: 44, height: 44, coverage: include_bytes!("fonts/nw_icon_diamond.bin") };

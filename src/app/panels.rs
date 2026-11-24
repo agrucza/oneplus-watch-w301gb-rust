@@ -1,6 +1,5 @@
-//! The pages that have nothing of their own to show yet: the panel
-//! pulled over the watch face from below, and the two pages a long press
-//! opens.
+//! The pages that have nothing of their own to show yet: the two pages a
+//! long press opens.
 //!
 //! The stock app has all four (see docs/hardware-plan.md, 3.1). What
 //! they hold there (notifications, quick settings, the faces to choose
@@ -13,9 +12,9 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
 use super::pages::Page;
-use super::theme::{self, C, CHROME, GREEN, SIGNAL, SIZE, YELLOW};
+use super::theme::{self, C, CHROME, GREEN, SIGNAL};
 use crate::services::font::{Art, Paint};
-use crate::services::font_data::{NW_ICON_BELL, NW_ICON_DIAMOND, NW_ICON_GRID, NW_MONO};
+use crate::services::font_data::{NW_ICON_DIAMOND, NW_ICON_GRID, NW_MONO};
 
 /// How one of these pages looks.
 struct Look {
@@ -23,19 +22,15 @@ struct Look {
     color: Rgb565,
     icon: &'static Art,
     leave: &'static str,
-    /// The top edge of the bar at the edge a panel is held by, and the
-    /// top of the line along that edge, which shows where the panel
-    /// ends while it moves over the face.
-    handle: Option<(i32, i32)>,
 }
 
 fn look(page: Page) -> Option<Look> {
     Some(match page {
-        Page::Below => Look { title: "ALERTS", color: YELLOW, icon: &NW_ICON_BELL, leave: "PUSH DOWN TO CLOSE", handle: Some((14, 0)) },
-        Page::Faces => Look { title: "FACES", color: SIGNAL, icon: &NW_ICON_DIAMOND, leave: "TAP TO GO BACK", handle: None },
-        Page::Cards => Look { title: "PAGES", color: GREEN, icon: &NW_ICON_GRID, leave: "TAP TO GO BACK", handle: None },
-        // The panel from above is the settings page (`super::settings`).
-        Page::Face | Page::Status | Page::Above | Page::Power => return None,
+        Page::Faces => Look { title: "FACES", color: SIGNAL, icon: &NW_ICON_DIAMOND, leave: "TAP TO GO BACK" },
+        Page::Cards => Look { title: "PAGES", color: GREEN, icon: &NW_ICON_GRID, leave: "TAP TO GO BACK" },
+        // The panels are the settings (`super::settings`) and the alerts
+        // (`super::alerts`).
+        Page::Face | Page::Status | Page::Above | Page::Below | Page::Power | Page::Picker => return None,
     })
 }
 
@@ -60,9 +55,4 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, page: Page) {
     target.art(clip, C - look.icon.width as i32 / 2, BOX_Y + (BOX - look.icon.height as i32) / 2, look.icon, look.color);
     theme::centred(target, clip, BOX_Y + BOX + 30, &NW_MONO, "// NOTHING HERE YET", theme::BONE);
     theme::centred(target, clip, BOX_Y + BOX + 62, &NW_MONO, look.leave, CHROME);
-    if let Some((bar, edge)) = look.handle {
-        theme::handle(target, clip, bar, look.color);
-        let line = Rectangle::new(Point::new(0, edge), Size::new(SIZE as u32, 2));
-        let _ = target.fill_solid(&line.intersection(clip), look.color);
-    }
 }

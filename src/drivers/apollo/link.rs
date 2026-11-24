@@ -76,7 +76,7 @@ const APOLLO_LOG_WINDOW: Option<(u64, u64)> = None;
 const APOLLO_LOG_LEVEL: u8 = 4;
 const APOLLO_LOG_MODULES: u32 = 0x0018_01CF;
 /// Do-not-disturb and sedentary settings after the setup status.
-const SEND_SETTINGS: bool = false;
+const SEND_SETTINGS: bool = true;
 /// The answer to the Apollo's question for the board revision.
 const ANSWER_REVISION: bool = true;
 /// How this firmware names itself to the Apollo.
@@ -155,12 +155,22 @@ pub struct Apollo {
     setup_sequence: u32,
     setup_tries: u32,
     setup_acknowledged: bool,
-    settings_sent: bool,
+    /// The two daily windows the user has set (`None`: off), and what the
+    /// Apollo was last told about each.
+    quiet: Option<(u16, u16)>,
+    quiet_told: Option<Option<(u16, u16)>>,
+    move_reminder: Option<(u16, u16)>,
+    move_reminder_told: Option<Option<(u16, u16)>>,
+    /// The Apollo reminded the wearer to move.
+    move_reminder_pending: bool,
     /// The screen state the Apollo should know, and the one it was last
     /// told (`None`: not told since its start).
     screen_on: bool,
     screen_told: Option<bool>,
-    raise_to_wake_sent: bool,
+    /// Whether raising the wrist is to be reported, and what the Apollo
+    /// was last told about it.
+    raise_to_wake: bool,
+    raise_to_wake_told: Option<bool>,
     /// The clock was set while running; the Apollo has to be told.
     time_changed: bool,
     /// Wear statistics, kept as the stock app keeps them (0x08033566,
@@ -243,10 +253,15 @@ impl Apollo {
             setup_sequence: 0,
             setup_tries: 0,
             setup_acknowledged: false,
-            settings_sent: false,
+            quiet: None,
+            quiet_told: None,
+            move_reminder: None,
+            move_reminder_told: None,
+            move_reminder_pending: false,
             screen_on: true,
             screen_told: None,
-            raise_to_wake_sent: false,
+            raise_to_wake: true,
+            raise_to_wake_told: None,
             time_changed: false,
             put_on_count: 0,
             taken_off_count: 0,
@@ -489,10 +504,14 @@ impl Apollo {
                 self.screen_told = Some(on);
             }
         }
-        // Wrist-raise detection, all day: without it the Apollo reports
-        // "lowered" but never "raised".
-        if SEND_RAISE_TO_WAKE && self.screen_told.is_some() && !self.raise_to_wake_sent {
-            self.raise_to_wake_sent = self.send(messages::RAISE_TO_WAKE, messages::raise_to_wake(true, (0, 1439)).as_bytes(), log).await;
+        // Wrist-raise detection, all day or not at all, as the stock app
+        // sends it: without "on" the Apollo reports "lowered" but never
+        // "raised". Once after the screen status, then on every change.
+        if SEND_RAISE_TO_WAKE && self.screen_told.is_some() && self.raise_to_wake_told != Some(self.raise_to_wake) {
+            let on = self.raise_to_wake;
+            if self.send(messages::RAISE_TO_WAKE, messages::raise_to_wake(on, (0, 1439)).as_bytes(), log).await {
+                self.raise_to_wake_told = Some(on);
+            }
         }
         if let Some((from, to)) = APOLLO_LOG_WINDOW {
             let now = Instant::now().as_secs();
@@ -506,12 +525,22 @@ impl Apollo {
                 }
             }
         }
-        // The settings follow the setup status, as in the stock app. Until
-        // this firmware has settings of its own: everything off.
-        if SEND_SETTINGS && self.setup_acknowledged && !self.settings_sent {
-            self.settings_sent = true;
-            self.send(messages::DO_NOT_DISTURB, messages::do_not_disturb(false, (0, 1439), None).as_bytes(), log).await;
-            self.send(messages::SEDENTARY, messages::sedentary(None, None).as_bytes(), log).await;
+        // Do-not-disturb and the sedentary reminder follow the setup
+        // status, as in the stock app: once at start, also when they are
+        // off, then on every change. "Off" is sent with the stock app's
+        // values for it.
+        if SEND_SETTINGS && self.setup_acknowledged && self.quiet_told != Some(self.quiet) {
+            let quiet = self.quiet;
+            if self.send(messages::DO_NOT_DISTURB, messages::do_not_disturb(quiet.is_some(), quiet.unwrap_or((0, 1439)), None).as_bytes(), log).await {
+                self.quiet_told = Some(quiet);
+            }
+        }
+        if SEND_SETTINGS && self.setup_acknowledged && self.move_reminder_told != Some(self.move_reminder) {
+            let window = self.move_reminder;
+            // The Apollo does not acknowledge this one.
+            if self.send(messages::SEDENTARY, messages::sedentary(window, false).as_bytes(), log).await {
+                self.move_reminder_told = Some(window);
+            }
         }
         if Instant::now() >= self.next_summary {
             self.next_summary = Instant::now() + Duration::from_secs(60);
@@ -590,6 +619,29 @@ impl Apollo {
     /// next `service`.
     pub fn set_screen(&mut self, on: bool) {
         self.screen_on = on;
+    }
+
+    /// Whether the Apollo is to report a raised wrist (the user's
+    /// setting). The Apollo is told when this changes.
+    pub fn set_raise_to_wake(&mut self, on: bool) {
+        self.raise_to_wake = on;
+    }
+
+    /// The daily quiet hours (the Apollo's do-not-disturb), `None` for
+    /// none. The Apollo is told when this changes.
+    pub fn set_quiet(&mut self, window: Option<(u16, u16)>) {
+        self.quiet = window;
+    }
+
+    /// The daily hours in which the Apollo reminds the wearer to move,
+    /// `None` for never. The Apollo is told when this changes.
+    pub fn set_move_reminder(&mut self, window: Option<(u16, u16)>) {
+        self.move_reminder = window;
+    }
+
+    /// Whether the Apollo reminded the wearer to move since the last call.
+    pub fn take_move_reminder(&mut self) -> bool {
+        core::mem::take(&mut self.move_reminder_pending)
     }
 
     /// Tell the driver the board revision, for the Apollo's question.
@@ -797,6 +849,10 @@ impl Apollo {
                         messages::WristGesture::Other(_) => "gesture with an unknown value",
                     }
                 );
+            }
+            if kind == Some(messages::MOVE_REMINDER) {
+                self.move_reminder_pending = true;
+                let _ = writeln!(log.stamp(), "apollo: reminder to move");
             }
             if kind == Some(messages::OFF_WRIST) {
                 if let Some(long) = self.readings.off_wrist_long {

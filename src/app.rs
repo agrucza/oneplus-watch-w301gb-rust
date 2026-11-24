@@ -1,9 +1,11 @@
 //! The application: bring the hardware up in a safe order, then run.
 
+mod alerts;
 mod controls;
 mod face;
 mod motion;
 mod pages;
+mod picker;
 mod panels;
 mod power;
 mod settings;
@@ -513,7 +515,7 @@ const SETTINGS_FILE: &str = "RUST.CFG";
 /// Read the settings from their file. A watch without the file, or with
 /// one that cannot be read, has the start values.
 fn settings_load(partition: storage::Partition, log: &mut Log) -> Settings {
-    let mut text = [0u8; 64];
+    let mut text = [0u8; settings::FILE_SIZE];
     match storage::read_tail(partition, SETTINGS_DIR, SETTINGS_FILE, &mut text) {
         Ok((_, n)) => {
             let settings = Settings::parse(&text[..n]);
@@ -531,7 +533,7 @@ fn settings_load(partition: storage::Partition, log: &mut Log) -> Settings {
 /// folded into the main loop, whose stack frame it would enlarge for good.
 #[inline(never)]
 fn settings_save(partition: storage::Partition, settings: &Settings, log: &mut Log) -> bool {
-    let mut text = [0u8; 64];
+    let mut text = [0u8; settings::FILE_SIZE];
     let n = settings.text(&mut text);
     let written = (|| {
         // The file has to exist before it can be rewritten.
@@ -783,6 +785,16 @@ impl Tracking {
     }
 }
 
+/// Which of the settings' times the page for setting a time is open for;
+/// the second of a pair carries the first, already set.
+#[derive(Clone, Copy)]
+enum PickFor {
+    QuietFrom,
+    QuietTo(u16),
+    MoveFrom,
+    MoveTo(u16),
+}
+
 /// The panel and what is currently shown on it.
 struct Screen {
     panel: panel::Panel,
@@ -806,6 +818,10 @@ struct Screen {
     last_button: &'static str,
     /// Where the glass was last touched, if that is newer than the button.
     last_touch: Option<(u16, u16)>,
+    /// What the alerts page lists.
+    alerts: alerts::Alerts,
+    /// The page for setting a time, while it is open, and what for.
+    picker: Option<(picker::Picker, PickFor)>,
     /// Which page is shown.
     page: Page,
     /// The frame the panel was sent last, whole; `None` before the first
@@ -861,6 +877,8 @@ impl Screen {
             wear: WearView::new(),
             last_button: "no button yet",
             last_touch: None,
+            alerts: alerts::Alerts::new(),
+            picker: None,
             page: Page::Face,
             on_screen: None,
             power_chosen: None,
@@ -932,6 +950,22 @@ impl Screen {
         }
         self.last_touch = None;
         self.drawn_for = None; // show the change at once
+    }
+
+    /// Something for the wearer: it goes on the alerts page, and with
+    /// `show` that page is brought up, lighting the display if it is dark.
+    async fn alert(&mut self, alert: alerts::Alert, show: bool, log: &mut Log) {
+        let _ = writeln!(log.stamp(), "alert: {:?}{}", alert.kind, if show { "" } else { ", not shown: quiet hours" });
+        self.alerts.add(alert);
+        self.t.damage[Page::Below.index()].add(face::whole());
+        self.changed = true;
+        if show {
+            self.active_at = Instant::now();
+            if !self.open(Page::Below, log).await {
+                let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+            }
+            self.drawn_for = None;
+        }
     }
 
     /// Show `page`, lighting the display if it is dark. False if the
@@ -1044,6 +1078,9 @@ impl Screen {
     /// dot.
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
         match gesture {
+            // The page for setting a time follows the finger itself
+            // (`touch_raw`); only taps reach it as gestures.
+            Gesture::DragStart { .. } | Gesture::Drag { .. } | Gesture::DragEnd { .. } if self.page == Page::Picker => {}
             Gesture::DragStart { direction, dx, dy, .. } if self.pull.is_none() => {
                 let Some((target, motion)) = pages::drag(self.page, direction) else {
                     let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
@@ -1087,8 +1124,36 @@ impl Screen {
                     self.go_to(page, log);
                 }
                 if self.page == Page::Above && self.pull.is_none() {
-                    if let Some(tap) = settings::tap_at(x, y) {
-                        self.set(tap, log);
+                    match settings::tap_at(x, y) {
+                        Some(settings::Tap::PickQuietTime) => self.pick(PickFor::QuietFrom, log),
+                        Some(settings::Tap::PickMoveTime) => self.pick(PickFor::MoveFrom, log),
+                        Some(tap) => self.set(tap, log),
+                        None => {}
+                    }
+                } else if self.page == Page::Picker {
+                    let outcome = self.picker.as_mut().map_or(picker::Outcome::Nothing, |(picker, _)| picker.tap(x, y));
+                    let what = self.picker.as_ref().map(|&(_, what)| what);
+                    match (outcome, what) {
+                        (picker::Outcome::Stepped, _) => self.wheels_turned(),
+                        // The first of a pair leads on to the second.
+                        (picker::Outcome::Save(seconds), Some(what)) => {
+                            // These are times of day in minutes.
+                            let minutes = (seconds / 60) as u16;
+                            match what {
+                                PickFor::QuietFrom => self.pick(PickFor::QuietTo(minutes), log),
+                                PickFor::MoveFrom => self.pick(PickFor::MoveTo(minutes), log),
+                                PickFor::QuietTo(from) => {
+                                    self.set(settings::Tap::QuietTime((from, minutes)), log);
+                                    self.go_to(Page::Above, log);
+                                }
+                                PickFor::MoveTo(from) => {
+                                    self.set(settings::Tap::MoveTime((from, minutes)), log);
+                                    self.go_to(Page::Above, log);
+                                }
+                            }
+                        }
+                        (picker::Outcome::Cancel, _) => self.go_to(Page::Above, log),
+                        _ => {}
                     }
                 }
                 if self.page == Page::Power {
@@ -1114,6 +1179,41 @@ impl Screen {
         }
     }
 
+    /// Open the page for setting a time, for `what`, with the wheels on
+    /// the time that is set now.
+    fn pick(&mut self, what: PickFor, log: &mut Log) {
+        let (title, minutes) = match what {
+            PickFor::QuietFrom => ("QUIET FROM", self.settings.quiet_time.0),
+            PickFor::QuietTo(_) => ("QUIET UNTIL", self.settings.quiet_time.1),
+            PickFor::MoveFrom => ("MOVE ALERT FROM", self.settings.move_time.0),
+            PickFor::MoveTo(_) => ("MOVE ALERT UNTIL", self.settings.move_time.1),
+        };
+        self.picker = Some((picker::Picker::new(title, minutes), what));
+        self.t.damage[Page::Picker.index()].add(face::whole());
+        if self.page != Page::Picker {
+            self.go_to(Page::Picker, log);
+        }
+        self.changed = true;
+    }
+
+    /// Where the finger is, as the touch controller reports it (`None`:
+    /// lifted), for the page that follows the finger itself.
+    fn touch_raw(&mut self, at: Option<(i32, i32)>) {
+        if self.page != Page::Picker {
+            return;
+        }
+        let now_ms = Instant::now().as_millis();
+        if self.picker.as_mut().is_some_and(|(picker, _)| picker.touch(at, now_ms)) {
+            self.wheels_turned();
+        }
+    }
+
+    /// A wheel of the page for setting a time has moved.
+    fn wheels_turned(&mut self) {
+        self.t.damage[Page::Picker.index()].add(picker::wheels_rect());
+        self.changed = true;
+    }
+
     /// Change a setting: it holds from now on, the settings page shows
     /// it, and the main task writes it to the file.
     fn set(&mut self, tap: settings::Tap, log: &mut Log) {
@@ -1134,6 +1234,14 @@ impl Screen {
         // A row chosen on the power page does not outlast the page.
         if self.power_chosen.take().is_some() {
             self.t.damage[Page::Power.index()].add(face::whole());
+        }
+        // Two pages share a frame: what it holds may be the other one.
+        if page.shared_frame() {
+            self.t.damage[page.index()].add(face::whole());
+        }
+        // A time being set is given up by leaving its page.
+        if page != Page::Picker {
+            self.picker = None;
         }
         // The page's own frames hold its picture as it was last drawn;
         // the next picture brings it up to date and shows it.
@@ -1223,6 +1331,10 @@ impl Screen {
         if self.visible && self.pull.is_some() {
             self.pull_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
             return;
+        }
+        // A wheel let go runs out by itself.
+        if self.page == Page::Picker && self.picker.as_mut().is_some_and(|(picker, _)| picker.tick(now.as_millis())) {
+            self.wheels_turned();
         }
         // The watch face moves: it is looked at again every `FACE_PERIOD`.
         let frame_due = self.page == Page::Face && now >= self.next_frame;
@@ -1366,6 +1478,35 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Picker {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            if let Some((picker, _)) = self.picker.as_ref() {
+                for area in changes.rects(face::whole()) {
+                    canvas.clip_to(&area);
+                    picker::draw(&mut canvas, &area, picker);
+                }
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Below {
+            // Changes when an alert comes.
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                alerts::draw(&mut canvas, &area, &self.alerts);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -1743,6 +1884,10 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
                     screen.gesture(gesture, &mut log).await;
                 }
                 shared::Event::Light(lux) => screen.ambient(lux),
+                shared::Event::Alert(alert, show) => {
+                    let _turn = crate::services::turn::take().await;
+                    screen.alert(alert, show, &mut log).await;
+                }
             }
         }
         shared::set_visible(screen.visible);
@@ -1791,6 +1936,11 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         if screen.visible {
             if touched.is_some() {
                 screen.active_at = Instant::now();
+            }
+            match touched {
+                Some(touch::TouchEvent::Down { x, y }) => screen.touch_raw(Some((x as i32, y as i32))),
+                Some(touch::TouchEvent::Up) => screen.touch_raw(None),
+                None => {}
             }
             if let Some(gesture) = gesture {
                 screen.touch_gesture(gesture, &mut log);
@@ -2001,6 +2151,22 @@ async fn main_loop(
                 }
                 // The Apollo is told whenever this changes.
                 apollo.set_screen(shared::visible());
+                let settings = shared::settings();
+                apollo.set_raise_to_wake(settings.raise_to_wake);
+                apollo.set_quiet(settings.quiet.then_some(settings.quiet_time));
+                apollo.set_move_reminder(settings.move_reminder.then_some(settings.move_time));
+                if apollo.take_move_reminder() {
+                    // The Apollo only says so: the vibration is ours, and
+                    // so is leaving the wearer alone in the quiet hours
+                    // (the alert is listed all the same).
+                    let now = clock::now();
+                    let quiet = now.is_some_and(|t| settings.quiet_at(t.hour as u16 * 60 + t.minute as u16));
+                    if !quiet {
+                        apollo.vibrate(200, 150, 2, &mut log).await;
+                    }
+                    let alert = alerts::Alert { kind: alerts::Kind::Move, at: now.map(|t| (t.hour, t.minute)) };
+                    shared::send(shared::Event::Alert(alert, !quiet));
+                }
             }
         }
 

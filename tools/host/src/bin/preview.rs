@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|above-set|below|faces|cards|power|power-chosen|status
+//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -72,10 +72,27 @@ fn main() {
     match args.get(2).map(String::as_str) {
         Some("above") => w301_host::app::settings::draw(&mut frame, &whole, &w301_host::app::settings::Settings::START),
         Some("above-set") => {
-            let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false };
+            let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
         }
-        Some("below") => panels::draw(&mut frame, &whole, Page::Below),
+        Some("picker") => w301_host::app::picker::draw(&mut frame, &whole, &w301_host::app::picker::Picker::new("QUIET FROM", 22 * 60)),
+        Some("picker-seconds") => w301_host::app::picker::draw(&mut frame, &whole, &w301_host::app::picker::Picker::with_seconds("TIMER", 25 * 60 + 30)),
+        Some("picker-turning") => {
+            // The minutes wheel under the finger, 70 pixels down.
+            let mut picker = w301_host::app::picker::Picker::new("QUIET UNTIL", 7 * 60);
+            let at = picker.wheel_rect(1).center();
+            picker.touch(Some((at.x, at.y)), 0);
+            picker.touch(Some((at.x, at.y + 70)), 100);
+            w301_host::app::picker::draw(&mut frame, &whole, &picker)
+        }
+        Some("below") => w301_host::app::alerts::draw(&mut frame, &whole, &w301_host::app::alerts::Alerts::new()),
+        Some("below-set") => {
+            use w301_host::app::alerts::{Alert, Alerts, Kind};
+            let mut alerts = Alerts::new();
+            alerts.add(Alert { kind: Kind::Move, at: Some((11, 2)) });
+            alerts.add(Alert { kind: Kind::Move, at: Some((15, 40)) });
+            w301_host::app::alerts::draw(&mut frame, &whole, &alerts)
+        }
         Some("faces") => panels::draw(&mut frame, &whole, Page::Faces),
         Some("cards") => panels::draw(&mut frame, &whole, Page::Cards),
         Some("status") => {

@@ -2,14 +2,18 @@
 //! page it is set on: the panel pulled down over the watch face, the
 //! design's "quick access".
 //!
-//! Three things for now, each of which the firmware acts on: how bright
-//! the display is (by the light, or one of four fixed steps), after how
-//! long without a finger or a button it goes dark, and whether raising
-//! the wrist lights it.
+//! Each of them is something the firmware acts on: how bright the
+//! display is (by the light, or one of four fixed steps), after how long
+//! without a finger or a button it goes dark, whether raising the wrist
+//! lights it, quiet hours (the Apollo's do-not-disturb: no display on a
+//! raised wrist, and no vibration for a reminder), and the reminder to
+//! move after sitting for long (the Apollo's sedentary reminder).
 //!
 //! The file is text, a line a setting ("display_off=15"), so that it can
 //! be read and written by hand. A line that is not understood is left
-//! out; whatever is missing keeps its start value.
+//! out; whatever is missing keeps its start value. The two daily times
+//! ("quiet_time=22:00-07:00") are set on a page of their own
+//! (`super::picker`), opened by a tap on the time.
 
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
@@ -18,6 +22,8 @@ use super::theme::{self, BLACK, BONE, CHROME, CYAN, SIZE, STEEL, YELLOW};
 use crate::services::font::Paint;
 use crate::services::font_data::{NW_LABEL, NW_MONO};
 
+/// The most the file's text takes.
+pub const FILE_SIZE: usize = 160;
 /// The fixed brightness steps there are.
 pub const LEVELS: u8 = 4;
 /// The times to choose from after which the display goes dark, seconds.
@@ -32,6 +38,25 @@ pub struct Settings {
     pub display_off_s: u16,
     /// Raising the wrist lights the display.
     pub raise_to_wake: bool,
+    /// Quiet hours are kept, and from when to when (`Window`).
+    pub quiet: bool,
+    pub quiet_time: Window,
+    /// The reminder to move is on, and from when to when.
+    pub move_reminder: bool,
+    pub move_time: Window,
+}
+
+/// A stretch of the day, from and to in minutes since midnight. The
+/// Apollo's rule for its windows (`lcAlgoCheckDNDMode`, 0x371C0 in its
+/// image), which this firmware keeps too: with from before to, both
+/// minutes belong to it; otherwise it runs over midnight, and from equal
+/// to to is the whole day.
+pub type Window = (u16, u16);
+
+/// Whether minute `now` of the day lies in `window`.
+pub fn within(window: Window, now: u16) -> bool {
+    let (from, to) = window;
+    if from < to { from <= now && now <= to } else { now >= from || now < to }
 }
 
 /// What a tap on the page changes.
@@ -40,11 +65,46 @@ pub enum Tap {
     Brightness(Option<u8>),
     DisplayOff(u16),
     RaiseToWake,
+    Quiet,
+    MoveReminder,
+    /// The time beside a switch was tapped: it is to be set (on the
+    /// page `super::picker`). Changes nothing by itself.
+    PickQuietTime,
+    PickMoveTime,
+    /// A time that was set there.
+    QuietTime(Window),
+    MoveTime(Window),
+}
+
+/// "22:00-07:00" as a window.
+fn parse_window(text: &str) -> Option<Window> {
+    let minutes = |text: &str| {
+        let (hours, minutes) = text.trim().split_once(':')?;
+        let (hours, minutes) = (hours.parse::<u16>().ok()?, minutes.parse::<u16>().ok()?);
+        (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+    };
+    let (from, to) = text.split_once('-')?;
+    Some((minutes(from)?, minutes(to)?))
 }
 
 impl Settings {
     /// The settings of a watch that has no file yet.
-    pub const START: Settings = Settings { brightness: None, display_off_s: 15, raise_to_wake: true };
+    /// The two daily times are the stock firmware's start values.
+    pub const START: Settings = Settings {
+        brightness: None,
+        display_off_s: 15,
+        raise_to_wake: true,
+        quiet: false,
+        quiet_time: (22 * 60, 7 * 60),
+        move_reminder: false,
+        move_time: (9 * 60, 21 * 60),
+    };
+
+    /// Whether the quiet hours are on and minute `now` of the day lies
+    /// in them.
+    pub fn quiet_at(&self, now: u16) -> bool {
+        self.quiet && within(self.quiet_time, now)
+    }
 
     /// The settings a file's text holds.
     pub fn parse(text: &[u8]) -> Settings {
@@ -70,6 +130,12 @@ impl Settings {
                 }
                 ("raise_to_wake", "on") => settings.raise_to_wake = true,
                 ("raise_to_wake", "off") => settings.raise_to_wake = false,
+                ("quiet", "on") => settings.quiet = true,
+                ("quiet", "off") => settings.quiet = false,
+                ("move_reminder", "on") => settings.move_reminder = true,
+                ("move_reminder", "off") => settings.move_reminder = false,
+                ("quiet_time", window) => settings.quiet_time = parse_window(window).unwrap_or(settings.quiet_time),
+                ("move_time", window) => settings.move_time = parse_window(window).unwrap_or(settings.move_time),
                 _ => {}
             }
         }
@@ -78,9 +144,9 @@ impl Settings {
 
     /// The file's text for these settings, written into `out`. Returns
     /// its length.
-    pub fn text(&self, out: &mut [u8; 64]) -> usize {
+    pub fn text(&self, out: &mut [u8; FILE_SIZE]) -> usize {
         use core::fmt::Write;
-        struct Into<'a>(&'a mut [u8; 64], usize);
+        struct Into<'a>(&'a mut [u8; FILE_SIZE], usize);
         impl Write for Into<'_> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let n = s.len().min(self.0.len() - self.1);
@@ -99,7 +165,15 @@ impl Settings {
             }
         }
         let _ = writeln!(into, "display_off={}", self.display_off_s);
-        let _ = writeln!(into, "raise_to_wake={}", if self.raise_to_wake { "on" } else { "off" });
+        let on = |on: bool| if on { "on" } else { "off" };
+        let _ = writeln!(into, "raise_to_wake={}", on(self.raise_to_wake));
+        let time = |(from, to): Window| (from / 60, from % 60, to / 60, to % 60);
+        let (a, b, c, d) = time(self.quiet_time);
+        let _ = writeln!(into, "quiet={}", on(self.quiet));
+        let _ = writeln!(into, "quiet_time={:02}:{:02}-{:02}:{:02}", a, b, c, d);
+        let (a, b, c, d) = time(self.move_time);
+        let _ = writeln!(into, "move_reminder={}", on(self.move_reminder));
+        let _ = writeln!(into, "move_time={:02}:{:02}-{:02}:{:02}", a, b, c, d);
         into.1
     }
 
@@ -109,6 +183,11 @@ impl Settings {
             Tap::Brightness(brightness) => Settings { brightness, ..self },
             Tap::DisplayOff(display_off_s) => Settings { display_off_s, ..self },
             Tap::RaiseToWake => Settings { raise_to_wake: !self.raise_to_wake, ..self },
+            Tap::Quiet => Settings { quiet: !self.quiet, ..self },
+            Tap::MoveReminder => Settings { move_reminder: !self.move_reminder, ..self },
+            Tap::PickQuietTime | Tap::PickMoveTime => self,
+            Tap::QuietTime(quiet_time) => Settings { quiet_time, ..self },
+            Tap::MoveTime(move_time) => Settings { move_time, ..self },
         }
     }
 }
@@ -121,14 +200,17 @@ const WIDTH: i32 = SIZE - 2 * LEFT;
 /// Buttons in a row: their height and the gap between them.
 const BUTTON: i32 = 40;
 const GAP: i32 = 6;
-/// The tops of the two labels with their rows of buttons under them, and
-/// of the row with the switch.
-const BRIGHTNESS_Y: i32 = 80;
-const DISPLAY_OFF_Y: i32 = 162;
-const RAISE_Y: i32 = 248;
+/// The tops of the two labels with their rows of buttons under them, the
+/// top of the first row with a switch and the height of such a row.
+const BRIGHTNESS_Y: i32 = 76;
+const DISPLAY_OFF_Y: i32 = 152;
+const SWITCHES_Y: i32 = 232;
+const ROW: i32 = 44;
 const LABEL_TO_ROW: i32 = 26;
 /// The switch: width and height.
 const SWITCH: (i32, i32) = (64, 30);
+/// The rows with a switch, from the top.
+pub const SWITCHES: [Tap; 3] = [Tap::RaiseToWake, Tap::Quiet, Tap::MoveReminder];
 
 /// The button for automatic brightness (0) or for fixed step `n - 1`.
 pub fn brightness_rect(n: usize) -> Rectangle {
@@ -144,9 +226,9 @@ pub fn display_off_rect(n: usize) -> Rectangle {
     Rectangle::new(Point::new(LEFT + n as i32 * (width + GAP), DISPLAY_OFF_Y + LABEL_TO_ROW), Size::new(width as u32, BUTTON as u32))
 }
 
-/// The row with the switch for raising the wrist.
-pub fn raise_rect() -> Rectangle {
-    Rectangle::new(Point::new(LEFT, RAISE_Y), Size::new(WIDTH as u32, 44))
+/// Row `n` of those with a switch (`SWITCHES`).
+pub fn switch_rect(n: usize) -> Rectangle {
+    Rectangle::new(Point::new(LEFT, SWITCHES_Y + n as i32 * ROW), Size::new(WIDTH as u32, ROW as u32))
 }
 
 /// What a tap at (x, y) changes, if it lands on anything.
@@ -160,7 +242,18 @@ pub fn tap_at(x: i32, y: i32) -> Option<Tap> {
     if let Some(n) = (0..TIMEOUTS.len()).find(|&n| hit(display_off_rect(n))) {
         return Some(Tap::DisplayOff(TIMEOUTS[n]));
     }
-    hit(raise_rect()).then_some(Tap::RaiseToWake)
+    // Only the switch switches: the rows lie close together, and a tap
+    // meant for the row below has switched the one above (seen in the
+    // log of 2026-11-24). In a row with a time the rest of the row leads
+    // to setting the time; in the others it does nothing.
+    let on_switch = x >= LEFT + WIDTH - SWITCH.0 - 12;
+    let n = (0..SWITCHES.len()).find(|&n| switch_rect(n).contains(at))?;
+    match (SWITCHES[n], on_switch) {
+        (tap, true) => Some(tap),
+        (Tap::Quiet, false) => Some(Tap::PickQuietTime),
+        (Tap::MoveReminder, false) => Some(Tap::PickMoveTime),
+        _ => None,
+    }
 }
 
 /// A button of a row: a plate in yellow with black text if it is the
@@ -196,13 +289,32 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, settings: &Settings) {
         button(target, clip, &display_off_rect(n), text, settings.display_off_s == TIMEOUTS[n]);
     }
 
-    let row = raise_rect();
-    theme::rule(target, clip, LEFT, row.top_left.y - 1, WIDTH, STEEL);
-    target.text(clip, LEFT, row.top_left.y + 10, &NW_LABEL, "RAISE TO WAKE", BONE);
-    theme::switch(target, clip, LEFT + WIDTH - SWITCH.0, row.top_left.y + (44 - SWITCH.1) / 2, SWITCH, settings.raise_to_wake);
-    theme::rule(target, clip, LEFT, row.top_left.y + 44, WIDTH, STEEL);
+    theme::rule(target, clip, LEFT, SWITCHES_Y, WIDTH, STEEL);
+    for (n, tap) in SWITCHES.iter().enumerate() {
+        let row = switch_rect(n);
+        let y = row.top_left.y;
+        let (label, on, time) = match tap {
+            Tap::Quiet => ("QUIET", settings.quiet, Some(settings.quiet_time)),
+            Tap::MoveReminder => ("MOVE ALERT", settings.move_reminder, Some(settings.move_time)),
+            _ => ("RAISE TO WAKE", settings.raise_to_wake, None),
+        };
+        target.text(clip, LEFT, y + 10, &NW_LABEL, label, BONE);
+        let switch_x = LEFT + WIDTH - SWITCH.0;
+        if let Some((from, to)) = time {
+            // From when to when, e.g. "22:00-07:00".
+            let mut text = [0u8; 11];
+            for (i, value) in [from / 60, from % 60, to / 60, to % 60].into_iter().enumerate() {
+                text[i * 3] = b'0' + (value / 10 % 10) as u8;
+                text[i * 3 + 1] = b'0' + (value % 10) as u8;
+            }
+            (text[2], text[5], text[8]) = (b':', b'-', b':');
+            let text = core::str::from_utf8(&text).unwrap_or("");
+            target.text(clip, switch_x - 12 - NW_MONO.measure(text), y + 10, &NW_MONO, text, CHROME);
+        }
+        theme::switch(target, clip, switch_x, y + (ROW - SWITCH.1) / 2, SWITCH, on);
+        theme::rule(target, clip, LEFT, y + ROW, WIDTH, STEEL);
+    }
 
-    theme::centred(target, clip, 318, &NW_MONO, "PUSH UP TO CLOSE", CHROME);
     // The bar the panel is held by, and a line along the edge it ends
     // at, which shows while it moves over the face.
     theme::handle(target, clip, SIZE - 34, CYAN);

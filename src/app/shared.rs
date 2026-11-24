@@ -24,6 +24,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
+use super::alerts::Alert;
 use super::controls::Action;
 use super::settings::Settings;
 use crate::drivers::apollo::messages::{Readings, WristGesture};
@@ -52,6 +53,8 @@ pub enum Event {
     Wrist(WristGesture),
     /// A new light reading, in lux.
     Light(u32),
+    /// Something for the wearer, and whether to bring it up at once.
+    Alert(Alert, bool),
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, Cell<State>> = Mutex::new(Cell::new(State {

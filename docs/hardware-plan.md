@@ -528,14 +528,56 @@ any size (`Art`), both blended by the blitter like text.
   file. The file is `log/RUST.CFG` on the log volume, three lines of
   text ("brightness=auto", "display_off=15", "raise_to_wake=on"), read
   once at start; a missing or senseless file gives the start values.
-  Raising the wrist is only ignored by this firmware when switched off:
-  the Apollo keeps detecting it and still wakes the processor. Telling
-  the Apollo to stop (its message 121 with "off") has never been sent
-  from here and belongs to the Apollo settings. The button action that
+  Raising the wrist, when switched off, is ignored by this firmware
+  and, from the next image on, switched off in the Apollo too (message
+  121 with "off", which is what the stock app sends when the user
+  switches the feature off; built, not yet tried on the watch): the
+  Apollo then sends no "raised" and no longer wakes the processor. The button action that
   steps the brightness changes the same setting.
-- The panel from below and the two long-press pages: title, the page's
-  icon in a frame, and how to leave. Named after the design ("alerts",
-  "faces", "pages").
+- Quiet hours and the reminder to move (built 2026-11-24, not yet tried
+  on the watch): two more switches on the settings page, each with a
+  daily time (22:00 to 07:00 and 09:00 to 21:00, the stock firmware's
+  start values; set on the page for setting a time, or in the file,
+  lines `quiet_time=` and `move_time=`). Quiet hours are the Apollo's do-not-disturb
+  (message 122): inside them it reports no raised wrist. The reminder
+  is the Apollo's sedentary reminder (message 125, which it does not
+  acknowledge); when it fires (message 40) this firmware vibrates
+  twice, lists it on the alerts page and brings that page up, except
+  in the quiet hours, where it is only listed. Both are sent once at
+  start, also when off, and on every change; the Apollo keeps neither
+  across its restart. What each does inside the Apollo is in
+  `drivers::apollo::messages`. Not read: how often the motion
+  library repeats a reminder, and whether the Apollo holds message 40
+  back while it was told the screen is off.
+- Setting a time (`app::picker`; built 2026-11-24, not yet tried on
+  the watch): a page of its own with a wheel for the hours and one for
+  the minutes, "cancel" and "save". A wheel follows the finger from where
+  it comes down, and let go it runs out, slowing, to the nearest value
+  or after a flick to one further on (the finger's speed taken to last
+  150 ms); a tap above or below the middle row steps by one. The first
+  version, tried on the watch, turned the wheel from drag gestures: it
+  only took hold after the 15 pixels a gesture needs and jumped to its
+  value when let go, which the user found awkward. Now the page takes
+  the finger's places straight from the touch controller (built, not
+  yet tried on the watch). Opened by a tap on
+  the time beside a switch on the settings page: first "from", whose
+  "save" leads on to "until", whose "save" stores both; "cancel" or
+  leaving the page changes nothing. It is a page and not a view of the
+  settings panel because a vertical drag on a panel pushes it shut. Its
+  On the settings page only the switch itself switches: with the
+  whole row doing it, a tap meant for the time below switched "raise
+  to wake" (seen in the log). Tried on the watch (2026-11-24): the
+  old three-line file read with the new settings at their start
+  values, both times set through the page and stored, raise to wake
+  switched off and on with the Apollo taking message 121 each time.
+  The picker's
+  frame is the one the two long-press pages used to have one each of:
+  those two now share a frame and are drawn afresh when opened.
+- Alerts (`app::alerts`): the panel from below lists the latest three
+  alerts as framed cards, newest first; kept in memory only. The
+  reminder to move is the one source so far.
+- The two long-press pages: title, the page's icon in a frame, and how
+  to leave ("faces", "pages").
 
 Differences from the design, on purpose: its text of 9 to 12 pixels is
 17 to 19 here (under a millimetre otherwise); no scan lines and no
@@ -546,6 +588,15 @@ sits right inside them; the bent lines say what is true of this watch.
 Shown as dimmed dashes until there is data: steps and unread messages.
 Not built yet, for lack of anything to show in them: the design's
 launcher, vitals, call, the brightness bar.
+For later, the size of the image (616 KB of the 1,974 KB there are,
+2026-11-24): 397 KB of it are the bitmaps, one byte a pixel, the glow of
+the big digits alone 166 KB; the code is 170 KB. Not pressing. When it
+is wanted: four bits a pixel, which the blitter takes as it is (about
+200 KB less; not tried on this panel), and the glow worked out at start
+into the PSRAM, of which 12 MB are unused (166 KB less). Large content
+(more faces, pictures, animations) belongs in a file on the eMMC,
+loaded into the PSRAM, as the stock app has it.
+
 Host tests check that every element of the face draws only inside its
 rectangle and that the rows of the status and power pages and the
 buttons of the settings lie on the round glass; that the settings file
@@ -612,7 +663,7 @@ names as text, which makes it readable as the other half of every message.
 | Time | stock sends kind 5: GMT seconds and time zone in minutes | done and measured (2026-11-22): the Apollo logged `Time set:UTC=1795365228 timeZone=60` and `Time set:2026-11-22 17:33:48 7 is OK!`; its clock had read 2026-11-21 12:54 before. It sets its running clock and its clock chip, stores the zone and tells its daily algorithms the time is valid (0x4010C in its image). The time zone comes from RTC backup register 3, where the stock app keeps it (`hal::rtc::time_zone`); `tools/ota.sh time` sets it. Sent again when the clock is set while running (`clock::take_changed`); that path is not tested yet |
 | Version | stock sends kind 6: its version text | done and measured (2026-11-22): the Apollo keeps the text, logged `st version:W301_RUST` and answered with its own, `CONBINE_LTAQ4002_0704_202112141814` (0x3F27A in its image) |
 | Setup status | stock sends kind 140 = 3 when first-time setup is over; the Apollo then switches its capacitive wear detection on (`lcAlgoOOBEStatusSet`) | sent on the announcement, repeated until acknowledged; **measured: acknowledged, capacitive sensor on, wrist detected about 4 s after putting the watch on** |
-| Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), screen status (130) | **done and measured:** raise-to-wake (on, all day) and screen status. Do-not-disturb and sedentary are read through on both sides, written and switched off. **Not read through:** heart-rate monitoring, stress, kind 142, SpO2. None can be changed yet because the firmware has no settings of its own |
+| Settings | stock then sends its settings in this order (`0x08033D38`): do-not-disturb (kind 122), sedentary reminder (125), raise-to-wake (121), heart-rate monitoring (123) with stress monitoring (135), kind 142, SpO2 monitoring (124), screen status (130) | **done and measured:** raise-to-wake (on, all day) and screen status. **Built from the user's settings, not yet tried on the watch (2026-11-24):** raise-to-wake off, do-not-disturb, sedentary reminder with its incoming reminder (kind 40). **Not read through:** heart-rate monitoring, stress, kind 142, SpO2 |
 | Board revision | Apollo asks "get pin 11" (kind 7) once after its start; stock answers with the revision it measured at start on PB0 (ADC1 channel 15: five samples, highest and lowest dropped, `0x0805C7A4`) | **measured: reading 3411 of 4095 (1.50 V), revision 3, which the Apollo calls B281_DVT.** Answered with the stock app's bytes. The Apollo's handler (`0x3F020`) takes an answer with field 4 = 2 and field 2 = 0, stores field 3 and sends nothing back, so the watch cannot show that it was taken. For revision 3 it only prints its banner; revision 1 would reconfigure two of its pins, revision 0 changes a pull on its link pin 9 |
 | Battery identification | kept inside the Apollo (its stored item 0x25); together with its revision question it sends the value to the STM32 (kind 7, field 2 = 0x25, field 4 = 2; measured: value 0) and it can be set or read with kind 24 | the value is logged; nothing else done with it |
 | Sensor switches | stock switches sensors with kind 120 (field 1: 0 compass, 1 barometer, 2 battery, 3 motion, 4 GPS, 5 capacitive, 6 temperature, 7 power control; field 2 on/off; field 3 interval) | **not done** |
@@ -725,6 +776,25 @@ back on the status screen for 3 s. The log window is off (`None`) in the
 normal image. Whether
 the stock firmware sees the same cannot be checked (it does not log wear
 changes).
+
+**How the Apollo detects a raised wrist** (read in its image 0704,
+2026-11-24): `OPPO_API_lift_wrist_input` (0x23E88) feeds every
+acceleration sample and the screen state to a detector (0x488E8) that
+reads nothing else: no gyroscope, no wear state, no setting. Every
+limit is a constant in its code, so there is no sensitivity to set.
+While the screen is reported off it looks for a raise only (rising
+stretches of the y and z axes and of two angles over the last 25
+samples, two of three or the z pair needed), while it is reported on
+for a lowering only; 20 samples must pass after either. So every
+"raised" needs a "screen off" before it, and the 690 of the worn day
+(2026-11-24) were 690 arm movements the detector took for raises. What
+can keep a "raised" from being sent, all in the Apollo: the feature
+switched off (message 121); do-not-disturb active (message 122, inside
+its windows, outside sport); the off-wrist timeout (message 11), which
+switches the feature off while the watch is off the wrist for long.
+The stock app (B.70, handler 0x0806CBE0) lights the screen on every
+"raised" without any filter of its own. Not read: the sample rate, and
+so what 20 or 25 samples are in seconds.
 
 **Screen status and wrist gestures** (measured): the Apollo starts with
 "screen off". Told "off", it sends almost nothing but wear changes; told

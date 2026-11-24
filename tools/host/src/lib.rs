@@ -375,7 +375,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 7] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power];
+    const PAGES: [Page; 8] = [Page::Face, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -417,8 +417,8 @@ mod pages {
         }
     }
 
-    /// Every page has frames of its own, and together they are exactly
-    /// the frames there are.
+    /// Every page has frames of its own, except those that say they share
+    /// one, and together they are exactly the frames there are.
     #[test]
     fn frames_are_shared_out() {
         use crate::app::pages::FRAMES;
@@ -430,7 +430,10 @@ mod pages {
             let (first, count) = page.frames();
             assert!(count == 1 || count == 2, "{page:?}");
             for frame in first..first + count {
-                assert_eq!(owner[frame], None, "{page:?}");
+                if let Some(other) = owner[frame] {
+                    let other: Page = other;
+                    assert!(page.shared_frame() && other.shared_frame() && count == 1, "{page:?} and {other:?} both use frame {frame}");
+                }
                 owner[frame] = Some(page);
             }
         }
@@ -817,15 +820,27 @@ mod round {
 
 #[cfg(test)]
 mod settings {
-    use crate::app::settings::{brightness_rect, display_off_rect, raise_rect, tap_at, Settings, Tap, LEVELS, TIMEOUTS};
+    use crate::app::settings::{brightness_rect, display_off_rect, switch_rect, tap_at, within, Settings, Tap, FILE_SIZE, LEVELS, SWITCHES, TIMEOUTS};
     use crate::app::theme::{C, SIZE};
+
+    fn r_right(r: embedded_graphics::primitives::Rectangle) -> i32 {
+        r.top_left.x + r.size.width as i32
+    }
 
     fn every() -> Vec<Settings> {
         let mut all = Vec::new();
         for brightness in std::iter::once(None).chain((0..LEVELS).map(Some)) {
             for &display_off_s in &TIMEOUTS {
-                for raise_to_wake in [true, false] {
-                    all.push(Settings { brightness, display_off_s, raise_to_wake });
+                for switches in 0..8 {
+                    all.push(Settings {
+                        brightness,
+                        display_off_s,
+                        raise_to_wake: switches & 1 != 0,
+                        quiet: switches & 2 != 0,
+                        quiet_time: (23 * 60 + 59, 5),
+                        move_reminder: switches & 4 != 0,
+                        move_time: (8 * 60 + 30, 18 * 60),
+                    });
                 }
             }
         }
@@ -835,7 +850,7 @@ mod settings {
     #[test]
     fn the_file_gives_back_what_was_written() {
         for settings in every() {
-            let mut text = [0u8; 64];
+            let mut text = [0u8; FILE_SIZE];
             let n = settings.text(&mut text);
             assert!(n < text.len(), "the text of {settings:?} fills the buffer");
             assert_eq!(Settings::parse(&text[..n]), settings);
@@ -846,13 +861,36 @@ mod settings {
     fn a_file_that_makes_no_sense_gives_the_start_values() {
         assert_eq!(Settings::parse(b""), Settings::START);
         assert_eq!(Settings::parse(&[0xFF; 64]), Settings::START);
-        assert_eq!(Settings::parse(b"brightness=9\ndisplay_off=7\nraise_to_wake=maybe\nnonsense\n=\n"), Settings::START);
+        let text = b"brightness=9\ndisplay_off=7\nraise_to_wake=maybe\nnonsense\n=\nquiet_time=25:00-07:00\nmove_time=9-21\nquiet=1\n";
+        assert_eq!(Settings::parse(text), Settings::START);
     }
 
     #[test]
     fn a_file_written_by_hand_is_understood() {
-        let text = b"  display_off = 60 \r\nraise_to_wake=off\r\nsomething_new=1\r\nbrightness=3";
-        assert_eq!(Settings::parse(text), Settings { brightness: Some(2), display_off_s: 60, raise_to_wake: false });
+        let text = b"  display_off = 60 \r\nraise_to_wake=off\r\nsomething_new=1\r\nquiet = on\r\nquiet_time = 21:30 - 06:15\r\nbrightness=3";
+        let expected = Settings { brightness: Some(2), display_off_s: 60, raise_to_wake: false, quiet: true, quiet_time: (21 * 60 + 30, 6 * 60 + 15), ..Settings::START };
+        assert_eq!(Settings::parse(text), expected);
+    }
+
+    /// The file written before the quiet hours existed (three lines).
+    #[test]
+    fn an_older_file_keeps_the_new_settings_at_their_start_values() {
+        let text = b"brightness=1\ndisplay_off=15\nraise_to_wake=on\n";
+        assert_eq!(Settings::parse(text), Settings { brightness: Some(0), ..Settings::START });
+    }
+
+    /// The Apollo's rule for a daily window, which the firmware keeps for
+    /// its own quiet hours.
+    #[test]
+    fn a_window_is_the_apollos() {
+        // From before to: both minutes belong to it.
+        assert!(within((540, 1260), 540) && within((540, 1260), 1260) && !within((540, 1260), 539) && !within((540, 1260), 1261));
+        // Over midnight: from belongs to it, to does not.
+        assert!(within((1320, 420), 1320) && within((1320, 420), 0) && within((1320, 420), 419) && !within((1320, 420), 420) && !within((1320, 420), 1319));
+        // Equal: the whole day.
+        assert!(within((600, 600), 0) && within((600, 600), 600) && within((600, 600), 1439));
+        let quiet = Settings { quiet: true, ..Settings::START };
+        assert!(quiet.quiet_at(23 * 60) && !quiet.quiet_at(12 * 60) && !Settings::START.quiet_at(23 * 60));
     }
 
     #[test]
@@ -868,10 +906,21 @@ mod settings {
             let at = middle(display_off_rect(n));
             assert_eq!(tap_at(at.x, at.y), Some(Tap::DisplayOff(seconds)));
         }
-        let at = middle(raise_rect());
-        assert_eq!(tap_at(at.x, at.y), Some(Tap::RaiseToWake));
-        // The title, the hint and the handle set nothing.
-        for y in [40, 330, 425] {
+        for (n, &tap) in SWITCHES.iter().enumerate() {
+            let at = middle(switch_rect(n));
+            // On the switch; the rest of a row with a time leads to setting it.
+            let on_switch = r_right(switch_rect(n)) - 20;
+            assert_eq!(tap_at(on_switch, at.y), Some(tap));
+            let beside = switch_rect(n).top_left.x + 10;
+            let expected = match tap {
+                Tap::Quiet => Some(Tap::PickQuietTime),
+                Tap::MoveReminder => Some(Tap::PickMoveTime),
+                _ => None,
+            };
+            assert_eq!(tap_at(beside, at.y), expected);
+        }
+        // The title and the handle set nothing.
+        for y in [40, 425] {
             assert_eq!(tap_at(C, y), None, "y = {y}");
         }
     }
@@ -881,12 +930,17 @@ mod settings {
         let start = Settings::START;
         assert_eq!(start.after(Tap::Brightness(Some(1))), Settings { brightness: Some(1), ..start });
         assert_eq!(start.after(Tap::DisplayOff(60)), Settings { display_off_s: 60, ..start });
+        assert_eq!(start.after(Tap::Quiet), Settings { quiet: true, ..start });
+        assert_eq!(start.after(Tap::MoveReminder), Settings { move_reminder: true, ..start });
         assert_eq!(start.after(Tap::RaiseToWake).after(Tap::RaiseToWake), start);
+        assert_eq!(start.after(Tap::PickQuietTime), start);
+        assert_eq!(start.after(Tap::QuietTime((60, 120))), Settings { quiet_time: (60, 120), ..start });
+        assert_eq!(start.after(Tap::MoveTime((600, 660))), Settings { move_time: (600, 660), ..start });
     }
 
     #[test]
     fn everything_to_tap_is_on_the_glass() {
-        let mut rects = vec![raise_rect()];
+        let mut rects: Vec<_> = (0..SWITCHES.len()).map(switch_rect).collect();
         rects.extend((0..=LEVELS as usize).map(brightness_rect));
         rects.extend((0..TIMEOUTS.len()).map(display_off_rect));
         for r in rects {
@@ -894,6 +948,185 @@ mod settings {
             let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
             for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
                 assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "{r:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod alerts {
+    use crate::app::alerts::{card_rect, Alert, Alerts, Kind, SHOWN};
+    use crate::app::theme::{C, SIZE};
+
+    #[test]
+    fn the_newest_alert_is_first_and_the_oldest_drops_out() {
+        let mut alerts = Alerts::new();
+        assert_eq!(alerts.count(), 0);
+        for minute in 0..SHOWN as u8 + 2 {
+            alerts.add(Alert { kind: Kind::Move, at: Some((10, minute)) });
+        }
+        assert_eq!(alerts.count(), SHOWN);
+    }
+
+    #[test]
+    fn the_cards_are_on_the_glass() {
+        for n in 0..SHOWN {
+            let r = card_rect(n);
+            let (x0, y0) = (r.top_left.x, r.top_left.y);
+            let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "card {n}: {r:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod picker {
+    use crate::app::picker::{button_rect, wheels_rect, Outcome, Picker, PITCH};
+    use crate::app::theme::{C, SIZE};
+
+    /// Turn a wheel `dy` pixels down in steps of 20 ms, the last
+    /// `fast` pixels of the way within the final 40 ms, and let go.
+    /// Returns when the finger lifted, in milliseconds.
+    fn turn(picker: &mut Picker, wheel: usize, dy: i32, slow_ms: u64) -> u64 {
+        let at = picker.wheel_rect(wheel).center();
+        assert!(picker.touch(Some((at.x, at.y)), 0));
+        let steps = 10;
+        for i in 1..=steps {
+            picker.touch(Some((at.x, at.y + dy * i / steps)), i as u64 * slow_ms);
+        }
+        let lifted = steps as u64 * slow_ms + 1;
+        assert!(picker.touch(None, lifted));
+        lifted
+    }
+
+    /// Let the wheel run out, however long it takes.
+    fn rest(picker: &mut Picker, lifted: u64) {
+        let mut moved = 0;
+        for ms in (lifted..lifted + 2000).step_by(16) {
+            moved += picker.tick(ms) as u32;
+        }
+        assert!(!picker.tick(lifted + 3000), "still running after 3 s");
+        let _ = moved;
+    }
+
+    #[test]
+    fn a_wheel_moved_slowly_rests_on_the_nearest_value() {
+        let mut picker = Picker::new("T", 10 * 60 + 30);
+        // Down by one value and a little, slowly (100 ms a step, so the
+        // speed adds next to nothing): the value before comes to the middle.
+        let lifted = turn(&mut picker, 1, PITCH + 4, 100);
+        assert_eq!(picker.seconds() / 60, 10 * 60 + 29);
+        rest(&mut picker, lifted);
+        // Up by three values.
+        let lifted = turn(&mut picker, 0, -3 * PITCH, 100);
+        assert_eq!(picker.seconds() / 60, 13 * 60 + 29);
+        rest(&mut picker, lifted);
+        assert_eq!(picker.seconds() / 60, 13 * 60 + 29);
+    }
+
+    #[test]
+    fn a_flick_carries_further() {
+        let mut picker = Picker::new("T", 12 * 60);
+        // 100 pixels up in 50 ms: 2000 pixels a second, taken to last
+        // 150 ms, is another 300 pixels; 400 in all, seven values.
+        turn(&mut picker, 1, -100, 5);
+        assert_eq!(picker.seconds() / 60, 12 * 60 + 7);
+    }
+
+    #[test]
+    fn a_wheel_let_go_runs_out_and_stops() {
+        let mut picker = Picker::new("T", 12 * 60);
+        let lifted = turn(&mut picker, 1, -100, 5);
+        // It moves for a while, by less and less, and then no more.
+        let mut moves = Vec::new();
+        for ms in (lifted..lifted + 1000).step_by(16) {
+            moves.push(picker.tick(ms));
+        }
+        assert!(moves[1] && moves[5], "the wheel does not run");
+        assert!(!moves[moves.len() - 1], "the wheel does not stop");
+        assert_eq!(picker.seconds() / 60, 12 * 60 + 7);
+    }
+
+    #[test]
+    fn a_touch_that_hardly_moves_turns_nothing() {
+        let mut picker = Picker::new("T", 8 * 60);
+        let lifted = turn(&mut picker, 0, 10, 2);
+        assert_eq!(picker.seconds() / 60, 8 * 60);
+        rest(&mut picker, lifted);
+        assert_eq!(picker.seconds() / 60, 8 * 60);
+    }
+
+    #[test]
+    fn the_wheels_go_round() {
+        let mut picker = Picker::new("T", 0);
+        turn(&mut picker, 0, PITCH, 100);
+        turn(&mut picker, 1, PITCH, 100);
+        assert_eq!(picker.seconds() / 60, 23 * 60 + 59);
+        turn(&mut picker, 0, -PITCH, 100);
+        turn(&mut picker, 1, -PITCH, 100);
+        assert_eq!(picker.seconds() / 60, 0);
+    }
+
+    #[test]
+    fn a_tap_above_or_below_the_middle_steps_by_one() {
+        let mut picker = Picker::new("T", 6 * 60 + 15);
+        let hours = picker.wheel_rect(0);
+        let (x, top) = (hours.center().x, hours.top_left.y);
+        assert_eq!(picker.tap(x, top + 5), Outcome::Stepped);
+        assert_eq!(picker.seconds() / 60, 5 * 60 + 15);
+        assert_eq!(picker.tap(x, top + 3 * PITCH - 5), Outcome::Stepped);
+        assert_eq!(picker.tap(x, top + 3 * PITCH - 5), Outcome::Stepped);
+        assert_eq!(picker.seconds() / 60, 7 * 60 + 15);
+        // The middle row itself does nothing.
+        assert_eq!(picker.tap(x, top + PITCH + PITCH / 2), Outcome::Nothing);
+    }
+
+    #[test]
+    fn the_buttons_give_the_time_back_or_not() {
+        let mut picker = Picker::new("T", 22 * 60);
+        let (cancel, save) = (button_rect(0).center(), button_rect(1).center());
+        assert_eq!(picker.tap(cancel.x, cancel.y), Outcome::Cancel);
+        assert_eq!(picker.tap(save.x, save.y), Outcome::Save(22 * 3600));
+        // A finger that comes down beside the wheels takes hold of nothing.
+        assert!(!picker.touch(Some((save.x, save.y)), 0));
+        assert!(!picker.touch(Some((save.x, save.y + 60)), 20) && !picker.touch(None, 40));
+        assert_eq!(picker.seconds() / 60, 22 * 60);
+    }
+
+    #[test]
+    fn everything_is_on_the_glass() {
+        let (two, three) = (Picker::new("T", 0), Picker::with_seconds("T", 0));
+        let wheels = [two.wheel_rect(0), two.wheel_rect(1), three.wheel_rect(0), three.wheel_rect(1), three.wheel_rect(2), wheels_rect()];
+        for r in wheels.into_iter().chain([button_rect(0), button_rect(1)]) {
+            let (x0, y0) = (r.top_left.x, r.top_left.y);
+            let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "{r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn three_wheels_set_seconds_too() {
+        let mut picker = Picker::with_seconds("T", 25 * 60 + 30);
+        assert_eq!(picker.seconds(), 25 * 60 + 30);
+        turn(&mut picker, 2, -2 * PITCH, 100);
+        turn(&mut picker, 0, -PITCH, 100);
+        assert_eq!(picker.seconds(), 3600 + 25 * 60 + 32);
+        // With two wheels there are no seconds, whatever was asked for.
+        let picker = Picker::new("T", 61);
+        assert_eq!(picker.seconds(), 3660);
+    }
+
+    /// What is drawn again when a wheel turns covers every wheel.
+    #[test]
+    fn a_turn_repaints_every_wheel() {
+        let all = wheels_rect();
+        for (picker, wheels) in [(Picker::new("T", 0), 2), (Picker::with_seconds("T", 0), 3)] {
+            for n in 0..wheels {
+                assert_eq!(picker.wheel_rect(n).intersection(&all), picker.wheel_rect(n));
             }
         }
     }

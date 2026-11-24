@@ -26,6 +26,9 @@ pub enum Page {
     /// Restart, power off and the way back to the stock firmware
     /// (`super::power`).
     Power,
+    /// A time of day being set (`super::picker`), opened from the
+    /// settings and left by its two buttons.
+    Picker,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
@@ -33,7 +36,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -43,6 +46,7 @@ impl Page {
             Page::Faces => 4,
             Page::Cards => 5,
             Page::Power => 6,
+            Page::Picker => 7,
         }
     }
 
@@ -53,7 +57,10 @@ impl Page {
     /// screen; a page that always looks the same has one, and so has
     /// the power page, which changes only on a tap: its frame is drawn
     /// into between two pictures, and the panel shows what it was sent
-    /// until the next one.
+    /// until the next one. The same goes for the page a time is set on.
+    /// The two pages opened by a long press share a frame: only one of
+    /// them can be on the screen, and whichever is opened is drawn
+    /// afresh (`shared_frame`).
     pub fn frames(self) -> (usize, usize) {
         match self {
             Page::Face => (0, 2),
@@ -61,9 +68,18 @@ impl Page {
             Page::Above => (4, 1),
             Page::Below => (5, 1),
             Page::Faces => (6, 1),
-            Page::Cards => (7, 1),
+            Page::Cards => (6, 1),
+            Page::Picker => (7, 1),
             Page::Power => (8, 1),
         }
+    }
+}
+
+impl Page {
+    /// True for a page whose frame another page uses too: its picture
+    /// may be gone when it is opened.
+    pub fn shared_frame(self) -> bool {
+        matches!(self, Page::Faces | Page::Cards)
     }
 }
 
