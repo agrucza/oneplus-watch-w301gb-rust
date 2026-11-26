@@ -23,11 +23,13 @@ use crate::services::font::Paint;
 use crate::services::font_data::{NW_LABEL, NW_MONO};
 
 /// The most the file's text takes.
-pub const FILE_SIZE: usize = 160;
+pub const FILE_SIZE: usize = 192;
 /// The fixed brightness steps there are.
 pub const LEVELS: u8 = 4;
 /// The times to choose from after which the display goes dark, seconds.
 pub const TIMEOUTS: [u16; 4] = [10, 15, 30, 60];
+/// The daily step goals to choose from.
+pub const STEP_GOALS: [u32; 5] = [6_000, 8_000, 10_000, 12_000, 15_000];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Settings {
@@ -44,6 +46,8 @@ pub struct Settings {
     /// The reminder to move is on, and from when to when.
     pub move_reminder: bool,
     pub move_time: Window,
+    /// The steps a day at which the watch face's arc is full.
+    pub step_goal: u32,
 }
 
 /// A stretch of the day, from and to in minutes since midnight. The
@@ -74,6 +78,18 @@ pub enum Tap {
     /// A time that was set there.
     QuietTime(Window),
     MoveTime(Window),
+    /// The next of the choices there are, round and round: for a row of
+    /// the settings list, which has no room for a button each.
+    NextBrightness,
+    NextDisplayOff,
+    NextStepGoal,
+}
+
+/// The entry after `now` in `choices`, the first after the last; the
+/// first if `now` is none of them.
+fn next<T: Copy + PartialEq>(choices: &[T], now: T) -> T {
+    let at = choices.iter().position(|&choice| choice == now).map_or(0, |n| (n + 1) % choices.len());
+    choices[at]
 }
 
 /// "22:00-07:00" as a window.
@@ -98,6 +114,7 @@ impl Settings {
         quiet_time: (22 * 60, 7 * 60),
         move_reminder: false,
         move_time: (9 * 60, 21 * 60),
+        step_goal: 10_000,
     };
 
     /// Whether the quiet hours are on and minute `now` of the day lies
@@ -134,6 +151,11 @@ impl Settings {
                 ("quiet", "off") => settings.quiet = false,
                 ("move_reminder", "on") => settings.move_reminder = true,
                 ("move_reminder", "off") => settings.move_reminder = false,
+                ("step_goal", steps) => {
+                    if let Some(steps) = steps.parse().ok().filter(|steps| STEP_GOALS.contains(steps)) {
+                        settings.step_goal = steps;
+                    }
+                }
                 ("quiet_time", window) => settings.quiet_time = parse_window(window).unwrap_or(settings.quiet_time),
                 ("move_time", window) => settings.move_time = parse_window(window).unwrap_or(settings.move_time),
                 _ => {}
@@ -174,6 +196,7 @@ impl Settings {
         let (a, b, c, d) = time(self.move_time);
         let _ = writeln!(into, "move_reminder={}", on(self.move_reminder));
         let _ = writeln!(into, "move_time={:02}:{:02}-{:02}:{:02}", a, b, c, d);
+        let _ = writeln!(into, "step_goal={}", self.step_goal);
         into.1
     }
 
@@ -188,6 +211,16 @@ impl Settings {
             Tap::PickQuietTime | Tap::PickMoveTime => self,
             Tap::QuietTime(quiet_time) => Settings { quiet_time, ..self },
             Tap::MoveTime(move_time) => Settings { move_time, ..self },
+            Tap::NextBrightness => {
+                let brightness = match self.brightness {
+                    None => Some(0),
+                    Some(step) if step + 1 < LEVELS => Some(step + 1),
+                    Some(_) => None,
+                };
+                Settings { brightness, ..self }
+            }
+            Tap::NextDisplayOff => Settings { display_off_s: next(&TIMEOUTS, self.display_off_s), ..self },
+            Tap::NextStepGoal => Settings { step_goal: next(&STEP_GOALS, self.step_goal), ..self },
         }
     }
 }

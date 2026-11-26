@@ -4,6 +4,7 @@ mod alerts;
 mod controls;
 mod face;
 mod launcher;
+mod menu;
 mod motion;
 mod pages;
 mod picker;
@@ -825,8 +826,12 @@ struct Screen {
     /// button then leads back to it.
     launcher: launcher::Launcher,
     from_launcher: bool,
-    /// The page for setting a time, while it is open, and what for.
+    /// The page for setting a time, while it is open, and what for; and
+    /// the page it was opened from, to go back to.
     picker: Option<(picker::Picker, PickFor)>,
+    picker_from: Page,
+    /// How far the settings app's list is moved.
+    scroll: menu::Scroll,
     /// Which page is shown.
     page: Page,
     /// The frame the panel was sent last, whole; `None` before the first
@@ -886,6 +891,8 @@ impl Screen {
             launcher: launcher::Launcher::new(),
             from_launcher: false,
             picker: None,
+            picker_from: Page::Above,
+            scroll: menu::Scroll::new(),
             page: Page::Face,
             on_screen: None,
             power_chosen: None,
@@ -943,12 +950,7 @@ impl Screen {
             }
             Action::StepBrightness => {
                 self.last_button = "button: brightness";
-                let brightness = match self.settings.brightness {
-                    None => Some(0),
-                    Some(n) if n + 1 < settings::LEVELS => Some(n + 1),
-                    Some(_) => None,
-                };
-                self.set(settings::Tap::Brightness(brightness), log);
+                self.set(settings::Tap::NextBrightness, log);
                 true // `fade` takes it from here
             }
             // Done by the main task, never sent here.
@@ -1087,9 +1089,10 @@ impl Screen {
     /// dot.
     fn touch_gesture(&mut self, gesture: Gesture, log: &mut Log) {
         match gesture {
-            // The page for setting a time follows the finger itself
-            // (`touch_raw`); only taps reach it as gestures.
-            Gesture::DragStart { .. } | Gesture::Drag { .. } | Gesture::DragEnd { .. } if self.page == Page::Picker => {}
+            // The page for setting a time and the settings list follow
+            // the finger themselves (`touch_raw`); only taps reach them
+            // as gestures.
+            Gesture::DragStart { .. } | Gesture::Drag { .. } | Gesture::DragEnd { .. } if matches!(self.page, Page::Picker | Page::Settings) => {}
             Gesture::DragStart { direction, dx, dy, .. } if self.pull.is_none() => {
                 let Some((target, motion)) = pages::drag(self.page, direction) else {
                     let _ = writeln!(log.stamp(), "touch: drag {:?}, nothing there", direction);
@@ -1138,7 +1141,7 @@ impl Screen {
                         }
                         launcher::Outcome::Open(app) => {
                             let page = match app {
-                                launcher::App::Settings => Page::Above,
+                                launcher::App::Settings => Page::Settings,
                                 launcher::App::Alerts => Page::Below,
                                 launcher::App::Status => Page::Status,
                                 launcher::App::Power => Page::Power,
@@ -1164,6 +1167,14 @@ impl Screen {
                         Some(tap) => self.set(tap, log),
                         None => {}
                     }
+                } else if self.page == Page::Settings {
+                    match menu::tap_at(x, y, self.scroll.moved()) {
+                        Some(menu::Hit::Quick) => self.go_to(Page::Above, log),
+                        Some(menu::Hit::Setting(settings::Tap::PickQuietTime)) => self.pick(PickFor::QuietFrom, log),
+                        Some(menu::Hit::Setting(settings::Tap::PickMoveTime)) => self.pick(PickFor::MoveFrom, log),
+                        Some(menu::Hit::Setting(tap)) => self.set(tap, log),
+                        None => {}
+                    }
                 } else if self.page == Page::Picker {
                     let outcome = self.picker.as_mut().map_or(picker::Outcome::Nothing, |(picker, _)| picker.tap(x, y));
                     let what = self.picker.as_ref().map(|&(_, what)| what);
@@ -1178,15 +1189,15 @@ impl Screen {
                                 PickFor::MoveFrom => self.pick(PickFor::MoveTo(minutes), log),
                                 PickFor::QuietTo(from) => {
                                     self.set(settings::Tap::QuietTime((from, minutes)), log);
-                                    self.go_to(Page::Above, log);
+                                    self.go_to(self.picker_from, log);
                                 }
                                 PickFor::MoveTo(from) => {
                                     self.set(settings::Tap::MoveTime((from, minutes)), log);
-                                    self.go_to(Page::Above, log);
+                                    self.go_to(self.picker_from, log);
                                 }
                             }
                         }
-                        (picker::Outcome::Cancel, _) => self.go_to(Page::Above, log),
+                        (picker::Outcome::Cancel, _) => self.go_to(self.picker_from, log),
                         _ => {}
                     }
                 }
@@ -1225,6 +1236,7 @@ impl Screen {
         self.picker = Some((picker::Picker::new(title, minutes), what));
         self.t.damage[Page::Picker.index()].add(face::whole());
         if self.page != Page::Picker {
+            self.picker_from = self.page;
             self.go_to(Page::Picker, log);
         }
         self.changed = true;
@@ -1233,10 +1245,14 @@ impl Screen {
     /// Where the finger is, as the touch controller reports it (`None`:
     /// lifted), for the page that follows the finger itself.
     fn touch_raw(&mut self, at: Option<(i32, i32)>) {
+        let now_ms = Instant::now().as_millis();
+        if self.page == Page::Settings && self.scroll.touch(at, now_ms) {
+            self.t.damage[Page::Settings.index()].add(menu::moving_rect());
+            self.changed = true;
+        }
         if self.page != Page::Picker {
             return;
         }
-        let now_ms = Instant::now().as_millis();
         if self.picker.as_mut().is_some_and(|(picker, _)| picker.touch(at, now_ms)) {
             self.wheels_turned();
         }
@@ -1259,6 +1275,7 @@ impl Screen {
         self.settings = new;
         shared::change_settings(new);
         self.t.damage[Page::Above.index()].add(face::whole());
+        self.t.damage[Page::Settings.index()].add(menu::window());
         self.changed = true;
     }
 
@@ -1371,6 +1388,11 @@ impl Screen {
             self.pull_on(now, readings, lux, bluetooth_connected, measuring_heart, log).await;
             return;
         }
+        // The settings list let go runs on by itself.
+        if self.page == Page::Settings && self.scroll.tick(now.as_millis()) {
+            self.t.damage[Page::Settings.index()].add(menu::moving_rect());
+            self.changed = true;
+        }
         // A wheel let go runs out by itself.
         if self.page == Page::Picker && self.picker.as_mut().is_some_and(|(picker, _)| picker.tick(now.as_millis())) {
             self.wheels_turned();
@@ -1458,6 +1480,7 @@ impl Screen {
                 worn,
                 temperature: readings.and_then(|r| r.temperatures).map(|t| (t[0] * 10.0) as i16),
                 steps: readings.and_then(|r| r.steps),
+                step_goal: self.settings.step_goal,
             };
             let mut stage = cycles();
             for n in 0..face::ELEMENTS {
@@ -1518,6 +1541,19 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Settings {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                menu::draw(&mut canvas, &area, &self.settings, self.scroll.moved());
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));

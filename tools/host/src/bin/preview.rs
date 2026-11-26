@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|launcher|launcher-chosen|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
+//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|menu|menu-moved|launcher|launcher-chosen|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -68,6 +68,7 @@ fn main() {
         worn: Some(true),
         temperature: Some(268),
         steps: Some(6_412),
+        step_goal: 10_000,
     };
     let whole = face::whole();
     match args.get(2).map(String::as_str) {
@@ -75,6 +76,11 @@ fn main() {
         Some("above-set") => {
             let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
+        }
+        Some("menu") => w301_host::app::menu::draw(&mut frame, &whole, &w301_host::app::settings::Settings::START, 0),
+        Some("menu-moved") => {
+            let set = w301_host::app::settings::Settings { brightness: Some(2), quiet: true, ..w301_host::app::settings::Settings::START };
+            w301_host::app::menu::draw(&mut frame, &whole, &set, w301_host::app::menu::longest())
         }
         Some("launcher") => w301_host::app::launcher::draw(&mut frame, &whole, &w301_host::app::launcher::Launcher::new()),
         Some("launcher-chosen") => {

@@ -30,6 +30,23 @@ mod gestures {
         assert_eq!(g.feed(None, at(2000)), None);
     }
 
+    /// As the watch logged it: one touch reported as two, the second
+    /// lifting 54 ms after the first.
+    #[test]
+    fn a_tap_reported_twice_counts_once() {
+        let mut g = Gestures::new();
+        g.feed(Some(Down { x: 324, y: 126 }), at(0));
+        assert_eq!(g.feed(Some(Up), at(60)), Some(Gesture::Tap { x: 324, y: 126 }));
+        assert_eq!(g.feed(Some(Down { x: 328, y: 106 }), at(90)), None);
+        assert_eq!(g.feed(Some(Up), at(114)), None);
+        // A second tap by a finger, however quick, still counts.
+        assert_eq!(g.feed(Some(Down { x: 326, y: 120 }), at(260)), None);
+        assert_eq!(g.feed(Some(Up), at(320)), Some(Gesture::Tap { x: 326, y: 120 }));
+        // And a drag that begins right after a tap is a drag.
+        assert_eq!(g.feed(Some(Down { x: 100, y: 100 }), at(350)), None);
+        assert!(matches!(g.feed(Some(Down { x: 160, y: 100 }), at(380)), Some(Gesture::DragStart { .. })));
+    }
+
     #[test]
     fn up_without_down_is_nothing() {
         let mut g = Gestures::new();
@@ -375,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 9] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker];
+    const PAGES: [Page; 10] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -445,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -455,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings] {
             assert_eq!(tap(page), None);
         }
     }
@@ -719,6 +736,7 @@ mod face {
                     worn: Some(true),
                     temperature: Some(268),
                     steps: battery.map(|(percent, _)| percent as u32 * 123),
+                    step_goal: 10_000,
                 });
             }
         }
@@ -841,6 +859,7 @@ mod settings {
                         quiet_time: (23 * 60 + 59, 5),
                         move_reminder: switches & 4 != 0,
                         move_time: (8 * 60 + 30, 18 * 60),
+                        step_goal: 12_000,
                     });
                 }
             }
@@ -935,6 +954,16 @@ mod settings {
         assert_eq!(start.after(Tap::MoveReminder), Settings { move_reminder: true, ..start });
         assert_eq!(start.after(Tap::RaiseToWake).after(Tap::RaiseToWake), start);
         assert_eq!(start.after(Tap::PickQuietTime), start);
+        // The choices of a row go round and round.
+        let mut s = start;
+        for _ in 0..=LEVELS {
+            s = s.after(Tap::NextBrightness);
+        }
+        assert_eq!(s, start);
+        assert_eq!(start.after(Tap::NextDisplayOff).display_off_s, 30);
+        assert_eq!(Settings { display_off_s: 60, ..start }.after(Tap::NextDisplayOff).display_off_s, 10);
+        assert_eq!(start.after(Tap::NextStepGoal).step_goal, 12_000);
+        assert_eq!(Settings { step_goal: 15_000, ..start }.after(Tap::NextStepGoal).step_goal, 6_000);
         assert_eq!(start.after(Tap::QuietTime((60, 120))), Settings { quiet_time: (60, 120), ..start });
         assert_eq!(start.after(Tap::MoveTime((600, 660))), Settings { move_time: (600, 660), ..start });
     }
@@ -1196,5 +1225,109 @@ mod launcher {
         // The first one stands at the top.
         assert_eq!(tiles[0].center().x, C);
         assert!(tiles[0].center().y < C);
+    }
+}
+
+#[cfg(test)]
+mod menu {
+    use crate::app::menu::{longest, tap_at, window, Hit, Row, Scroll, ROW, ROWS};
+    use crate::app::settings::Tap;
+    use crate::app::theme::{C, SIZE};
+
+    /// Drag the list by `dy` (up is negative) in ten steps of `step_ms`
+    /// and let go. Returns when the finger lifted.
+    fn drag(scroll: &mut Scroll, dy: i32, step_ms: u64) -> u64 {
+        let at = window().center();
+        scroll.touch(Some((at.x, at.y)), 0);
+        for i in 1..=10 {
+            scroll.touch(Some((at.x, at.y + dy * i / 10)), i as u64 * step_ms);
+        }
+        scroll.touch(None, 10 * step_ms + 1);
+        10 * step_ms + 1
+    }
+
+    #[test]
+    fn the_list_is_longer_than_its_window_and_on_the_glass() {
+        assert!(longest() > 0, "nothing to scroll: the scrolling is not exercised");
+        let r = window();
+        let (x0, y0) = (r.top_left.x, r.top_left.y);
+        let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn the_list_follows_the_finger_and_stops_at_its_ends() {
+        let mut scroll = Scroll::new();
+        // Slowly up by 40 pixels: the list is 40 further on.
+        drag(&mut scroll, -40, 100);
+        assert_eq!(scroll.moved(), 40);
+        // Down by far more than there is: back at the top, not beyond.
+        drag(&mut scroll, 300, 100);
+        assert_eq!(scroll.moved(), 0);
+        drag(&mut scroll, -1000, 100);
+        assert_eq!(scroll.moved(), longest());
+    }
+
+    #[test]
+    fn a_tap_does_not_nudge_the_list() {
+        let mut scroll = Scroll::new();
+        drag(&mut scroll, -40, 100);
+        drag(&mut scroll, -8, 5);
+        assert_eq!(scroll.moved(), 40);
+        assert!(!scroll.tick(2000));
+    }
+
+    #[test]
+    fn a_flick_runs_on_and_comes_to_rest() {
+        let mut scroll = Scroll::new();
+        // 30 pixels up in 50 ms.
+        let lifted = drag(&mut scroll, -30, 5);
+        let at_lift = scroll.moved();
+        let mut moves = 0;
+        for ms in (lifted..lifted + 3000).step_by(16) {
+            moves += scroll.tick(ms) as u32;
+        }
+        assert!(scroll.moved() > at_lift, "the list does not run on");
+        assert!(moves > 3);
+        assert!(!scroll.tick(lifted + 4000), "the list does not come to rest");
+        assert!(scroll.moved() <= longest());
+    }
+
+    #[test]
+    fn a_tap_lands_on_the_row_under_it_wherever_the_list_stands() {
+        let r = window();
+        let (left, right) = (r.top_left.x + 20, r.top_left.x + r.size.width as i32 - 20);
+        for moved in [0, 30, longest()] {
+            for (n, &row) in ROWS.iter().enumerate() {
+                let y = r.top_left.y + n as i32 * ROW - moved + ROW / 2;
+                let hit = tap_at(left, y, moved);
+                if y < r.top_left.y || y >= r.top_left.y + r.size.height as i32 {
+                    assert_eq!(hit, None, "row {n} is out of the window");
+                    continue;
+                }
+                let expected = match row {
+                    Row::Quick => Some(Hit::Quick),
+                    Row::Brightness => Some(Hit::Setting(Tap::NextBrightness)),
+                    Row::DisplayOff => Some(Hit::Setting(Tap::NextDisplayOff)),
+                    Row::StepGoal => Some(Hit::Setting(Tap::NextStepGoal)),
+                    Row::Quiet => Some(Hit::Setting(Tap::PickQuietTime)),
+                    Row::MoveAlert => Some(Hit::Setting(Tap::PickMoveTime)),
+                    Row::RaiseToWake => None,
+                };
+                assert_eq!(hit, expected, "row {n}, list moved {moved}");
+                // On the switch, the rows that have one switch.
+                let switched = match row {
+                    Row::RaiseToWake => Some(Hit::Setting(Tap::RaiseToWake)),
+                    Row::Quiet => Some(Hit::Setting(Tap::Quiet)),
+                    Row::MoveAlert => Some(Hit::Setting(Tap::MoveReminder)),
+                    _ => expected,
+                };
+                assert_eq!(tap_at(right, y, moved), switched, "row {n}, on the switch");
+            }
+        }
+        // Above the window (the title) nothing is hit.
+        assert_eq!(tap_at(C, 40, 0), None);
     }
 }

@@ -34,6 +34,13 @@ const START: i32 = 15;
 const LONG_PRESS: Duration = Duration::from_millis(600);
 /// The speed at lift-off is taken over about this long.
 const SPEED_WINDOW: Duration = Duration::from_millis(90);
+/// A touch that begins this soon after a tap lifted is that same touch
+/// reported a second time, not a second tap: no finger lifts and comes
+/// down again that fast. Seen on the watch (2026-11-24): two taps 54 ms
+/// apart from one touch, of which the first chose a tile in the launcher
+/// and the second opened it; on the power page the second would have
+/// done what the first only chose.
+const BOUNCE: Duration = Duration::from_millis(100);
 /// A touch no longer than this is short enough to judge by its average
 /// speed, when the speed at lift-off cannot be told.
 const SHORT_TOUCH: Duration = Duration::from_millis(400);
@@ -97,12 +104,16 @@ pub struct Gestures {
     /// Recent places of the finger, oldest first, for the lift-off speed.
     trail: [Sample; 6],
     trail_len: usize,
+    /// When the last tap lifted, and whether the touch now on the glass
+    /// began so soon after it that it is that tap again (`BOUNCE`).
+    tapped_at: Option<Instant>,
+    bounce: bool,
 }
 
 impl Gestures {
     pub fn new() -> Self {
         let nowhere = Sample { at: Instant::now(), x: 0, y: 0 };
-        Self { began: None, last: nowhere, dragging: false, long_press_reported: false, trail: [nowhere; 6], trail_len: 0 }
+        Self { began: None, last: nowhere, dragging: false, long_press_reported: false, trail: [nowhere; 6], trail_len: 0, tapped_at: None, bounce: false }
     }
 
     /// Take what the touch controller reported on this pass (`None` if
@@ -117,6 +128,7 @@ impl Gestures {
                     self.last = here;
                     self.dragging = false;
                     self.long_press_reported = false;
+                    self.bounce = self.tapped_at.is_some_and(|tapped| now.duration_since(tapped) < BOUNCE);
                     self.trail_len = 0;
                     self.remember(here);
                     return None;
@@ -141,8 +153,13 @@ impl Gestures {
                     let (speed_x, speed_y) = self.speed(began, now);
                     return Some(Gesture::DragEnd { dx, dy, speed_x, speed_y });
                 }
-                // A long press was already reported when it happened.
-                (!self.long_press_reported).then_some(Gesture::Tap { x: began.x, y: began.y })
+                // A long press was already reported when it happened, and
+                // a tap reported twice counts once.
+                if self.long_press_reported || self.bounce {
+                    return None;
+                }
+                self.tapped_at = Some(now);
+                Some(Gesture::Tap { x: began.x, y: began.y })
             }
             None => match self.began {
                 Some(began) if !self.dragging => self.resting(began, now),

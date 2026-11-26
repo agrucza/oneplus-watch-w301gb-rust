@@ -63,6 +63,8 @@ pub struct State {
     pub temperature: Option<i16>,
     /// Steps today, as far as known.
     pub steps: Option<u32>,
+    /// The steps a day at which the steps' arc is full.
+    pub step_goal: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -236,7 +238,7 @@ pub fn key(n: usize, s: &State) -> u32 {
         SECOND_DOT => s.time.map_or(60, |t| t.second as u32),
         BATTERY_ARC | BATTERY_TEXT => s.battery.map_or(u32::MAX, |(percent, _)| percent as u32),
         // The arc only changes with its share of the goal.
-        STEP_ARC => s.steps.map_or(u32::MAX, |steps| step_share(steps) as u32),
+        STEP_ARC => s.steps.map_or(u32::MAX, |steps| step_share(steps, s.step_goal) as u32),
         STEP_TEXT => s.steps.unwrap_or(u32::MAX),
         FIRST_GLOW..DATE => digit(n - FIRST_GLOW, s).map_or(10, |d| d as u32),
         DATE => s.time.map_or(0, |t| (t.weekday as u32) << 16 | (t.month as u32) << 8 | t.day as u32),
@@ -285,7 +287,7 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
             // Filled from the bottom end upwards, as far as the day's
             // goal is reached.
             if let Some(steps) = s.steps {
-                let from = STEP_SPAN.1 - step_share(steps);
+                let from = STEP_SPAN.1 - step_share(steps, s.step_goal);
                 dashes(target, clip, from, STEP_SPAN.1, GREEN);
             }
         }
@@ -356,13 +358,11 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, n: usize, s: &State) {
     }
 }
 
-/// The steps the arc is full at. A fixed number until the wearer can
-/// set a goal.
-const STEP_GOAL: u32 = 10_000;
-
-/// How much of the steps' arc `steps` fill, as an angle.
-fn step_share(steps: u32) -> i32 {
-    ((STEP_SPAN.1 - STEP_SPAN.0) as u32 * steps.min(STEP_GOAL) / STEP_GOAL) as i32
+/// How much of the steps' arc `steps` fill, as an angle: all of it at
+/// `goal`.
+fn step_share(steps: u32, goal: u32) -> i32 {
+    let goal = goal.max(1);
+    ((STEP_SPAN.1 - STEP_SPAN.0) as u32 * steps.min(goal) / goal) as i32
 }
 
 /// The lit part of an arc, from `from` to `to`, in dashes.

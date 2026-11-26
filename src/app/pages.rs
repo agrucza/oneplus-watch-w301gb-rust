@@ -32,6 +32,8 @@ pub enum Page {
     /// A time of day being set (`super::picker`), opened from the
     /// settings and left by its two buttons.
     Picker,
+    /// The settings app: every setting, as a list (`super::menu`).
+    Settings,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
@@ -39,7 +41,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -51,6 +53,7 @@ impl Page {
             Page::Power => 6,
             Page::Picker => 7,
             Page::Launcher => 8,
+            Page::Settings => 9,
         }
     }
 
@@ -62,8 +65,8 @@ impl Page {
     /// the power page, which changes only on a tap: its frame is drawn
     /// into between two pictures, and the panel shows what it was sent
     /// until the next one. The same goes for the page a time is set on.
-    /// The two pages opened by a long press and the page a time is set
-    /// on share a frame: only one of them can be on the screen, and
+    /// The two pages opened by a long press, the page a time is set on
+    /// and the settings app share a frame: only one of them can be on the screen, and
     /// whichever is opened is drawn afresh (`shared_frame`).
     pub fn frames(self) -> (usize, usize) {
         match self {
@@ -74,6 +77,7 @@ impl Page {
             Page::Faces => (6, 1),
             Page::Cards => (6, 1),
             Page::Picker => (6, 1),
+            Page::Settings => (6, 1),
             Page::Launcher => (7, 1),
             Page::Power => (8, 1),
         }
@@ -84,7 +88,7 @@ impl Page {
     /// True for a page whose frame another page uses too: its picture
     /// may be gone when it is opened.
     pub fn shared_frame(self) -> bool {
-        matches!(self, Page::Faces | Page::Cards | Page::Picker)
+        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings)
     }
 }
 
