@@ -604,6 +604,35 @@ any size (`Art`), both blended by the blitter like text.
   "off" put the light out in the same instant. A value now counts as
   the latest only with quality 3 or more. Not measured: what the
   monitoring costs.
+- Compass (`app::compass`, 2026-11-26): a fifth app in the launcher.
+  While its page is on a lit screen the chip is switched on with the
+  stock compass page's own message (kind 120, sensor 0, on, gap 20 ms)
+  and off again with its other one when the page is left or the
+  display goes dark. Measured with a first page that showed the report
+  as numbers: reports come about 23 times a second; field 2 is the
+  heading in degrees as a float (137, 291, 306, 335 as the watch was
+  turned); field 3, the calibration's quality, did not come at all; the
+  three further floats stay small and are not understood. The Apollo's
+  count of the compass's users went to 1 on entering and back to 0 on
+  leaving and each time the display went dark, six times over. The
+  page now is a dial that turns under a fixed mark, with the heading as
+  a number and its name of sixteen, and "not calibrated" while the
+  quality is 0. On the watch the same day: the quality went up after
+  moving the watch about; the heading jumped while the arm moved. The
+  dial now follows the heading with a delay of a third of a second. A
+  notice "magnet nearby" for a field outside 0.2 to 0.8 was tried and
+  taken out again: it showed all the time. The three floats being about
+  1.8 together had been taken for a magnet close by; they are that
+  large whenever the chip counts as not calibrated (0.39, 1.91, 0.35
+  right after switching on), so they are no measure of a disturbance,
+  and what they are in that state is not known. The four readings a
+  quarter turn apart in that day's log prove nothing: the watch was
+  aimed by its own needle.
+  Against a phone's compass the user found the heading to point about
+  the same way (by eye, no numbers taken). Open:
+  whether the heading is right against a known north, how the chip
+  gets calibrated (the stock app's compass page was not read). On this
+  page the display stays lit without a touch, for five minutes at most.
 - One touch reported twice (seen in the launcher, 54 ms apart) now
   counts as one tap: a touch that begins within 100 ms of a tap lifting
   is that tap again (`services::gestures`).
@@ -876,7 +905,20 @@ the watch):
   unasked, counts in RAM, and starts at zero with a new day (it needs
   the time) and with an Apollo restart. Its summary is kind 81, whose
   field 3 begins with the step count (four bytes); it is sent when
-  something changed and only while the screen is reported on. Kinds
+  something changed and only while the screen is reported on. All 42
+  bytes of it are read (2026-11-26, both sides) and decoded in
+  `messages::Day`: steps, minutes of exercise, energy, a mask of the
+  hours with activity, distance in metres, floors, the day's stress,
+  time in five heart-rate zones. A summary from the watch (16:18 on a
+  working day): 3396 steps, 2518 m, 201 kcal, 2 floors, 12 minutes of
+  exercise, 9 active hours. Kind 80 is the same per minute (19 bytes),
+  which the stock app keeps in a table and hands back summed as kind 95
+  so that the day's totals outlast an Apollo restart. Distance and
+  energy are the motion library's and take a body of 30 years, 70 kg
+  and 175 cm unless message 128 says otherwise (gender, age, weight,
+  height; the Apollo keeps it in its flash; the stock app sends it only
+  when the phone sets it). The Apollo sends kind 96 when a goal is
+  reached. Kinds
   92 and 95 can hand a count back after a restart (not read).
   Measured 2026-11-24: 11 s after a restart of this firmware the
   summary said 7629 steps, in the evening of a worn day, so the count
@@ -1031,7 +1073,114 @@ Steps:
 Risk: the largest single driver in the stock app. The codec needs its
 register file in the right order before it makes a sound.
 
+**First contact, measured 2026-11-26** (`drivers::probe`, run at
+start, each chip as the stock app approaches it, on the first try):
+the codec's register 0 reads 0x6370, so it is the CS47L15 and SPI2,
+PB1, PB6 and the 3 MHz clock are right; the amplifier's register 0
+reads 0x0310 (its register 3 reads 0x3FFF), so the fitted part is the
+Awinic AW8896 and PG6 was what it lacked; the NFC controller took the
+core reset (see 3.7). All three were switched off again afterwards.
+
+**Read in the stock app B.70, 2026-11-26** (addresses in
+`drivers::probe`):
+
+- The codec's control bus is SPI2 (PB10, PC1, PC2, chip select PB12;
+  mode 0, 7.5 MHz). A transfer is four address bytes, top bit set for
+  a read, two bytes of padding, then two bytes of value (four from
+  address 0x3000 up). PB6 is its reset, PB1 high takes it out of sleep
+  (on board revisions 1 and 3), PA3 carries a 3 MHz clock from timer 2
+  that the playback settings multiply up. No interrupt pin was found.
+  Register 0 is expected to read 0x6370.
+- The amplifier at 0x36 may be one of two parts, told apart at start:
+  register 3 reading 0x1B96 is an NXP TFA, otherwise register 0 reading
+  0x0310 an Awinic AW8896; which one is fitted also selects the set of
+  voice files. PG6 high and PG10 low (its reset, active high) are the
+  stock app's state from its start, and PG6 is the likely reason
+  neither part answered a bus scan so far.
+- Nothing is loaded into the codec at start: after the ID read the
+  stock app switches audio off again and sets it up for each use. For
+  playback that is one file of register writes
+  (`adsp_for_playback_48.bin` or `_441`: a length, then address and
+  value pairs, 102 of them), no DSP image; for voice a register file, a
+  DSP file and a second register file. The codec is clock master of the
+  sample lines; SAI1 (PA8, PA9, PA10, PB5) is slave, I2S, 16 bit. The
+  file's routing suggests the codec's first port feeds the amplifier,
+  the second is the STM32 and the third the Bluetooth chip.
+- The microphone is analog on the codec's input IN1L, powered from
+  the codec's own bias output; no STM32 pin switches it.
+- AW8896 start for playback: 18 register writes from a table
+  (0x081E3058) and two blobs written through registers 0x40 and 0x41,
+  whose format is not read. The TFA's init is not read.
+- Off, as the stock app leaves things between uses: amplifier muted
+  and powered down, PG6 low (with the AW part), PB1 low, SPI2, SAI1 and
+  timer 2 off, PG10 low, PB6 low.
+- Not found: what PG6 and PA12 switch electrically; PF4 in any audio
+  or NFC path.
+
+**The stock app's playback, read in full 2026-11-26** (B.70; the
+numbers, the amplifier's tables and data blocks and the codec file
+decoded line by line are kept outside the repository with the other
+reading notes; nothing of this is built yet):
+
+- The stock app's ordinary tones do not go through SAI1 at all: the
+  tone routine (0x0806769E) loads the 44.1 kHz codec file and streams
+  the wav file to the Bluetooth chip, which feeds the codec on its
+  third port. SAI1 is used by the factory's speaker test (`wav_play`,
+  0x080BCACC, with `tone/spkT.wav`, 48 kHz mono) and by the playback of
+  a recording. That path is the one read and the one to take here: it
+  needs nothing from the Bluetooth chip.
+- Codec file for playback: a software reset, the datasheet's init
+  sequence, the FLL from the 3 MHz clock, the system clock from the
+  FLL, three audio ports (first and second: codec is master, I2S, 16
+  bit, 32 clocks a frame; third: slave), the first port's output mixed
+  from the second and third ports' inputs. The codec's own analog
+  outputs stay off. By the routing the first port feeds the amplifier,
+  the second is the STM32, the third the Bluetooth chip (inferred, no
+  schematic). The stock app writes the file without any wait, also
+  after its reset, and reads no status.
+- The file's FLL numbers do not give 48 kHz by the datasheet: with the
+  synchroniser on they come to 96.004 MHz where 98.304 are wanted,
+  2.3 % low, unless the Bluetooth chip's clock on the third port pulls
+  it right. The SAI is slave, so it plays either way, possibly flat.
+- Volume is the codec's: four mixer registers (0x701, 0x703, 0x709,
+  0x70B; for the STM32's port 0x703 and 0x70B), 0x80 = 0 dB, 0x40 =
+  -32 dB, the stock app's sixteen steps 2 dB apart. The file leaves
+  them at 0 dB.
+- Amplifier start: its I2S format (register 5), 18 register writes
+  from a table, a check that its PLL has locked to the codec's bit
+  clock, a read of its ROM version that decides between two patches
+  for its processor, mute, the patch and 62 words of settings written
+  into its memory through registers 0x40 and 0x41, a watchdog check,
+  power up, wait for the PLL, unmute. Stop: mute, power down. There is
+  no speaker calibration in this driver (that belongs to the other
+  amplifier the stock app supports).
+- SAI1 block A: slave transmitter, 16 bit in 2 slots of 16, frame 32,
+  frame sync low and one bit early, mono mode for one-channel data;
+  started last, on a buffer of silence, refilled by halves from the
+  file; at the end everything is cut and powered down at once.
+- The sound files: all 44.1 kHz stereo 16 bit except the two test
+  files; several peak at full scale.
+- Cautions: the amplifier's PLL needs the codec's bit clock for 5 ms
+  before it is configured; the table's last write unmutes before the
+  patch is in (stock mutes again three transfers later); the wrong
+  patch for the ROM must not be written; the codec's volume has to be
+  set after its file, which resets it to 0 dB.
+
 ### 3.7 NFC (item 9) - L, low priority
+
+Read in the stock app B.70, 2026-11-26: PF2 is the controller's supply,
+PB3 its enable, PA4 its download request, PG2 its interrupt (rising).
+The factory check (0x08026C4C): PF2 high, 100 ms, PB3 low, 100 ms, PB3
+high, 100 ms, then the four bytes `20 00 01 01` (core reset) written;
+that the chip takes them is the check. An answer is read as three bytes
+and then as many as the third says. Off: PB3 low, PF2 low.
+`drivers::probe` does exactly this at start and logs the answer.
+Measured 2026-11-26: the controller took the four bytes and answered
+`40 00 01 00` (reset accepted), then by itself `60 00 0a 02 01 20 04 05
+00 a4 01 10 53`: by the NCI standard's layout a reset notification
+saying NCI version 2.0, manufacturer 0x04 (NXP) and five bytes of its
+own, which would be hardware 0xA4 and firmware 01.10.53 (the layout of
+those five is taken from NXP's usual one, not read).
 
 Known: NXP SN100T with secure element, NXP's `SeApi` middleware in the
 stock app, a firmware image and two RF configuration files.

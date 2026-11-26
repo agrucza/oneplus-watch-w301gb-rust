@@ -68,6 +68,7 @@ static STATE: Mutex<CriticalSectionRawMutex, Cell<State>> = Mutex::new(Cell::new
 static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 static POWER_OFF: AtomicBool = AtomicBool::new(false);
+static COMPASS: AtomicBool = AtomicBool::new(false);
 
 pub fn set_state(state: State) {
     STATE.lock(|cell| cell.set(state));
@@ -103,6 +104,19 @@ pub fn set_visible(visible: bool) {
 /// Whether the picture is visible (not blanked).
 pub fn visible() -> bool {
     VISIBLE.load(Ordering::Relaxed)
+}
+
+/// Say whether the compass is wanted: while its page is on a lit screen.
+pub fn set_compass(wanted: bool) {
+    if COMPASS.swap(wanted, Ordering::Relaxed) != wanted {
+        // The main task, which tells the Apollo, may be waiting.
+        crate::hal::wake::nudge();
+    }
+}
+
+/// Whether the compass is wanted.
+pub fn compass() -> bool {
+    COMPASS.load(Ordering::Relaxed)
 }
 
 /// Ask the main task to have the Apollo switch the watch off.

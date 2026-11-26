@@ -1,6 +1,7 @@
 //! The application: bring the hardware up in a safe order, then run.
 
 mod alerts;
+mod compass;
 mod controls;
 mod face;
 mod launcher;
@@ -132,7 +133,8 @@ pub async fn run(spawner: Spawner, board: Board) {
         let _ = log.flush();
         let (revision, reading) = board.revision.measure();
         let _ = writeln!(log.stamp(), "board revision {} (reading {} of 4095, {} mV)", revision, reading, reading as u32 * 1800 / 4096);
-        if board.codec_supply.off(revision) {
+        let mut codec_awake = board.codec_supply.off(revision);
+        if codec_awake.is_some() {
             let _ = writeln!(log.stamp(), "audio codec supply (PB1) held off");
         }
         let _ = log.flush();
@@ -175,6 +177,17 @@ pub async fn run(spawner: Spawner, board: Board) {
         // Sensor bus and light sensor. Nothing depends on them.
         let mut bus = board.sensor_bus.open();
         light::scan(&mut bus, &mut log);
+        // Codec, amplifier and NFC: asked once, logged, switched off again.
+        if PROBE_CHIPS {
+            if let Some(pin) = codec_awake.as_mut() {
+                crate::drivers::probe::run(board.probe, pin, &mut bus, &mut log).await;
+                let _ = log.flush();
+            } else {
+                let _ = writeln!(log.stamp(), "probe: not run, the stock app's steps for this board revision are not known");
+            }
+        }
+        // PB1 stays low for good.
+        core::mem::forget(codec_awake);
         let factor = factory::light_calibration(&mut log).unwrap_or_else(|| {
             let _ = writeln!(log.stamp(), "light sensor: using the stock default factor {}", light::DEFAULT_FACTOR);
             light::DEFAULT_FACTOR
@@ -510,6 +523,15 @@ fn speed_up_card(log: &mut Log) -> bool {
     true
 }
 
+/// How long the display stays lit on the compass page without a finger
+/// or a button.
+const COMPASS_LIT: Duration = Duration::from_secs(300);
+
+/// Diagnosis: at every start, make first contact with the audio codec,
+/// the speaker amplifier and the NFC controller (`drivers::probe`). Takes
+/// about 0.7 s. On until all three have been seen to answer.
+const PROBE_CHIPS: bool = true;
+
 /// The settings file, beside the log.
 const SETTINGS_DIR: &str = "LOG";
 const SETTINGS_FILE: &str = "RUST.CFG";
@@ -826,6 +848,13 @@ struct Screen {
     /// button then leads back to it.
     launcher: launcher::Launcher,
     from_launcher: bool,
+    /// The compass's report as the compass page shows it, and when it
+    /// was last taken over.
+    compass: Option<compass::View>,
+    /// The heading the dial has got to on its way after the reports, and
+    /// when it was last carried on.
+    compass_heading: f32,
+    compass_at: Instant,
     /// The page for setting a time, while it is open, and what for; and
     /// the page it was opened from, to go back to.
     picker: Option<(picker::Picker, PickFor)>,
@@ -890,6 +919,9 @@ impl Screen {
             alerts: alerts::Alerts::new(),
             launcher: launcher::Launcher::new(),
             from_launcher: false,
+            compass: None,
+            compass_heading: 0.0,
+            compass_at: Instant::now(),
             picker: None,
             picker_from: Page::Above,
             scroll: menu::Scroll::new(),
@@ -1031,7 +1063,9 @@ impl Screen {
     /// (`Settings::display_off_s`) without a finger or a button, counted from the display coming on
     /// if that was later. Not while a page is under the finger.
     async fn idle(&mut self, log: &mut Log) {
-        let timeout = Duration::from_secs(self.settings.display_off_s as u64);
+        // The compass is looked at without touching it: there the display
+        // stays on, for `COMPASS_LIT` at most in case it was forgotten.
+        let timeout = if self.page == Page::Compass { COMPASS_LIT } else { Duration::from_secs(self.settings.display_off_s as u64) };
         if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < timeout {
             return;
         }
@@ -1144,6 +1178,7 @@ impl Screen {
                                 launcher::App::Settings => Page::Settings,
                                 launcher::App::Alerts => Page::Below,
                                 launcher::App::Status => Page::Status,
+                                launcher::App::Compass => Page::Compass,
                                 launcher::App::Power => Page::Power,
                             };
                             self.go_to(page, log);
@@ -1255,6 +1290,38 @@ impl Screen {
         }
         if self.picker.as_mut().is_some_and(|(picker, _)| picker.touch(at, now_ms)) {
             self.wheels_turned();
+        }
+    }
+
+    /// Carry the compass page on after the compass's latest report: the
+    /// dial follows the heading with a short delay (`compass::follow`).
+    /// Drawn again when what the page
+    /// shows has changed, seven times a second at most.
+    fn compass_report(&mut self, report: Option<crate::drivers::apollo::messages::Compass>) {
+        let Some(report) = report else {
+            if self.compass.take().is_some() {
+                self.t.damage[Page::Compass.index()].add(face::whole());
+                self.changed |= self.page == Page::Compass;
+            }
+            return;
+        };
+        let passed = self.compass_at.elapsed();
+        if self.compass.is_some() && passed < Duration::from_millis(150) {
+            return;
+        }
+        self.compass_at = Instant::now();
+        if self.compass.is_none() {
+            // The first report: the dial starts where it says.
+            self.compass_heading = report.heading;
+        } else {
+            self.compass_heading = compass::follow(self.compass_heading, report.heading, passed.as_millis() as u32);
+        }
+        let view = compass::View { degrees: compass::whole_degrees(self.compass_heading), calibrated: report.accuracy != 0 };
+        if self.compass != Some(view) {
+            self.compass = Some(view);
+            // The dial turns as a whole.
+            self.t.damage[Page::Compass.index()].add(face::whole());
+            self.changed |= self.page == Page::Compass;
         }
     }
 
@@ -1554,6 +1621,19 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Compass {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                compass::draw(&mut canvas, &area, self.compass);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -1994,6 +2074,9 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             }
         }
         shared::set_visible(screen.visible);
+        // The compass runs while its page is to be seen.
+        shared::set_compass(screen.visible && screen.page == Page::Compass);
+        screen.compass_report(state.readings.as_ref().and_then(|r| r.compass));
         if screen.stays != state.stays {
             // The power page says where a restart leads.
             screen.stays = state.stays;
@@ -2259,6 +2342,7 @@ async fn main_loop(
                 apollo.set_quiet(settings.quiet.then_some(settings.quiet_time));
                 apollo.set_move_reminder(settings.move_reminder.then_some(settings.move_time));
                 apollo.set_heart_monitor(settings.heart_monitor.mode());
+                apollo.set_compass(shared::compass());
                 if apollo.take_move_reminder() {
                     // The Apollo only says so: the vibration is ours, and
                     // so is leaving the wearer alone in the quiet hours

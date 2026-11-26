@@ -14,6 +14,7 @@
 //! |    20 | heartbeat                       | 2 = 0xA5A5A5A5 from the Apollo                |
 //! |    40 | reminder to move                | 1 time, 2 = 1; see `sedentary`                |
 //! |    41 | wrist gesture (raise to wake)   | see `WristGesture`                            |
+//! |    42 | compass                         | see `Compass`                                 |
 //! |    43 | barometer ("BAR")               | 1 time ms, 2 pressure Pa, 3 altitude m        |
 //! |    44 | heart rate, SpO2, stress        | 1 time ms, 2 bpm, 5 SpO2, 7 stress, 8 type, 25 status |
 //! |    11 | off-wrist timeout and notification | see `off_wrist_timeout`                    |
@@ -22,18 +23,20 @@
 //! |    50 | temperatures ("NTC msg")        | 1 time ms, 2..4 degrees Celsius               |
 //! |    51 | lower button                    | 2 event (see `KeyEvent`), 3 Apollo uptime ms  |
 //! |    52 | sensor chip names               | 21..29 strings                                |
-//! |    54 | sensor status (unconfirmed)     | 1 time ms, 3, 4, 8 numbers                    |
+//! |    54 | users of each sensor            | 1 time ms, 2..8 compass, barometer, accelerometer, gyroscope, GPS, capacitive, optical |
 //! |    59 | Apollo's own reset info         | 1 shutdown type, 2 reset reason               |
 //! |    80 | 180-byte record, type 19        | 1 time s, 2 type, 3 bytes                     |
 //! |    84 | vibration motor (to the Apollo) | see `motor_pulses`                            |
 //! |   102 | system state (to the Apollo)    | see `power_off`                               |
+//! |   120 | sensor switch (to the Apollo)   | see `compass`                                 |
 //! |   121 | raise to wake on/off (to the Apollo) | see `raise_to_wake`                      |
 //! |   122 | do-not-disturb (to the Apollo)  | see `do_not_disturb`                          |
 //! |   125 | sedentary reminder (to the Apollo) | see `sedentary`                            |
 //! |   123 | heart rate on/off (to the Apollo)| see `heart_rate`                              |
 //! |   130 | screen status (to the Apollo)   | see `screen_status`                           |
 //! |   140 | setup status (to the Apollo)    | see `setup_finished`                          |
-//! |    81 | the day's activity so far      | 1 time s, 2 = 42, 3 bytes; see `Readings::steps` |
+//! |    80 | one minute's activity          | 1 time s, 2 = 19, 3 bytes: minute of the day, distance, steps, calories, floors, heart rate, stress, SpO2 (not decoded here) |
+//! |    81 | the day's activity so far      | 1 time s, 2 = 42, 3 bytes; see `Day`          |
 //!
 //! Times are the watch's real-time clock as Unix time.
 
@@ -55,7 +58,10 @@ pub const DAILY: u32 = 81;
 /// off: field 1 = 4 green on, 5 green off, 6 red on, 7 red off.
 pub const LIGHT: u32 = 58;
 pub const WRIST_GESTURE: u32 = 41;
+pub const COMPASS: u32 = 42;
 pub const BAROMETER: u32 = 43;
+pub const SENSOR_USERS: u32 = 54;
+pub const SENSOR_SWITCH: u32 = 120;
 pub const WEAR: u32 = 45;
 pub const BATTERY: u32 = 47;
 pub const TEMPERATURES: u32 = 50;
@@ -301,6 +307,49 @@ pub fn sedentary(window: Option<(Minutes, Minutes)>, lunch_break: bool) -> Encod
         .number(6, 840)
 }
 
+/// Switch the compass on or off.
+///
+/// Kind 120 switches a sensor (read in the Apollo's image 0704,
+/// dispatcher 0x10174, and in the stock app B.70, sender 0x0806D7C6):
+/// field 1 the sensor, 2 on or off, 3 the gap between samples in ms, 4 a
+/// sub-command, 5 a value for it. Sensor 0, which as a zero field is
+/// left out here, is the compass (`lcSensorCompassSet`, 0x13A2C). "On"
+/// sets the gap to field 3 as it stands, so it must always be there,
+/// and counts one user of the chip, which keeps it powered until "off"
+/// takes the user away again. These are the stock compass page's own
+/// two messages (0x0807E7DC): on with 20 ms when it is entered, off with
+/// 20 when it is left.
+///
+/// Only the compass has an encoder here, on purpose: sensor 2 with
+/// sub-command 1 or 3 puts the watch into ship mode or switches
+/// charging off, and sensor 7 takes the heart-rate algorithms down.
+///
+/// The Apollo then sends kind `COMPASS` (see `Compass`), and kind
+/// `SENSOR_USERS` when the number of users of a chip changes.
+pub fn compass(on: bool) -> Encoder {
+    Encoder::new().number(2, on as u32).number(3, 20)
+}
+
+/// What the compass says (kind `COMPASS`), about 23 times a second
+/// while it is on (measured): field 2 the heading in degrees as a
+/// float, 3 how sure the chip's driver is of its calibration, 4 to 6
+/// three more floats from the driver (`MMC5603_angle_data`, 0x99B30 in
+/// the Apollo's image).
+///
+/// Measured 2026-11-26 with the watch turned by hand: the heading went
+/// through 137, 291, 306, 335 degrees; field 3 did not come at all at
+/// first (so 0: not calibrated) and came once the watch had been moved
+/// about. The three floats are about (0.4, 1.9, 0.4) while the quality
+/// is 0 and small afterwards, about 0.46 together lying still; what
+/// they are is not known.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Compass {
+    /// Degrees clockwise from north, 0 up to 360.
+    pub heading: f32,
+    pub accuracy: u32,
+    pub other: [f32; 3],
+}
+
 /// Start or stop a single heart-rate measurement.
 ///
 /// The stock app sends kind 123 from `sendHeartRateSet` (B.70:
@@ -463,6 +512,8 @@ pub struct Readings {
     /// `HEART`, field 2; the stock app logs that field as "hr" at
     /// 0x0806CB8A). 0 while the Apollo has no result yet.
     pub heart_bpm: Option<u32>,
+    /// The compass's latest report, while it is switched on.
+    pub compass: Option<Compass>,
     /// The latest heart rate the Apollo called valid (field 25 = 1) and
     /// of some quality (field 4 at least 3, the limit its own warning for
     /// a high heart rate takes), from a measurement by hand or from its
@@ -487,6 +538,58 @@ pub struct Readings {
     /// there is no message to ask for it. So this is the count as of
     /// the last time the display was lit.
     pub steps: Option<u32>,
+    /// The whole of that summary (`Day`).
+    pub day: Option<Day>,
+}
+
+/// The day so far, as the Apollo's summary gives it (kind `DAILY`, the
+/// first 42 bytes of field 3; the struct at 0x100337E8 in the Apollo's
+/// image 0704, written out by its builder at 0x2847A and read by the
+/// stock app's decoder B.70 0x08053D56; the names are those of the
+/// Apollo's own log texts). Steps, distance, energy and floors come out
+/// of the motion library, whose reckoning was not read; it works from a
+/// body of 30 years, 70 kg and 175 cm unless told otherwise (message
+/// 128, which this firmware does not send yet).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Day {
+    pub steps: u32,
+    /// Minutes with more than 100 steps.
+    pub exercise_minutes: u16,
+    /// Energy, by its size in kilocalories; whether with or without
+    /// what a body burns at rest is not known.
+    pub calories: u16,
+    /// Bit h is set if hour h of the day had a minute of 31 steps or
+    /// more; the stock app counts these as the hours stood.
+    pub active_hours: u32,
+    pub distance_m: u32,
+    pub floors: u16,
+    /// The day's stress values (1 to 100): average, lowest, highest;
+    /// `None` while there are none.
+    pub stress: Option<(u8, u8, u8)>,
+    /// How long the heart rate was in each of five zones (50 to 60 %
+    /// of the highest rate for the age, and so on in steps of ten), in
+    /// counts that are about seconds.
+    pub heart_zones: [u32; 5],
+}
+
+impl Day {
+    /// Take the summary's bytes apart; `None` if there are too few.
+    pub fn parse(bytes: &[u8]) -> Option<Day> {
+        let bytes: &[u8; 42] = bytes.get(..42)?.try_into().ok()?;
+        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let u32_at = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        Some(Day {
+            steps: u32_at(0),
+            exercise_minutes: u16_at(4),
+            calories: u16_at(6),
+            active_hours: u32_at(8) & 0x00FF_FFFF,
+            distance_m: u32_at(12),
+            floors: u16_at(16),
+            stress: (bytes[18] != 0xFF).then_some((bytes[18], bytes[19], bytes[20])),
+            // Byte 21 is the motion library's kind of activity, not decoded.
+            heart_zones: [u32_at(22), u32_at(26), u32_at(30), u32_at(34), u32_at(38)],
+        })
+    }
 }
 
 impl Readings {
@@ -535,9 +638,27 @@ impl Readings {
                     self.off_wrist_long = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0) != 0);
                 }
             }
+            COMPASS => {
+                let float = |n| field(n).and_then(|v| v.as_f32()).unwrap_or(0.0);
+                // A report without a heading is none.
+                if let Some(heading) = field(2).and_then(|v| v.as_f32()).filter(|h| h.is_finite()) {
+                    self.compass = Some(Compass {
+                        // Into 0 up to 360, without the float routines
+                        // the firmware's build does not have.
+                        heading: if (0.0..360.0).contains(&heading) { heading } else { heading - 360.0 * ((heading / 360.0) as i32 as f32) + if heading < 0.0 { 360.0 } else { 0.0 } },
+                        accuracy: field(3).and_then(|v| v.as_u32()).unwrap_or(0),
+                        other: [float(4), float(5), float(6)],
+                    });
+                }
+            }
             DAILY => {
-                if let Some(Value::Bytes(&[a, b, c, d, ..])) = field(3) {
-                    self.steps = Some(u32::from_le_bytes([a, b, c, d]));
+                if let Some(Value::Bytes(bytes)) = field(3) {
+                    if let &[a, b, c, d, ..] = bytes {
+                        self.steps = Some(u32::from_le_bytes([a, b, c, d]));
+                    }
+                    if let Some(day) = Day::parse(bytes) {
+                        self.day = Some(day);
+                    }
                 }
             }
             HEART => {

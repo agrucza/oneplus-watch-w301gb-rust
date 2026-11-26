@@ -16,3 +16,8 @@ pub mod touch_report;
 /// The Apollo's messages: what is sent and what its reports hold.
 #[path = "../../../src/drivers/apollo/messages.rs"]
 pub mod apollo_messages;
+
+/// Under the name the firmware has it by.
+pub mod apollo {
+    pub use super::apollo_messages as messages;
+}

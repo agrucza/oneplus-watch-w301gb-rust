@@ -34,6 +34,8 @@ pub enum Page {
     Picker,
     /// The settings app: every setting, as a list (`super::menu`).
     Settings,
+    /// What the compass reports (`super::compass`).
+    Compass,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
@@ -41,7 +43,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -54,6 +56,7 @@ impl Page {
             Page::Picker => 7,
             Page::Launcher => 8,
             Page::Settings => 9,
+            Page::Compass => 10,
         }
     }
 
@@ -78,6 +81,7 @@ impl Page {
             Page::Cards => (6, 1),
             Page::Picker => (6, 1),
             Page::Settings => (6, 1),
+            Page::Compass => (6, 1),
             Page::Launcher => (7, 1),
             Page::Power => (8, 1),
         }
@@ -88,7 +92,7 @@ impl Page {
     /// True for a page whose frame another page uses too: its picture
     /// may be gone when it is opened.
     pub fn shared_frame(self) -> bool {
-        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings)
+        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings | Page::Compass)
     }
 }
 

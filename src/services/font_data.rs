@@ -45,6 +45,9 @@ pub static NW_ICON_BELL: Art = Art { width: 26, height: 26, coverage: include_by
 /// The design's signal icon (26 x 26).
 pub static NW_ICON_SIGNAL: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_signal.bin") };
 
+/// The design's diamond icon with a needle in it, for the compass (26 x 26).
+pub static NW_ICON_COMPASS: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_compass.bin") };
+
 /// The design's diamond icon (44 x 44).
 pub static NW_ICON_DIAMOND: Art = Art { width: 44, height: 44, coverage: include_bytes!("fonts/nw_icon_diamond.bin") };
 

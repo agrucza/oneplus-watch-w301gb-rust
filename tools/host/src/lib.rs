@@ -392,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 10] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings];
+    const PAGES: [Page; 11] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -462,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -472,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass] {
             assert_eq!(tap(page), None);
         }
     }
@@ -1167,7 +1167,8 @@ mod picker {
 
 #[cfg(test)]
 mod apollo_messages {
-    use crate::drivers::apollo_messages::{heart_monitor, heart_rate, Readings, DAILY, HEART};
+    use crate::app::compass::{follow, name, whole_degrees};
+    use crate::drivers::apollo_messages::{compass, heart_monitor, heart_rate, Day, Readings, COMPASS, DAILY, HEART};
 
     /// The summary of the day's activity as it arrived on the watch
     /// (2026-11-24, 12 s after a start): time, 42, and 180 bytes that
@@ -1226,6 +1227,65 @@ mod apollo_messages {
         // Out of range is not kept either.
         readings.update(HEART, &report(30, 3, 1));
         assert_eq!(readings.heart_last, Some(64));
+    }
+
+    /// The compass page's two messages as the stock app sends them:
+    /// sensor 0 (a zero, left out), on or off, and always the gap of
+    /// 20 ms, without which "on" would set the gap to nothing.
+    #[test]
+    fn the_compass_switch_always_carries_its_gap() {
+        assert_eq!(compass(true).as_bytes(), [0x10, 1, 0x18, 20]);
+        assert_eq!(compass(false).as_bytes(), [0x18, 20]);
+    }
+
+    #[test]
+    fn a_compass_report_is_taken_apart() {
+        let mut readings = Readings::default();
+        assert!(readings.compass.is_none());
+        // The first report as the watch sent it (2026-11-26): the time,
+        // then field 2 as a float (291.3 degrees) and three more floats.
+        let payload = [0x08, 0xd7, 0xb6, 0xb3, 0xbf, 0xa1, 0x34, 0x15, 0x55, 0xa7, 0x91, 0x43, 0x25, 0x63, 0xd7, 0x0e, 0x3f, 0x2d, 0x35, 0x1a, 0xb6, 0x3f, 0x35, 0x98, 0x81, 0x16, 0x3f];
+        readings.update(COMPASS, &payload);
+        let c = readings.compass.unwrap();
+        assert!((c.heading - 291.307).abs() < 0.01, "{}", c.heading);
+        assert_eq!(c.accuracy, 0);
+        assert!((c.other[0] - 0.558).abs() < 0.01 && (c.other[1] - 1.423).abs() < 0.01);
+        assert_eq!((whole_degrees(c.heading), name(whole_degrees(c.heading))), (291, "WNW"));
+        // The dial follows the heading the short way round, a part of
+        // the way at a time, and arrives.
+        assert_eq!(follow(10.0, 20.0, 300), 20.0);
+        assert!((follow(10.0, 20.0, 150) - 15.0).abs() < 0.01);
+        assert!((follow(350.0, 10.0, 150) - 0.0).abs() < 0.01);
+        assert!((follow(10.0, 350.0, 150) - 0.0).abs() < 0.01 || (follow(10.0, 350.0, 150) - 360.0).abs() < 0.01);
+        assert!((follow(5.0, 355.0, 75) - 2.5).abs() < 0.01);
+        assert!((0.0..360.0).contains(&follow(359.9, 0.2, 290)));
+        // A report without a heading leaves the last one standing.
+        readings.update(COMPASS, &[0x18, 3]);
+        assert_eq!(readings.compass, Some(c));
+        // The names, each for 22.5 degrees around its direction.
+        for (at, expected) in [(0, "N"), (11, "N"), (12, "NNE"), (45, "NE"), (90, "E"), (180, "S"), (270, "W"), (348, "NNW"), (349, "N"), (359, "N")] {
+            assert_eq!(name(at), expected, "{at} degrees");
+        }
+    }
+
+    /// A summary as the watch sent it on a working day at 16:18.
+    #[test]
+    fn the_day_is_taken_apart() {
+        let mut bytes = [0u8; 180];
+        let sent = [0x44, 0x0d, 0, 0, 0x0c, 0, 0xc9, 0, 0xc0, 0xf3, 0x01, 0, 0xd6, 0x09, 0, 0, 0x02, 0, 0xff, 0xff, 0xff, 0x01, 0x36, 0, 0, 0];
+        bytes[..sent.len()].copy_from_slice(&sent);
+        let day = Day::parse(&bytes).unwrap();
+        assert_eq!((day.steps, day.exercise_minutes, day.calories, day.distance_m, day.floors), (3396, 12, 201, 2518, 2));
+        // Hours 6 to 9 and 12 to 16 had steps in them.
+        assert_eq!(day.active_hours, 0x1F3C0);
+        assert_eq!((6..=9).chain(12..=16).fold(0, |mask, hour| mask | 1 << hour), day.active_hours);
+        assert_eq!(day.stress, None);
+        assert_eq!(day.heart_zones, [54, 0, 0, 0, 0]);
+        assert_eq!(Day::parse(&bytes[..41]), None);
+        // Through the report as a whole.
+        let mut readings = Readings::default();
+        readings.update(DAILY, &[&[0x1a, 0xb4, 0x01][..], &bytes[..]].concat());
+        assert_eq!((readings.steps, readings.day), (Some(3396), Some(day)));
     }
 }
 

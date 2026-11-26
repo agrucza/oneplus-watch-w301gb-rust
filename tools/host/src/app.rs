@@ -26,3 +26,5 @@ pub mod picker;
 pub mod launcher;
 #[path = "../../../src/app/menu.rs"]
 pub mod menu;
+#[path = "../../../src/app/compass.rs"]
+pub mod compass;

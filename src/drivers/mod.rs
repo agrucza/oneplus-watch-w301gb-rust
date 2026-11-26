@@ -5,6 +5,7 @@ pub mod buttons;
 pub mod cypress;
 pub mod light;
 pub mod panel;
+pub mod probe;
 pub mod psram;
 pub mod touch;
 pub mod touch_report;

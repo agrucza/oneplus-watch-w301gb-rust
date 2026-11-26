@@ -274,6 +274,7 @@ icon("NW_ICON_NEXT", 26, "M4 5 L11 12 L4 19 M11 5 L18 12 L11 19", "The design's 
 icon("NW_ICON_GEAR", 26, "M12 2 L13.5 5 L17 4 L17 7.5 L20 9 L18.5 12 L20 15 L17 16.5 L17 20 L13.5 19 L12 22 L10.5 19 L7 20 L7 16.5 L4 15 L5.5 12 L4 9 L7 7.5 L7 4 L10.5 5 Z M9 12 A3 3 0 1 0 15 12 A3 3 0 1 0 9 12 Z", "The design's gear icon")
 icon("NW_ICON_BELL", 26, "M5 17 H19 L17 14 V10 A5 5 0 0 0 7 10 V14 L5 17 Z M10 20 H14", "The design's bell icon")
 icon("NW_ICON_SIGNAL", 26, "M3 16 H6 V21 H3 Z M9 12 H12 V21 H9 Z M15 8 H18 V21 H15 Z", "The design's signal icon", filled=True)
+icon("NW_ICON_COMPASS", 26, "M12 3 L21 12 L12 21 L3 12 Z M12 8 L14 12 L12 16 L10 12 Z", "The design's diamond icon with a needle in it, for the compass")
 icon("NW_ICON_DIAMOND", 44, "M12 3 L21 12 L12 21 L3 12 Z", "The design's diamond icon")
 icon("NW_ICON_GRID", 44, "M3 3 H10 V10 H3 Z M14 3 H21 V10 H14 Z M3 14 H10 V21 H3 Z M14 14 H21 V21 H14 Z", "The design's grid icon")
 rim_text("NW_RIM_TOP", "NIGHTWATCH OS · W301 · RUST", 13, 192, 0, False, "The line of text along the top of the face")

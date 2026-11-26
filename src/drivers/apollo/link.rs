@@ -81,6 +81,9 @@ const SEND_SETTINGS: bool = true;
 /// With heart-rate monitoring on, the Apollo is asked for a result this
 /// often while its light is on: three in a periodic measurement of 30 s.
 const HEART_REPORT_S: u16 = 10;
+/// Diagnosis: while the compass is on, one of its reports is written to
+/// the log this often.
+const COMPASS_LOG_EVERY: Duration = Duration::from_millis(500);
 /// The answer to the Apollo's question for the board revision.
 const ANSWER_REVISION: bool = true;
 /// How this firmware names itself to the Apollo.
@@ -169,10 +172,16 @@ pub struct Apollo {
     /// 0 none, 1 periodic, 2 continuous) and what the Apollo was last told.
     heart_monitor: u8,
     heart_monitor_told: Option<u8>,
+    /// Whether the compass is wanted, and what the Apollo was last told.
+    /// Its start state is off, so nothing is sent until it is wanted.
+    compass: bool,
+    compass_told: bool,
     /// The Apollo reminded the wearer to move.
     move_reminder_pending: bool,
     /// The step count last written to the log.
     steps_logged: Option<u32>,
+    /// When a compass report was last written to the log.
+    compass_logged_at: Instant,
     /// The screen state the Apollo should know, and the one it was last
     /// told (`None`: not told since its start).
     screen_on: bool,
@@ -269,8 +278,11 @@ impl Apollo {
             move_reminder_told: None,
             heart_monitor: 0,
             heart_monitor_told: None,
+            compass: false,
+            compass_told: false,
             move_reminder_pending: false,
             steps_logged: None,
+            compass_logged_at: Instant::now(),
             screen_on: true,
             screen_told: None,
             raise_to_wake: true,
@@ -548,6 +560,17 @@ impl Apollo {
                 self.quiet_told = Some(quiet);
             }
         }
+        // The compass, on while its page is shown: the stock compass
+        // page's own two messages.
+        if self.setup_acknowledged && self.compass_told != self.compass {
+            let on = self.compass;
+            if self.send(messages::SENSOR_SWITCH, messages::compass(on).as_bytes(), log).await {
+                self.compass_told = on;
+                if !on {
+                    self.readings.compass = None;
+                }
+            }
+        }
         // Heart-rate monitoring, as the stock app sends it at start (there
         // always "none") and when the setting changes.
         if SEND_SETTINGS && self.setup_acknowledged && self.heart_monitor_told != Some(self.heart_monitor) {
@@ -658,6 +681,12 @@ impl Apollo {
     /// `None` for never. The Apollo is told when this changes.
     pub fn set_move_reminder(&mut self, window: Option<(u16, u16)>) {
         self.move_reminder = window;
+    }
+
+    /// Whether the compass is to run (while its page is shown). The
+    /// Apollo is told when this changes.
+    pub fn set_compass(&mut self, on: bool) {
+        self.compass = on;
     }
 
     /// The Apollo's own heart-rate monitoring: 0 none, 1 periodic, 2
@@ -886,7 +915,47 @@ impl Apollo {
             }
             if kind == Some(messages::DAILY) && self.readings.steps != self.steps_logged {
                 self.steps_logged = self.readings.steps;
-                let _ = writeln!(log.stamp(), "apollo: {} steps today", self.readings.steps.unwrap_or(0));
+                let _ = write!(log.stamp(), "apollo: {} steps today", self.readings.steps.unwrap_or(0));
+                if let Some(day) = self.readings.day {
+                    let _ = write!(
+                        log,
+                        ", {} m, {} kcal, {} floors, {} min of exercise, {} hours active",
+                        day.distance_m,
+                        day.calories,
+                        day.floors,
+                        day.exercise_minutes,
+                        day.active_hours.count_ones()
+                    );
+                    match day.stress {
+                        Some((average, lowest, highest)) => {
+                            let _ = write!(log, ", stress {} ({} to {})", average, lowest, highest);
+                        }
+                        None => {
+                            let _ = write!(log, ", stress none");
+                        }
+                    }
+                    let [a, b, c, d, e] = day.heart_zones;
+                    let _ = write!(log, ", heart zones {} {} {} {} {} s", a, b, c, d, e);
+                }
+                let _ = writeln!(log);
+            }
+            if kind == Some(messages::SENSOR_USERS) {
+                // Sent when the number of users of a chip changes: what
+                // is really switched on.
+                let n = |i| Fields(payload).find(|&(tag, _)| tag == i).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+                let _ = writeln!(
+                    log.stamp(),
+                    "apollo: users of compass {}, barometer {}, accelerometer {}, gyroscope {}, GPS {}, capacitive {}, optical {}",
+                    n(2), n(3), n(4), n(5), n(6), n(7), n(8)
+                );
+            }
+            if kind == Some(messages::COMPASS) && self.compass_logged_at.elapsed() >= COMPASS_LOG_EVERY {
+                // Two a second of some 46, to see afterwards how the
+                // heading behaved while the watch was moved.
+                self.compass_logged_at = Instant::now();
+                if let Some(c) = self.readings.compass {
+                    let _ = writeln!(log.stamp(), "apollo: compass: heading {:.1}, sure {}, others {:.2} {:.2} {:.2}", c.heading, c.accuracy, c.other[0], c.other[1], c.other[2]);
+                }
             }
             if kind == Some(messages::LIGHT) {
                 let what = match Fields(payload).find(|&(tag, _)| tag == 1).and_then(|(_, v)| v.as_u32()) {
