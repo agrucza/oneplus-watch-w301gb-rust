@@ -73,15 +73,18 @@ send)
     fi
     ;;
 put) # a small file the firmware reads but does not carry
+    python3 tools/offer.py PUT
     python3 tools/put.py "${2:?file}" "${3:?name}"
     ;;
 log) # fetch the Rust app's log (works with either firmware) and show its end
+    python3 tools/offer.py GET
     bt pull 3:log/rust.log target/rust.log
     tail -n 40 target/rust.log
     echo
     echo "[ota.sh] last 40 lines shown; full log: $PWD/target/rust.log"
     ;;
 oldlog) # the previous generation of the log, kept when the log was started afresh
+    python3 tools/offer.py GET
     bt pull 3:log/rust.old target/rust.old
     echo "[ota.sh] previous log: $PWD/target/rust.old"
     ;;

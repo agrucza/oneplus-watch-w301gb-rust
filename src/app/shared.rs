@@ -38,9 +38,6 @@ pub struct State {
     pub bluetooth_connected: bool,
     /// A heart-rate measurement is running.
     pub measuring_heart: bool,
-    /// A package is streaming in over Bluetooth: the display task keeps
-    /// still, so that the transfer has the processor to itself.
-    pub transferring: bool,
     /// A reset comes back to this firmware (`Server::staying`).
     pub stays: bool,
 }
@@ -55,6 +52,9 @@ pub enum Event {
     Light(u32),
     /// Something for the wearer, and whether to bring it up at once.
     Alert(Alert, bool),
+    /// Something happened that the wearer will want to see (named for
+    /// the log): light the display if it is dark.
+    Wake(&'static str),
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, Cell<State>> = Mutex::new(Cell::new(State {
@@ -62,7 +62,6 @@ static STATE: Mutex<CriticalSectionRawMutex, Cell<State>> = Mutex::new(Cell::new
     lux: None,
     bluetooth_connected: false,
     measuring_heart: false,
-    transferring: false,
     stays: false,
 }));
 static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();

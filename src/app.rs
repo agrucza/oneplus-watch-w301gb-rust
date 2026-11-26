@@ -2,6 +2,7 @@
 
 mod alerts;
 mod compass;
+mod confirm;
 mod controls;
 mod face;
 mod launcher;
@@ -15,6 +16,7 @@ mod settings;
 mod shared;
 mod sounds;
 mod status;
+mod transfer;
 mod theme;
 
 use core::fmt::Write;
@@ -849,6 +851,8 @@ struct Screen {
     from_launcher: bool,
     /// The sound the sounds page shows as playing.
     sound_shown: Option<usize>,
+    /// The Bluetooth transfer the transfer page shows.
+    transfer: Option<(crate::services::progress::Transfer, u8)>,
     /// The compass's report as the compass page shows it, and when it
     /// was last taken over.
     compass: Option<compass::View>,
@@ -921,6 +925,7 @@ impl Screen {
             launcher: launcher::Launcher::new(),
             from_launcher: false,
             sound_shown: None,
+            transfer: None,
             compass: None,
             compass_heading: 0.0,
             compass_at: Instant::now(),
@@ -954,6 +959,7 @@ impl Screen {
     /// Do what a press of a button stands for (`controls::Bindings`).
     async fn act(&mut self, action: Action, log: &mut Log) {
         self.active_at = Instant::now();
+
         let taken = match action {
             Action::HomeOrSleep => {
                 self.last_button = "button: home / sleep";
@@ -1007,6 +1013,19 @@ impl Screen {
         if show {
             self.active_at = Instant::now();
             if !self.open(Page::Below, log).await {
+                let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+            }
+            self.drawn_for = None;
+        }
+    }
+
+    /// Something happened that is worth a look: a dark display comes on
+    /// with the face, a lit one stays as it is and lit for its full time.
+    async fn wake(&mut self, why: &str, log: &mut Log) {
+        let _ = writeln!(log.stamp(), "display: woken by {}", why);
+        self.active_at = Instant::now();
+        if !self.visible {
+            if !self.open(Page::Face, log).await {
                 let _ = writeln!(log.stamp(), "display: the panel did not take the command");
             }
             self.drawn_for = None;
@@ -1204,6 +1223,16 @@ impl Screen {
                         Some(settings::Tap::PickMoveTime) => self.pick(PickFor::MoveFrom, log),
                         Some(tap) => self.set(tap, log),
                         None => {}
+                    }
+                } else if self.page == Page::Transfer {
+                    use crate::services::progress;
+                    if self.transfer.is_some_and(|(what, _)| what.is_offer()) {
+                        if let Some(accept) = confirm::answer_at(x, y) {
+                            progress::decide(accept);
+                        }
+                    } else if transfer::cancel_at(x, y) {
+                        let _ = writeln!(log.stamp(), "transfer: ended by a tap on the watch");
+                        progress::cancel();
                     }
                 } else if self.page == Page::Sounds {
                     // The main task plays it, or ends what plays.
@@ -1629,6 +1658,20 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Transfer {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let (kind, percent) = self.transfer.unwrap_or((crate::services::progress::Transfer::Sending, 100));
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                transfer::draw(&mut canvas, &area, kind, percent);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -2097,6 +2140,10 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
                     let _turn = crate::services::turn::take().await;
                     screen.alert(alert, show, &mut log).await;
                 }
+                shared::Event::Wake(why) => {
+                    let _turn = crate::services::turn::take().await;
+                    screen.wake(why, &mut log).await;
+                }
             }
         }
         shared::set_visible(screen.visible);
@@ -2128,9 +2175,31 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
             Some(choice) => power_do(choice, &mut log),
             None => {}
         }
-        if state.transferring {
-            Timer::after_millis(20).await;
-            continue;
+        // A transfer over Bluetooth is shown as long as it lasts, with
+        // the display lit, whatever was on it; afterwards the face.
+        match crate::services::progress::now() {
+            Some(now) => {
+                if screen.transfer != Some(now) {
+                    screen.transfer = Some(now);
+                    screen.t.damage[Page::Transfer.index()].add(face::whole());
+                    screen.changed = true;
+                }
+                screen.active_at = Instant::now();
+                if screen.page != Page::Transfer || !screen.visible {
+                    let _turn = crate::services::turn::take().await;
+                    let _ = writeln!(log.stamp(), "display: a transfer over Bluetooth is shown");
+                    if !screen.open(Page::Transfer, &mut log).await {
+                        let _ = writeln!(log.stamp(), "display: the panel did not take the command");
+                    }
+                    screen.drawn_for = None;
+                }
+            }
+            None => {
+                if screen.transfer.take().is_some() && screen.page == Page::Transfer {
+                    screen.go_to(Page::Face, &mut log);
+                    screen.active_at = Instant::now();
+                }
+            }
         }
         // The touch controller sleeps while the display is dark.
         if let Some(touch) = touch.as_mut() {
@@ -2275,6 +2344,14 @@ async fn main_loop(
         let mut presses: [Option<(Button, Press)>; 3] = [None; 3];
         let _ = buttons.poll(&mut log);
         presses[0] = hold.feed(buttons.upper_pressed(), now_ms).map(|press| (Button::Upper, press));
+        // A transfer offered over Bluetooth is accepted by the upper
+        // button too, here in the main task: that needs neither the touch
+        // controller nor the display, nor the task that draws.
+        if presses[0].is_some() && crate::services::progress::now().is_some_and(|(what, _)| what.is_offer()) {
+            let _ = writeln!(log.stamp(), "button: the offered transfer is accepted");
+            crate::services::progress::decide(true);
+            presses[0] = None;
+        }
         if clock::take_changed() {
             if let Some(apollo) = apollo.as_mut() {
                 apollo.time_changed();
@@ -2443,7 +2520,6 @@ async fn main_loop(
                 lux: sensors.last_lux,
                 bluetooth_connected: server.connected,
                 measuring_heart,
-                transferring: server.transferring(),
                 stays: server.staying(),
             });
             if let Some(lux) = lux {
@@ -2483,6 +2559,8 @@ async fn main_loop(
                     }
                     if was_charging.is_some_and(|was| was != charging) {
                         let _ = writeln!(log.stamp(), "charger: {}", if charging { "put on" } else { "taken off" });
+                        // Either is worth a look at the battery.
+                        shared::send(shared::Event::Wake(if charging { "the charger put on" } else { "the charger taken off" }));
                     }
                     was_charging = Some(charging);
                     if charging || percent >= LOW_BATTERY + 5 {

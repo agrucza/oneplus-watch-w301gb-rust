@@ -392,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 12] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
+    const PAGES: [Page; 13] = [Page::Transfer, Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -462,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -472,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer] {
             assert_eq!(tap(page), None);
         }
     }
@@ -1512,5 +1512,63 @@ mod sounds {
             }
         }
         assert_eq!(tap_at(C, 40), None);
+    }
+}
+
+#[cfg(test)]
+mod transfer {
+    use crate::app::confirm::{answer_at, no_rect, yes_rect};
+    use crate::app::transfer::{cancel_at, cancel_rect, question};
+    use crate::services::progress::{self, Transfer};
+
+    #[test]
+    fn the_button_is_hit_in_its_middle_and_nowhere_near_the_top() {
+        let middle = cancel_rect().center();
+        assert!(cancel_at(middle.x, middle.y));
+        assert!(!cancel_at(227, 100));
+        let (yes, no) = (yes_rect().center(), no_rect().center());
+        assert_eq!(answer_at(yes.x, yes.y), Some(true));
+        assert_eq!(answer_at(no.x, no.y), Some(false));
+        assert_eq!(answer_at(227, 100), None);
+        // Every offer has its question, a transfer under way has none.
+        for offer in [Transfer::Offered, Transfer::OfferedGet, Transfer::OfferedPut] {
+            assert!(offer.is_offer() && question(offer).is_some());
+        }
+        for running in [Transfer::Receiving, Transfer::Sending, Transfer::Waiting] {
+            assert!(!running.is_offer() && question(running).is_none());
+        }
+    }
+
+    /// One test for the shared state, which is the same for all.
+    #[test]
+    fn a_transfer_is_told_from_its_beginning_to_its_end() {
+        assert_eq!(progress::now(), None);
+        progress::begin(Transfer::Receiving);
+        assert_eq!(progress::now(), Some((Transfer::Receiving, 0)));
+        progress::at(335_000, 670_000);
+        assert_eq!(progress::now(), Some((Transfer::Receiving, 50)));
+        assert!(!progress::cancelled());
+        progress::cancel();
+        assert!(progress::cancelled());
+        progress::end();
+        assert_eq!(progress::now(), None);
+        // The next one begins without the last one's request to end.
+        progress::begin(Transfer::Sending);
+        assert!(!progress::cancelled());
+        assert_eq!(progress::now(), Some((Transfer::Sending, 0)));
+        progress::at(10, 0);
+        assert_eq!(progress::now(), Some((Transfer::Sending, 100)));
+        progress::end();
+        // An offer has no answer until one is given, and the next one
+        // begins without the last one's.
+        progress::begin(Transfer::Offered);
+        assert_eq!(progress::decision(), None);
+        progress::decide(false);
+        assert_eq!(progress::decision(), Some(false));
+        progress::begin(Transfer::Offered);
+        assert_eq!(progress::decision(), None);
+        progress::decide(true);
+        assert_eq!(progress::decision(), Some(true));
+        progress::end();
     }
 }

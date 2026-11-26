@@ -39,6 +39,17 @@ def main():
         watch.send_cmd("AT^BLUETOOTH", prefix=opw_bt.PFX_AT)
         if b"W301RUST" not in watch.read_response():
             return 3
+        # The wearer has to accept the package on the watch. A firmware
+        # from before that rule answers a plain ERROR at once.
+        watch.send_cmd("AT^W301OFFER", prefix=opw_bt.PFX_AT)
+        print("accept the firmware on the watch (tap ACCEPT or press the upper button)", file=sys.stderr)
+        answer = watch.read_response(total=40.0)
+        if b"DENIED" in answer:
+            print("the package was denied on the watch, or not answered in 30 s", file=sys.stderr)
+            return 1
+        if b"OK" not in answer and b"ERROR" not in answer:
+            print("the watch did not answer the offer", file=sys.stderr)
+            return 1
         watch.push_file(sys.argv[1], "1:B280STM32_ota.bin")
         watch.send_cmd("FI^OTAUPDATE", prefix=opw_bt.PFX_FI)
         if b"OK" not in watch.read_response():

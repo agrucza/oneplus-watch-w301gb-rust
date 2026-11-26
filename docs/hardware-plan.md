@@ -1360,6 +1360,42 @@ Steps:
 6. Chip firmware update (`minidriver.bin` / `appdriver.bin` at 115200
    baud): only if ever needed.
 
+**Transfers are shown and need a yes (2026-11-26; built, not yet tried
+on the watch).** Nothing goes over Bluetooth behind the wearer's back
+any more. A firmware package has to be offered first (`AT^W301OFFER`,
+sent by `tools/send.py`): the display lights with a page asking for it
+to be accepted or denied; a tap, or the upper button for a yes (which
+needs neither touch nor display nor the task that draws: the main
+task takes it), answers within 30 s, no
+answer is a no. Only within 60 s of a yes is the package's start
+command taken. While a package arrives, and while a file is sent to
+the PC (a log pull), the page shows what it is, how far it is, and a
+button that ends it: a package's rest is then refused ("311", at which
+the sender gives up), a file's sending stops. A file to the PC
+and a small file from it need the same yes (`AT^W301OFFER=GET` and
+`=PUT`, sent by `tools/offer.py` before a pull or a put); a yes is good
+for one transfer of its kind. The display task is no
+longer held while a package arrives; the Apollo and the sensors still
+are. A package ended half way leaves the image file overwritten, so a
+restart then leads to the stock firmware until a whole package has
+gone through, as with a transfer that broke off. `AT^W301STOCK` is
+taken without a yes: it leads to the maker's firmware and is the way
+out of an image whose display task does not run. The charger put on or
+taken off lights the display (a general wake event, with the reason in
+the log).
+
+On the watch the same evening: offers were accepted by a tap and by
+the upper button, one left alone was denied after 30 s, a package was
+ended by a tap at 623,948 of 681,760 bytes and the next one went
+through; three log pulls after a yes; the charger put on and taken off
+lit the display within 1 ms of the Apollo's report. A package of
+680 KB takes 6 to 11 s with the display task running. After that: a
+yes is followed at once by a state of its own, "accepted, waiting for
+the PC to begin" (20 s at most, with the button that ends it), where
+the face showed in between. Tried on the watch and found good by the user. An offer denied
+by a tap is in the log once, from the build before the questions for
+files were added.
+
 ### 3.9 GPS (items 12, 23) - M
 
 Known: the Apollo owns the AG3335 for positions (`AG3335_Init`,

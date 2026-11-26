@@ -30,3 +30,7 @@ pub mod menu;
 pub mod compass;
 #[path = "../../../src/app/sounds.rs"]
 pub mod sounds;
+#[path = "../../../src/app/transfer.rs"]
+pub mod transfer;
+#[path = "../../../src/app/confirm.rs"]
+pub mod confirm;

@@ -45,6 +45,7 @@ use embassy_time::{Duration, Instant, Timer};
 use crate::drivers::cypress::{self, Link};
 use crate::services::clock;
 use crate::services::log::Log;
+use crate::services::progress::{self, Transfer};
 use crate::boot::ticket;
 use crate::services::update::package::{crc32_update, Package, PACKAGE_HEADER};
 use crate::services::storage::{self, FileReader, FileWriter, Partition};
@@ -73,7 +74,26 @@ const PACKAGE_PATH: &str = "1:B280STM32_ota.bin";
 enum State {
     Commands,
     Receiving { total: usize, received: usize },
+    /// A package was ended on the watch: what the sender still sends is
+    /// dropped and answered with "311" (once every `answer_at` at most),
+    /// at which it gives up after three tries; over when it disconnects
+    /// or has been silent for `REFUSE_FOR`.
+    Refusing { since: Instant, answer_at: Instant },
+    /// A PC has offered a package ("AT^W301OFFER") and waits for the
+    /// answer, which the wearer gives on the display, until `until`.
+    Offered { handle: [u8; 2], until: Instant, what: Transfer },
 }
+
+/// How long an offer waits for the wearer, and how long after a yes the
+/// package may begin.
+const OFFER_FOR: Duration = Duration::from_secs(30);
+const ACCEPTED_FOR: Duration = Duration::from_secs(60);
+/// How long an accepted transfer is shown while the PC has not begun it.
+const AWAITED_FOR: Duration = Duration::from_secs(20);
+
+/// How long after the last data of a refused package the sender counts
+/// as gone.
+const REFUSE_FOR: Duration = Duration::from_secs(15);
 
 /// What one `Server::step` did.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +109,13 @@ pub struct Server {
     chunk: &'static mut [u8; CHUNK_DATA + 4],
     chunk_len: usize,
     state: State,
+    /// When the package under way began.
+    receiving_since: Instant,
+    /// What the wearer accepted, and until when it may begin.
+    accepted: Option<(Transfer, Instant)>,
+    /// An accepted transfer is on the display and has not begun: until
+    /// when it stays there.
+    awaited: Option<Instant>,
     package: Option<Package>,
     /// Length of a complete, verified image.
     ready_image: Option<usize>,
@@ -113,6 +140,9 @@ impl Server {
             chunk,
             chunk_len: 0,
             state: State::Commands,
+            receiving_since: Instant::now(),
+            accepted: None,
+            awaited: None,
             package: None,
             ready_image: None,
             rx_errors_logged: 0,
@@ -131,6 +161,19 @@ impl Server {
         matches!(self.state, State::Receiving { .. })
     }
 
+    /// Whether the wearer accepted an offer of `what` shortly before; a
+    /// yes is good for one transfer.
+    fn take_accepted(&mut self, what: Transfer) -> bool {
+        match self.accepted {
+            Some((accepted, until)) if accepted == what => {
+                self.accepted = None;
+                self.awaited = None;
+                Instant::now() < until
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a reset comes back to this firmware: the bootloader is
     /// booked to install it again, which happens once a PC has been in
     /// touch since the start. Otherwise a reset goes to the stock
@@ -142,6 +185,64 @@ impl Server {
     /// Wait up to 20 ms for a packet from the Bluetooth chip and deal with
     /// it. An install or a return request ends in a reset from in here.
     pub async fn step(&mut self, link: &mut Link, wait: Duration, log: &mut Log) -> Activity {
+        // The package was ended on the watch (`progress::cancel`).
+        if let State::Receiving { total, received } = self.state {
+            if progress::cancelled() {
+                let _ = writeln!(log.stamp(), "ota: transfer ended on the watch at {} of {} bytes", received, total);
+                if let Some(p) = self.package.take() {
+                    let _ = p.finish(total);
+                }
+                self.state = State::Refusing { since: Instant::now(), answer_at: Instant::now() };
+                self.chunk_len = 0;
+                progress::end();
+                let _ = log.flush();
+            }
+        }
+        // An offer is answered once the wearer has decided, or with a no
+        // when the time is up.
+        if let State::Offered { handle, until, what } = self.state {
+            let decision = progress::decision().or((Instant::now() > until).then_some(false));
+            if let Some(accept) = decision {
+                self.state = State::Commands;
+                progress::end();
+                self.accepted = accept.then(|| (what, Instant::now() + ACCEPTED_FOR));
+                // After a yes the display says that the PC is waited
+                // for, until it begins: a file is fetched over a new
+                // connection, some seconds later.
+                self.awaited = None;
+                if accept && what != Transfer::OfferedPut {
+                    progress::begin(Transfer::Waiting);
+                    self.awaited = Some(Instant::now() + AWAITED_FOR);
+                }
+                let _ = writeln!(log.stamp(), "bluetooth: the offered transfer was {}", if accept { "accepted on the watch" } else if progress::decision().is_some() { "denied on the watch" } else { "not answered in time: denied" });
+                let answer: &[u8] = if accept { b"OK\r\n" } else { b"ERROR DENIED\r\n" };
+                let mut out = [0u8; 20];
+                out[..2].copy_from_slice(&handle);
+                out[2..2 + answer.len()].copy_from_slice(answer);
+                if !link.send(CMD_SPP_DATA, &out[..2 + answer.len()]).await {
+                    let _ = writeln!(log.stamp(), "bluetooth: answer could not be sent");
+                }
+                let _ = log.flush();
+            }
+        }
+        // An accepted transfer the PC does not begin, or that is ended
+        // on the watch before it began, is taken off the display again;
+        // ended, it also loses its yes.
+        if let Some(until) = self.awaited {
+            if progress::cancelled() {
+                let _ = writeln!(log.stamp(), "bluetooth: the accepted transfer was ended on the watch before it began");
+                self.accepted = None;
+            }
+            if progress::cancelled() || Instant::now() > until {
+                self.awaited = None;
+                progress::end();
+            }
+        }
+        if let State::Refusing { since, .. } = self.state {
+            if since.elapsed() > REFUSE_FOR {
+                self.state = State::Commands;
+            }
+        }
         let Some(packet) = link.receive_idle(wait).await else {
             if link.rx_errors != self.rx_errors_logged {
                 self.rx_errors_logged = link.rx_errors;
@@ -174,6 +275,13 @@ impl Server {
                         }
                         self.state = State::Commands;
                         self.chunk_len = 0;
+                        progress::end();
+                    }
+                    if matches!(self.state, State::Offered { .. }) {
+                        progress::end();
+                    }
+                    if matches!(self.state, State::Refusing { .. } | State::Offered { .. }) {
+                        self.state = State::Commands;
                     }
                     let _ = log.flush();
                 }
@@ -198,7 +306,19 @@ impl Server {
             State::Commands => {
                 let text = core::str::from_utf8(data).unwrap_or("");
                 let _ = writeln!(log.stamp(), "bluetooth rx: {:?}", text);
-                if text.contains("AT^BLUETOOTH") {
+                if text.contains("AT^W301OFFER") {
+                    // Answered when the wearer has decided (see the top).
+                    let what = if text.contains("OFFER=GET") {
+                        Transfer::OfferedGet
+                    } else if text.contains("OFFER=PUT") {
+                        Transfer::OfferedPut
+                    } else {
+                        Transfer::Offered
+                    };
+                    self.state = State::Offered { handle, until: Instant::now() + OFFER_FOR, what };
+                    progress::begin(what);
+                    let _ = writeln!(log.stamp(), "bluetooth: a transfer is offered ({:?}); waiting for the wearer", what);
+                } else if text.contains("AT^BLUETOOTH") {
                     answer = b"W301RUST OK\r\n";
                     self.handshaken = true;
                     if !self.staying && self.image_file_is_ours {
@@ -222,7 +342,12 @@ impl Server {
                     let (_ext, path, size) = (parts.next(), parts.next(), parts.next());
                     let size = size.and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                     answer = b"ERROR\r\n";
-                    let acceptable = path == Some(PACKAGE_PATH) && size > PACKAGE_HEADER + 4;
+                    // Only a package the wearer said yes to, shortly before.
+                    let accepted = self.take_accepted(Transfer::Offered);
+                    if !accepted {
+                        let _ = writeln!(log.stamp(), "ota: a package that was not offered and accepted on the watch is refused");
+                    }
+                    let acceptable = accepted && path == Some(PACKAGE_PATH) && size > PACKAGE_HEADER + 4;
                     let mut rebooked = true;
                     if acceptable {
                         self.ready_image = None;
@@ -244,6 +369,8 @@ impl Server {
                                 self.package = Some(Package::new(writer));
                                 self.state = State::Receiving { total: size, received: 0 };
                                 self.chunk_len = 0;
+                                self.receiving_since = Instant::now();
+                                progress::begin(Transfer::Receiving);
                                 answer = b"330";
                                 let _ = writeln!(log.stamp(), "ota: receiving package, {} bytes", size);
                             }
@@ -251,14 +378,23 @@ impl Server {
                                 let _ = writeln!(log.stamp(), "ota: cannot open the image file (step {})", step);
                             }
                         }
-                    } else if !acceptable {
+                    } else if accepted && !acceptable {
                         let _ = writeln!(log.stamp(), "ota: only {} can be pushed", PACKAGE_PATH);
                     }
+                    // Accepted and shown, but it did not begin.
+                    if accepted && !matches!(self.state, State::Receiving { .. }) {
+                        progress::end();
+                    }
                 } else if let Some(what) = text.strip_prefix("061").and_then(|t| t.strip_suffix('\r')) {
-                    let mut name = [0u8; 128];
-                    let n = what.len().min(name.len());
-                    name[..n].copy_from_slice(&what.as_bytes()[..n]);
-                    export = Some((name, n));
+                    if self.take_accepted(Transfer::OfferedGet) {
+                        let mut name = [0u8; 128];
+                        let n = what.len().min(name.len());
+                        name[..n].copy_from_slice(&what.as_bytes()[..n]);
+                        export = Some((name, n));
+                    } else {
+                        let _ = writeln!(log.stamp(), "export: {} was not offered and accepted on the watch: refused", what);
+                        answer = b"ERROR\r\n";
+                    }
                 } else if text.contains("FILE_EXPORT_OVER") {
                     // the PC's closing word after a file export; no answer
                 } else if text.contains("FI^SETUNCOMPFLAG") {
@@ -271,12 +407,27 @@ impl Server {
                 } else if let Some((_, time)) = text.split_once("AT^W301TIME=") {
                     answer = if clock::set_from_text(time.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if let Some((_, put)) = text.split_once("AT^W301PUT=") {
-                    answer = if put_small_file(put.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
+                    let accepted = self.take_accepted(Transfer::OfferedPut);
+                    if !accepted {
+                        let _ = writeln!(log.stamp(), "put: not offered and accepted on the watch: refused");
+                    }
+                    answer = if accepted && put_small_file(put.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if text.contains("AT^W301STOCK") {
                     to_stock = true;
                     answer = b"OK\r\n";
                 } else {
                     answer = b"ERROR\r\n";
+                }
+            }
+            // Nothing is taken while the wearer decides.
+            State::Offered { .. } => {}
+            State::Refusing { answer_at, .. } => {
+                let now = Instant::now();
+                if now >= answer_at {
+                    answer = b"311";
+                    self.state = State::Refusing { since: now, answer_at: now + Duration::from_millis(500) };
+                } else {
+                    self.state = State::Refusing { since: now, answer_at };
                 }
             }
             State::Receiving { total, received } => {
@@ -296,12 +447,14 @@ impl Server {
                         }
                         let received = received + body.len();
                         answer = b"310";
+                        progress::at(received, total);
                         if received == total {
                             self.state = State::Commands;
+                            progress::end();
                             match self.package.take().map(|p| p.finish(total)) {
                                 Some(Ok(len)) => {
                                     self.ready_image = Some(len);
-                                    let _ = writeln!(log.stamp(), "ota: package complete, image of {} bytes verified", len);
+                                    let _ = writeln!(log.stamp(), "ota: package complete after {} s, image of {} bytes verified", self.receiving_since.elapsed().as_secs(), len);
                                 }
                                 Some(Err(reason)) => {
                                     let _ = writeln!(log.stamp(), "ota: package rejected: {}", reason);
@@ -426,7 +579,13 @@ async fn export_file(
     let mut result = Ok(());
     if let Some(reader) = reader.as_mut() {
         let mut left = reader.len() as usize;
+        let whole = left;
+        progress::begin(Transfer::Sending);
         while left > 0 && result.is_ok() {
+            if progress::cancelled() {
+                result = Err("ended on the watch");
+                break;
+            }
             let n = left.min(EXPORT_FRAME);
             // Frame: 0x40, length (u32 big-endian), data.
             buf[0] = 0x40;
@@ -453,6 +612,7 @@ async fn export_file(
             }
             total += n;
             left -= n;
+            progress::at(total, whole);
             // The PC confirms every frame with "062\r".
             for _ in 0..40 {
                 if confirmed {
@@ -469,6 +629,7 @@ async fn export_file(
             }
         }
     }
+    progress::end();
     if let Some(reader) = reader {
         reader.close();
     }

@@ -8,3 +8,5 @@ pub mod font_data;
 pub mod gestures;
 #[path = "../../../src/services/wav.rs"]
 pub mod wav;
+#[path = "../../../src/services/progress.rs"]
+pub mod progress;

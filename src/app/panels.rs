@@ -30,7 +30,7 @@ fn look(page: Page) -> Option<Look> {
         Page::Cards => Look { title: "PAGES", color: GREEN, icon: &NW_ICON_GRID, leave: "TAP TO GO BACK" },
         // The panels are the settings (`super::settings`) and the alerts
         // (`super::alerts`).
-        Page::Face | Page::Launcher | Page::Status | Page::Above | Page::Below | Page::Power | Page::Picker | Page::Settings | Page::Compass | Page::Sounds => return None,
+        Page::Face | Page::Launcher | Page::Status | Page::Above | Page::Below | Page::Power | Page::Picker | Page::Settings | Page::Compass | Page::Sounds | Page::Transfer => return None,
     })
 }
 

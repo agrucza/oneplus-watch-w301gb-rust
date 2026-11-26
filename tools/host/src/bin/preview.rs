@@ -77,6 +77,9 @@ fn main() {
             let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
         }
+        Some("waiting") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Waiting, 0),
+        Some("offer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Offered, 0),
+        Some("transfer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Receiving, 42),
         Some("sounds") => w301_host::app::sounds::draw(&mut frame, &whole, Some(2)),
         Some("compass") => {
             let view = w301_host::app::compass::View { degrees: 291, calibrated: true };
