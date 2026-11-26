@@ -580,6 +580,30 @@ any size (`Art`), both blended by the blitter like text.
   goal (6000 to 15,000, line `step_goal=` in the file), which the
   face's arc now takes. It shares the frame of the picker and the two
   long-press pages.
+- Heart-rate monitoring (built 2026-11-26): a row of the settings app, "off", "10 min" (the Apollo's
+  periodic kind: its green light for 30 s in every ten and a half
+  minutes while worn) or "always"; line `heart_monitor=` in the file.
+  Sent as message 123 with the mode, at start and on every change;
+  "off" is field for field what the stock app sends at its start. With
+  monitoring on the Apollo is asked for a result every 10 s while its
+  light is on, which the stock app does not do (it sends "no results"
+  and takes the values from the Apollo's records): read in the Apollo,
+  not a path stock takes. The face's pulse pill shows the latest
+  result the Apollo called valid, or the running one during a
+  measurement by hand; after such a measurement the monitoring is sent
+  again, because the Apollo keeps only the latest heart-rate message.
+  The Apollo's own report of its lights going on and off (message 58)
+  is logged, to see on the watch what the setting switches on.
+  Measured 2026-11-26, worn: set to "10 min" at 53 s, the green light
+  came on at 652.6 s, 600 s after the message, stayed on for 30.0 s, and
+  came again 630 s later each time (1282.5 s, 1912.5 s); three results
+  10 s apart in each, also while the display was dark, of which the
+  last was valid in two of three measurements (100 with quality 1,
+  then 70 with quality 6; none in the third, where the wear check
+  dropped out meanwhile). "Always" gave a result every 10 s (63 to 77);
+  "off" put the light out in the same instant. A value now counts as
+  the latest only with quality 3 or more. Not measured: what the
+  monitoring costs.
 - One touch reported twice (seen in the launcher, 54 ms apart) now
   counts as one tap: a touch that begins within 100 ms of a tap lifting
   is that tap again (`services::gestures`).

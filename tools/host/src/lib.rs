@@ -839,7 +839,7 @@ mod round {
 
 #[cfg(test)]
 mod settings {
-    use crate::app::settings::{brightness_rect, display_off_rect, switch_rect, tap_at, within, Settings, Tap, FILE_SIZE, LEVELS, SWITCHES, TIMEOUTS};
+    use crate::app::settings::{brightness_rect, display_off_rect, switch_rect, tap_at, within, HeartMonitor, Settings, Tap, FILE_SIZE, LEVELS, SWITCHES, TIMEOUTS};
     use crate::app::theme::{C, SIZE};
 
     fn r_right(r: embedded_graphics::primitives::Rectangle) -> i32 {
@@ -860,6 +860,7 @@ mod settings {
                         move_reminder: switches & 4 != 0,
                         move_time: (8 * 60 + 30, 18 * 60),
                         step_goal: 12_000,
+                        heart_monitor: HeartMonitor::ALL[switches as usize % 3],
                     });
                 }
             }
@@ -964,6 +965,8 @@ mod settings {
         assert_eq!(Settings { display_off_s: 60, ..start }.after(Tap::NextDisplayOff).display_off_s, 10);
         assert_eq!(start.after(Tap::NextStepGoal).step_goal, 12_000);
         assert_eq!(Settings { step_goal: 15_000, ..start }.after(Tap::NextStepGoal).step_goal, 6_000);
+        let monitors: Vec<_> = (0..3).scan(start, |s, _| { *s = s.after(Tap::NextHeartMonitor); Some(s.heart_monitor) }).collect();
+        assert_eq!(monitors, [HeartMonitor::Periodic, HeartMonitor::Always, HeartMonitor::Off]);
         assert_eq!(start.after(Tap::QuietTime((60, 120))), Settings { quiet_time: (60, 120), ..start });
         assert_eq!(start.after(Tap::MoveTime((600, 660))), Settings { move_time: (600, 660), ..start });
     }
@@ -1164,7 +1167,7 @@ mod picker {
 
 #[cfg(test)]
 mod apollo_messages {
-    use crate::drivers::apollo_messages::{Readings, DAILY};
+    use crate::drivers::apollo_messages::{heart_monitor, heart_rate, Readings, DAILY, HEART};
 
     /// The summary of the day's activity as it arrived on the watch
     /// (2026-11-24, 12 s after a start): time, 42, and 180 bytes that
@@ -1183,6 +1186,46 @@ mod apollo_messages {
         // A summary cut short changes nothing.
         readings.update(DAILY, &[0x1a, 0x02, 0x01, 0x02]);
         assert_eq!(readings.steps, Some(8_412));
+    }
+
+    /// The messages byte for byte: a field is its number times eight
+    /// and then its value; fields that are zero are left out.
+    #[test]
+    fn heart_monitoring_is_sent_as_read() {
+        // None: what the stock app sends at its start.
+        assert_eq!(heart_monitor(0, 10).as_bytes(), [0x18, 40, 0x20, 100, 0x38, 1]);
+        // Periodic, results every 10 s.
+        assert_eq!(heart_monitor(1, 10).as_bytes(), [0x08, 1, 0x18, 40, 0x20, 100, 0x38, 10, 0x40, 1]);
+        assert_eq!(heart_monitor(2, 10).as_bytes(), [0x08, 1, 0x18, 40, 0x20, 100, 0x38, 10, 0x40, 2]);
+        // A measurement by hand, as it has been sent all along.
+        assert_eq!(heart_rate(true).as_bytes(), [0x08, 1, 0x18, 40, 0x38, 1, 0x40, 3]);
+        assert_eq!(heart_rate(false).as_bytes(), [0x18, 40, 0x38, 1, 0x40, 3]);
+    }
+
+    #[test]
+    fn only_a_valid_heart_rate_is_kept_as_the_latest() {
+        let mut readings = Readings::default();
+        // Field 2 beats, 4 quality, 8 what it is about, 25 (two bytes
+        // of tag) status.
+        let report = |bpm: u8, about: u8, status: u8| vec![0x10, bpm, 0x20, 6, 0x40, about, 0xc8, 0x01, status];
+        readings.update(HEART, &report(0, 3, 0));
+        assert_eq!((readings.heart_bpm, readings.heart_last), (Some(0), None));
+        readings.update(HEART, &report(64, 3, 1));
+        assert_eq!((readings.heart_bpm, readings.heart_last), (Some(64), Some(64)));
+        // Not worn: the live value goes, the latest valid one stays.
+        readings.update(HEART, &report(0, 3, 3));
+        assert_eq!((readings.heart_bpm, readings.heart_last), (Some(0), Some(64)));
+        // A stress or SpO2 report is not a heart rate.
+        readings.update(HEART, &report(99, 1, 1));
+        readings.update(HEART, &report(99, 2, 1));
+        assert_eq!((readings.heart_bpm, readings.heart_last), (Some(0), Some(64)));
+        // Nor is a value of low quality: as the watch sent it, the first
+        // of a periodic measurement, 100 beats with quality 1.
+        readings.update(HEART, &[0x10, 100, 0x20, 1, 0x40, 3, 0xc8, 0x01, 1]);
+        assert_eq!((readings.heart_bpm, readings.heart_last), (Some(100), Some(64)));
+        // Out of range is not kept either.
+        readings.update(HEART, &report(30, 3, 1));
+        assert_eq!(readings.heart_last, Some(64));
     }
 }
 
@@ -1312,6 +1355,7 @@ mod menu {
                     Row::Brightness => Some(Hit::Setting(Tap::NextBrightness)),
                     Row::DisplayOff => Some(Hit::Setting(Tap::NextDisplayOff)),
                     Row::StepGoal => Some(Hit::Setting(Tap::NextStepGoal)),
+                    Row::HeartMonitor => Some(Hit::Setting(Tap::NextHeartMonitor)),
                     Row::Quiet => Some(Hit::Setting(Tap::PickQuietTime)),
                     Row::MoveAlert => Some(Hit::Setting(Tap::PickMoveTime)),
                     Row::RaiseToWake => None,

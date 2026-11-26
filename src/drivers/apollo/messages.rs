@@ -51,6 +51,9 @@ pub const VERSION: u32 = 6;
 pub const SENSOR_NAMES: u32 = 52;
 pub const MOVE_REMINDER: u32 = 40;
 pub const DAILY: u32 = 81;
+/// The Apollo says that one of the optical sensor's lights went on or
+/// off: field 1 = 4 green on, 5 green off, 6 red on, 7 red off.
+pub const LIGHT: u32 = 58;
 pub const WRIST_GESTURE: u32 = 41;
 pub const BAROMETER: u32 = 43;
 pub const WEAR: u32 = 45;
@@ -338,6 +341,22 @@ pub fn heart_rate(on: bool) -> Encoder {
     Encoder::new().number(1, on as u32).number(3, 40).number(7, 1).number(8, 3)
 }
 
+/// Set the Apollo's own heart-rate monitoring: `mode` 0 for none, 1 for
+/// periodic (30 s in every 630 s while worn), 2 for continuous; see
+/// `heart_rate` for the fields. With monitoring on, results are asked
+/// for (field 1) every `report_s` seconds while the light is on.
+///
+/// Mode 0 is, field for field, what the stock app sends at its start
+/// (B.70: 0x08052E00): 1 = 0, 3 = 40, 4 = 100, 7 = 1, 8 = 0. From the
+/// phone's setting the stock app sends modes 1 and 2 with field 1 = 0
+/// and so gets no results while monitoring; asking for them is this
+/// firmware's own, read in the Apollo (0x311E4, 0x37120: reports go out
+/// while worn and field 1 is not 0) and not a path the stock app takes.
+pub fn heart_monitor(mode: u8, report_s: u16) -> Encoder {
+    let on = mode != 0;
+    Encoder::new().number(1, on as u32).number(3, 40).number(4, 100).number(7, if on { report_s as u32 } else { 1 }).number(8, mode as u32)
+}
+
 /// Switch the watch off: kind 102 with field 1 = 3.
 ///
 /// Kind 102 carries one number, a system state. The stock app's "model
@@ -444,6 +463,13 @@ pub struct Readings {
     /// `HEART`, field 2; the stock app logs that field as "hr" at
     /// 0x0806CB8A). 0 while the Apollo has no result yet.
     pub heart_bpm: Option<u32>,
+    /// The latest heart rate the Apollo called valid (field 25 = 1) and
+    /// of some quality (field 4 at least 3, the limit its own warning for
+    /// a high heart rate takes), from a measurement by hand or from its
+    /// monitoring. Measured (2026-11-26): the first valid value of a
+    /// periodic measurement came with quality 1 and said 100, the next
+    /// ones with quality 6 said 70 and 74.
+    pub heart_last: Option<u32>,
     /// Steps today, from the latest summary of the day's activity (kind
     /// `DAILY`): the first four bytes of its field 3, which the stock
     /// app's decoder (B.70: 0x08053D56) logs as `rpt->step_number`.
@@ -515,7 +541,17 @@ impl Readings {
                 }
             }
             HEART => {
-                self.heart_bpm = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0));
+                // Field 8 says what the report is about: 3 the heart
+                // rate, 1 stress, 2 and 4 SpO2. A report without it is
+                // taken for the heart rate, as before this was read.
+                let n = |i| field(i).and_then(|v| v.as_u32());
+                if n(8).is_none_or(|kind| kind == 3) {
+                    let bpm = n(2).unwrap_or(0);
+                    self.heart_bpm = Some(bpm);
+                    if n(25) == Some(1) && n(4).unwrap_or(0) >= 3 && (40..=220).contains(&bpm) {
+                        self.heart_last = Some(bpm);
+                    }
+                }
             }
             RESET_INFO => {
                 let n = |i| field(i).and_then(|v| v.as_u32()).unwrap_or(0);

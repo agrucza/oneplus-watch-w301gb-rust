@@ -75,8 +75,12 @@ const SEND_RAISE_TO_WAKE: bool = true;
 const APOLLO_LOG_WINDOW: Option<(u64, u64)> = None;
 const APOLLO_LOG_LEVEL: u8 = 4;
 const APOLLO_LOG_MODULES: u32 = 0x0018_01CF;
-/// Do-not-disturb and sedentary settings after the setup status.
+/// Do-not-disturb, sedentary and heart-monitoring settings after the
+/// setup status.
 const SEND_SETTINGS: bool = true;
+/// With heart-rate monitoring on, the Apollo is asked for a result this
+/// often while its light is on: three in a periodic measurement of 30 s.
+const HEART_REPORT_S: u16 = 10;
 /// The answer to the Apollo's question for the board revision.
 const ANSWER_REVISION: bool = true;
 /// How this firmware names itself to the Apollo.
@@ -161,6 +165,10 @@ pub struct Apollo {
     quiet_told: Option<Option<(u16, u16)>>,
     move_reminder: Option<(u16, u16)>,
     move_reminder_told: Option<Option<(u16, u16)>>,
+    /// The heart-rate monitoring the user has set (`messages::heart_monitor`:
+    /// 0 none, 1 periodic, 2 continuous) and what the Apollo was last told.
+    heart_monitor: u8,
+    heart_monitor_told: Option<u8>,
     /// The Apollo reminded the wearer to move.
     move_reminder_pending: bool,
     /// The step count last written to the log.
@@ -259,6 +267,8 @@ impl Apollo {
             quiet_told: None,
             move_reminder: None,
             move_reminder_told: None,
+            heart_monitor: 0,
+            heart_monitor_told: None,
             move_reminder_pending: false,
             steps_logged: None,
             screen_on: true,
@@ -538,6 +548,14 @@ impl Apollo {
                 self.quiet_told = Some(quiet);
             }
         }
+        // Heart-rate monitoring, as the stock app sends it at start (there
+        // always "none") and when the setting changes.
+        if SEND_SETTINGS && self.setup_acknowledged && self.heart_monitor_told != Some(self.heart_monitor) {
+            let mode = self.heart_monitor;
+            if self.send(messages::HEART_RATE_SET, messages::heart_monitor(mode, HEART_REPORT_S).as_bytes(), log).await {
+                self.heart_monitor_told = Some(mode);
+            }
+        }
         if SEND_SETTINGS && self.setup_acknowledged && self.move_reminder_told != Some(self.move_reminder) {
             let window = self.move_reminder;
             // The Apollo does not acknowledge this one.
@@ -642,6 +660,12 @@ impl Apollo {
         self.move_reminder = window;
     }
 
+    /// The Apollo's own heart-rate monitoring: 0 none, 1 periodic, 2
+    /// continuous. The Apollo is told when this changes.
+    pub fn set_heart_monitor(&mut self, mode: u8) {
+        self.heart_monitor = mode;
+    }
+
     /// Whether the Apollo reminded the wearer to move since the last call.
     pub fn take_move_reminder(&mut self) -> bool {
         core::mem::take(&mut self.move_reminder_pending)
@@ -659,6 +683,13 @@ impl Apollo {
             self.readings.heart_bpm = None;
         }
         self.heart_logged = 0;
+        // The Apollo keeps the latest heart-rate message whole: this one
+        // replaces what the monitoring set (whether and how often it
+        // reports). That is wanted while the measurement runs, a result
+        // a second; once it is over the monitoring is sent again.
+        if !on {
+            self.heart_monitor_told = None;
+        }
         self.send(messages::HEART_RATE_SET, messages::heart_rate(on).as_bytes(), log).await
     }
 
@@ -856,6 +887,16 @@ impl Apollo {
             if kind == Some(messages::DAILY) && self.readings.steps != self.steps_logged {
                 self.steps_logged = self.readings.steps;
                 let _ = writeln!(log.stamp(), "apollo: {} steps today", self.readings.steps.unwrap_or(0));
+            }
+            if kind == Some(messages::LIGHT) {
+                let what = match Fields(payload).find(|&(tag, _)| tag == 1).and_then(|(_, v)| v.as_u32()) {
+                    Some(4) => "green light on",
+                    Some(5) => "green light off",
+                    Some(6) => "red light on",
+                    Some(7) => "red light off",
+                    _ => "a light report with an unknown value",
+                };
+                let _ = writeln!(log.stamp(), "apollo: {}", what);
             }
             if kind == Some(messages::MOVE_REMINDER) {
                 self.move_reminder_pending = true;

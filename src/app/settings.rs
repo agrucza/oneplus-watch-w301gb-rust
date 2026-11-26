@@ -48,6 +48,40 @@ pub struct Settings {
     pub move_time: Window,
     /// The steps a day at which the watch face's arc is full.
     pub step_goal: u32,
+    /// Whether the Apollo measures the heart rate by itself.
+    pub heart_monitor: HeartMonitor,
+}
+
+/// The Apollo's own heart-rate monitoring, while the watch is worn. Its
+/// periodic kind cannot be given another rhythm: 30 seconds in every
+/// ten and a half minutes are fixed in the Apollo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeartMonitor {
+    Off,
+    Periodic,
+    Always,
+}
+
+impl HeartMonitor {
+    pub const ALL: [HeartMonitor; 3] = [HeartMonitor::Off, HeartMonitor::Periodic, HeartMonitor::Always];
+
+    /// The mode for the Apollo (`messages::heart_monitor`).
+    pub fn mode(self) -> u8 {
+        match self {
+            HeartMonitor::Off => 0,
+            HeartMonitor::Periodic => 1,
+            HeartMonitor::Always => 2,
+        }
+    }
+
+    /// The word in the settings file.
+    fn word(self) -> &'static str {
+        match self {
+            HeartMonitor::Off => "off",
+            HeartMonitor::Periodic => "periodic",
+            HeartMonitor::Always => "always",
+        }
+    }
 }
 
 /// A stretch of the day, from and to in minutes since midnight. The
@@ -83,6 +117,7 @@ pub enum Tap {
     NextBrightness,
     NextDisplayOff,
     NextStepGoal,
+    NextHeartMonitor,
 }
 
 /// The entry after `now` in `choices`, the first after the last; the
@@ -115,6 +150,7 @@ impl Settings {
         move_reminder: false,
         move_time: (9 * 60, 21 * 60),
         step_goal: 10_000,
+        heart_monitor: HeartMonitor::Off,
     };
 
     /// Whether the quiet hours are on and minute `now` of the day lies
@@ -154,6 +190,11 @@ impl Settings {
                 ("step_goal", steps) => {
                     if let Some(steps) = steps.parse().ok().filter(|steps| STEP_GOALS.contains(steps)) {
                         settings.step_goal = steps;
+                    }
+                }
+                ("heart_monitor", word) => {
+                    if let Some(&monitor) = HeartMonitor::ALL.iter().find(|monitor| monitor.word() == word) {
+                        settings.heart_monitor = monitor;
                     }
                 }
                 ("quiet_time", window) => settings.quiet_time = parse_window(window).unwrap_or(settings.quiet_time),
@@ -197,6 +238,7 @@ impl Settings {
         let _ = writeln!(into, "move_reminder={}", on(self.move_reminder));
         let _ = writeln!(into, "move_time={:02}:{:02}-{:02}:{:02}", a, b, c, d);
         let _ = writeln!(into, "step_goal={}", self.step_goal);
+        let _ = writeln!(into, "heart_monitor={}", self.heart_monitor.word());
         into.1
     }
 
@@ -221,6 +263,7 @@ impl Settings {
             }
             Tap::NextDisplayOff => Settings { display_off_s: next(&TIMEOUTS, self.display_off_s), ..self },
             Tap::NextStepGoal => Settings { step_goal: next(&STEP_GOALS, self.step_goal), ..self },
+            Tap::NextHeartMonitor => Settings { heart_monitor: next(&HeartMonitor::ALL, self.heart_monitor), ..self },
         }
     }
 }

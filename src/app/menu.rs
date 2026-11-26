@@ -10,7 +10,7 @@
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
-use super::settings::{Settings, Tap};
+use super::settings::{HeartMonitor, Settings, Tap};
 use super::theme::{self, BONE, C, CHROME, CYAN, SIGNAL, SIZE, STEEL, STEEL_2};
 use crate::services::font::Paint;
 use crate::services::font_data::{NW_ICON_NEXT, NW_LABEL, NW_MONO};
@@ -26,9 +26,10 @@ pub enum Row {
     Quiet,
     MoveAlert,
     StepGoal,
+    HeartMonitor,
 }
 
-pub const ROWS: [Row; 7] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal];
+pub const ROWS: [Row; 8] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal, Row::HeartMonitor];
 
 /// The left edge and the width of the rows, and the height of one.
 const LEFT: i32 = 66;
@@ -82,6 +83,7 @@ pub fn tap_at(x: i32, y: i32, moved: i32) -> Option<Hit> {
         (Row::Brightness, _) => Hit::Setting(Tap::NextBrightness),
         (Row::DisplayOff, _) => Hit::Setting(Tap::NextDisplayOff),
         (Row::StepGoal, _) => Hit::Setting(Tap::NextStepGoal),
+        (Row::HeartMonitor, _) => Hit::Setting(Tap::NextHeartMonitor),
         (Row::RaiseToWake, true) => Hit::Setting(Tap::RaiseToWake),
         (Row::Quiet, true) => Hit::Setting(Tap::Quiet),
         (Row::MoveAlert, true) => Hit::Setting(Tap::MoveReminder),
@@ -165,6 +167,14 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, settings: &Settings, mov
             Row::StepGoal => {
                 let _ = write!(value, "{}", settings.step_goal);
                 ("STEP GOAL", None)
+            }
+            Row::HeartMonitor => {
+                let _ = write!(value, "{}", match settings.heart_monitor {
+                    HeartMonitor::Off => "OFF",
+                    HeartMonitor::Periodic => "10 MIN",
+                    HeartMonitor::Always => "ALWAYS",
+                });
+                ("HEART RATE", None)
             }
         };
         target.text(&window, LEFT, y + (ROW - NW_LABEL.height as i32) / 2, &NW_LABEL, label, BONE);

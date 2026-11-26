@@ -1474,7 +1474,20 @@ impl Screen {
                     second: t.second,
                 }),
                 battery: readings.and_then(|r| r.battery).map(|(percent, _, power)| (percent.min(100) as u8, power)),
-                heart: readings.and_then(|r| r.heart_bpm).filter(|_| measuring_heart).map(|bpm| bpm.min(999) as u16),
+                // While a measurement by hand runs, what it says right
+                // now; otherwise, with the Apollo's monitoring on, the
+                // latest value it called valid.
+                heart: readings
+                    .and_then(|r| {
+                        if measuring_heart {
+                            r.heart_bpm
+                        } else if self.settings.heart_monitor != settings::HeartMonitor::Off {
+                            r.heart_last
+                        } else {
+                            None
+                        }
+                    })
+                    .map(|bpm| bpm.min(999) as u16),
                 measuring: measuring_heart,
                 bluetooth: bluetooth_connected,
                 worn,
@@ -2245,6 +2258,7 @@ async fn main_loop(
                 apollo.set_raise_to_wake(settings.raise_to_wake);
                 apollo.set_quiet(settings.quiet.then_some(settings.quiet_time));
                 apollo.set_move_reminder(settings.move_reminder.then_some(settings.move_time));
+                apollo.set_heart_monitor(settings.heart_monitor.mode());
                 if apollo.take_move_reminder() {
                     // The Apollo only says so: the vibration is ours, and
                     // so is leaving the wearer alone in the quiet hours
