@@ -23,7 +23,7 @@ use crate::services::font::Paint;
 use crate::services::font_data::{NW_LABEL, NW_MONO};
 
 /// The most the file's text takes.
-pub const FILE_SIZE: usize = 192;
+pub const FILE_SIZE: usize = 256;
 /// The fixed brightness steps there are.
 pub const LEVELS: u8 = 4;
 /// The times to choose from after which the display goes dark, seconds.
@@ -52,6 +52,9 @@ pub struct Settings {
     pub heart_monitor: HeartMonitor,
     /// How loud sounds are, 0 (quiet) up to `VOLUMES - 1`.
     pub volume: u8,
+    /// Whether things that happen (the charger put on, the battery low,
+    /// the reminder to move) are told by a sound.
+    pub event_sounds: bool,
 }
 
 /// How many steps of loudness there are.
@@ -124,6 +127,7 @@ pub enum Tap {
     NextStepGoal,
     NextHeartMonitor,
     NextVolume,
+    EventSounds,
 }
 
 /// The entry after `now` in `choices`, the first after the last; the
@@ -158,6 +162,7 @@ impl Settings {
         step_goal: 10_000,
         heart_monitor: HeartMonitor::Off,
         volume: 0,
+        event_sounds: false,
     };
 
     /// Whether the quiet hours are on and minute `now` of the day lies
@@ -190,6 +195,8 @@ impl Settings {
                 }
                 ("raise_to_wake", "on") => settings.raise_to_wake = true,
                 ("raise_to_wake", "off") => settings.raise_to_wake = false,
+                ("event_sounds", "on") => settings.event_sounds = true,
+                ("event_sounds", "off") => settings.event_sounds = false,
                 ("quiet", "on") => settings.quiet = true,
                 ("quiet", "off") => settings.quiet = false,
                 ("move_reminder", "on") => settings.move_reminder = true,
@@ -252,6 +259,7 @@ impl Settings {
         let _ = writeln!(into, "step_goal={}", self.step_goal);
         let _ = writeln!(into, "heart_monitor={}", self.heart_monitor.word());
         let _ = writeln!(into, "volume={}", self.volume + 1);
+        let _ = writeln!(into, "event_sounds={}", on(self.event_sounds));
         into.1
     }
 
@@ -278,6 +286,7 @@ impl Settings {
             Tap::NextStepGoal => Settings { step_goal: next(&STEP_GOALS, self.step_goal), ..self },
             Tap::NextHeartMonitor => Settings { heart_monitor: next(&HeartMonitor::ALL, self.heart_monitor), ..self },
             Tap::NextVolume => Settings { volume: (self.volume + 1) % VOLUMES, ..self },
+            Tap::EventSounds => Settings { event_sounds: !self.event_sounds, ..self },
         }
     }
 }

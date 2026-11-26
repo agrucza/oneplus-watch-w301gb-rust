@@ -528,6 +528,9 @@ fn speed_up_card(log: &mut Log) -> bool {
 /// or a button.
 const COMPASS_LIT: Duration = Duration::from_secs(300);
 
+/// The battery counts as low at this many percent.
+const LOW_BATTERY: u32 = 15;
+
 /// The settings file, beside the log.
 const SETTINGS_DIR: &str = "LOG";
 const SETTINGS_FILE: &str = "RUST.CFG";
@@ -2231,6 +2234,14 @@ async fn main_loop(
     let mut log = Log::get();
     let mut last_save = Instant::now();
     let mut measuring_heart = false;
+    // A sound for something that happened, to be played on the next pass.
+    let mut event_sound: Option<usize> = None;
+    // The recording, to be played back on the next pass.
+    let mut replay: Option<usize> = None;
+    // Whether the charger was on at the last look, and whether the low
+    // battery has been told since it got low.
+    let mut was_charging: Option<bool> = None;
+    let mut low_battery_told = false;
     let bindings = Bindings::new();
     let (mut hold, mut taps) = (Hold::new(), Taps::new());
     // When the STM32 switches itself off, after the Apollo was asked to.
@@ -2320,37 +2331,79 @@ async fn main_loop(
         if let (Some(settings), Some(partition)) = (shared::take_changed_settings(), log.partition()) {
             settings_save(partition, &settings, &mut log);
         }
-        // Sound. A request while one plays ends that one; otherwise it
-        // starts the sound asked for. The samples are the player task's
-        // business; when it is through, everything is switched off.
-        if let Some(n) = shared::take_sound() {
-            match (sensors.audio.as_mut(), log.partition()) {
-                (Some((audio, _)), _) if audio.playing() => audio::cut(),
-                (Some((audio, awake)), Some(files)) => {
-                    // The codec's mixer value: from the stock speaker
-                    // test's own, in steps of 6 dB up to 4 dB below full.
-                    let volume = audio::VOLUME_QUIET + 12 * shared::settings().volume.min(3) as u32;
-                    let path = sounds::SOUNDS[n % sounds::SOUNDS.len()].1;
-                    if audio.start(awake, &mut sensors.bus, sensors.image, files, path, volume, &mut log).await {
-                        shared::set_playing(Some(n));
+        // Sound. A tap on the sounds page while one plays ends that one,
+        // otherwise it starts the sound tapped. Something that happened
+        // (`event_sound`) plays its sound if that is switched on, nothing
+        // else is playing and it is not the quiet hours. The samples are
+        // the player task's business; when it is through, everything is
+        // switched off.
+        {
+            let settings = shared::settings();
+            let tapped = shared::take_sound();
+            let quiet_hours = clock::now().is_some_and(|t| settings.quiet_at(t.hour as u16 * 60 + t.minute as u16));
+            let happened = event_sound.take().filter(|_| settings.event_sounds && !quiet_hours);
+            let playing = sensors.audio.as_ref().is_some_and(|(audio, _)| audio.playing());
+            let start = match (tapped, playing) {
+                (Some(_), true) => {
+                    audio::cut();
+                    None
+                }
+                (Some(n), false) => Some(n),
+                (None, false) => replay.take().or(happened),
+                (None, true) => None,
+            };
+            if let Some(n) = start {
+                match (sensors.audio.as_mut(), log.partition()) {
+                    (Some((audio, awake)), Some(files)) => {
+                        // The codec's mixer value: from the stock speaker
+                        // test's own, in steps of 6 dB up to 4 dB below full.
+                        let volume = audio::VOLUME_QUIET + 12 * settings.volume.min(3) as u32;
+                        let started = if n == sounds::RECORD {
+                            audio.record(awake, &mut sensors.bus, sensors.image, files, &mut log).await
+                        } else {
+                            let sound = if n == sounds::REPLAY { audio::Sound::Recording } else { audio::Sound::File(sounds::SOUNDS[n % sounds::SOUNDS.len()].1) };
+                            audio.start(awake, &mut sensors.bus, sensors.image, files, sound, volume, &mut log).await
+                        };
+                        if started {
+                            // The recording's row shows both its halves.
+                            shared::set_playing(Some(n.min(sounds::RECORD)));
+                        }
+                    }
+                    _ => {
+                        let _ = writeln!(log.stamp(), "sound: not on this board revision");
                     }
                 }
-                _ => {
-                    let _ = writeln!(log.stamp(), "sound: not on this board revision");
-                }
+                let _ = log.flush();
             }
-            let _ = log.flush();
         }
         if let Some(outcome) = audio::finished() {
             if let Some((audio, awake)) = sensors.audio.as_mut() {
-                let _ = writeln!(
-                    log.stamp(),
-                    "sound: {} samples sent, the port ran dry {} times{}{}",
-                    outcome.sent,
-                    outcome.dry,
-                    if outcome.cut { "; cut short on request" } else { "" },
-                    if outcome.failed { "; it FAILED (no clock from the codec, or the file)" } else { "" }
-                );
+                if outcome.recorded {
+                    let _ = writeln!(
+                        log.stamp(),
+                        "sound: {} samples recorded, samples lost {} times, largest {} and on average {} of 32768{}{}",
+                        outcome.sent,
+                        outcome.dry,
+                        outcome.peak,
+                        outcome.level,
+                        if outcome.cut { "; cut short on request" } else { "" },
+                        if outcome.failed { "; it FAILED (nothing came from the codec)" } else { "" }
+                    );
+                    // What was recorded is played back next.
+                    if !outcome.failed && !outcome.cut {
+                        replay = Some(sounds::REPLAY);
+                        crate::hal::wake::nudge();
+                    }
+                } else {
+                    let _ = writeln!(
+                        log.stamp(),
+                        "sound: {} samples sent, the port ran dry {} times{}{}",
+                        outcome.sent,
+                        outcome.dry,
+                        if outcome.cut { "; cut short on request" } else { "" },
+                        if outcome.failed { "; it FAILED (no clock from the codec, or the file)" } else { "" }
+                    );
+                }
                 audio.stop(awake, &mut sensors.bus, &mut log);
             }
             shared::set_playing(None);
@@ -2419,6 +2472,32 @@ async fn main_loop(
                     }
                     let alert = alerts::Alert { kind: alerts::Kind::Move, at: now.map(|t| (t.hour, t.minute)) };
                     shared::send(shared::Event::Alert(alert, !quiet));
+                    event_sound = Some(sounds::MESSAGE);
+                }
+                // The charger put on, and the battery getting low: once
+                // each time, with a sound; the low battery also as an
+                // alert, with the same regard for the quiet hours.
+                if let Some((percent, _, charging)) = apollo.readings.battery {
+                    if was_charging == Some(false) && charging {
+                        event_sound = Some(sounds::CHARGING);
+                    }
+                    if was_charging.is_some_and(|was| was != charging) {
+                        let _ = writeln!(log.stamp(), "charger: {}", if charging { "put on" } else { "taken off" });
+                    }
+                    was_charging = Some(charging);
+                    if charging || percent >= LOW_BATTERY + 5 {
+                        low_battery_told = false;
+                    } else if percent <= LOW_BATTERY && !low_battery_told {
+                        low_battery_told = true;
+                        let now = clock::now();
+                        let quiet = now.is_some_and(|t| settings.quiet_at(t.hour as u16 * 60 + t.minute as u16));
+                        if !quiet {
+                            apollo.vibrate(200, 150, 2, &mut log).await;
+                        }
+                        let alert = alerts::Alert { kind: alerts::Kind::LowBattery, at: now.map(|t| (t.hour, t.minute)) };
+                        shared::send(shared::Event::Alert(alert, !quiet));
+                        event_sound = Some(sounds::LOW_BATTERY);
+                    }
                 }
             }
         }
@@ -2434,6 +2513,9 @@ async fn main_loop(
             && !taps.waiting()
             && power_off_at.is_none()
             && !sounding
+            // A sound that waits to be started is started by the next pass.
+            && event_sound.is_none()
+            && replay.is_none()
             && !server.transferring();
         // The Bluetooth link sleeps and the processor may stop, the way
         // the stock app does it (its routines at 0x080969B6 and

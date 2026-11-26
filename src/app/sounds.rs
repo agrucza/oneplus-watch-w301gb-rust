@@ -20,10 +20,22 @@ pub const SOUNDS: [(&str, &str); 6] = [
     ("TEST TONE", "packetA/audio/spkT.wav"),
 ];
 
+/// The row after the sounds: record two seconds from the microphone and
+/// play them back. As a number it follows the sounds'; the one after it
+/// stands for playing the recording.
+pub const RECORD: usize = SOUNDS.len();
+pub const REPLAY: usize = RECORD + 1;
+const ROWS: usize = SOUNDS.len() + 1;
+
+/// The sounds that tell of something, as numbers in `SOUNDS`.
+pub const MESSAGE: usize = 2;
+pub const LOW_BATTERY: usize = 3;
+pub const CHARGING: usize = 4;
+
 const LEFT: i32 = 72;
 const WIDTH: i32 = SIZE - 2 * LEFT;
-const TOP: i32 = 78;
-const ROW: i32 = 48;
+const TOP: i32 = 72;
+const ROW: i32 = 42;
 
 /// The rectangle of row `n`.
 pub fn row_rect(n: usize) -> Rectangle {
@@ -32,7 +44,7 @@ pub fn row_rect(n: usize) -> Rectangle {
 
 /// The sound a tap at (x, y) lands on, if any.
 pub fn tap_at(x: i32, y: i32) -> Option<usize> {
-    (0..SOUNDS.len()).find(|&n| row_rect(n).contains(Point::new(x, y)))
+    (0..ROWS).find(|&n| row_rect(n).contains(Point::new(x, y)))
 }
 
 /// Draw the part of the page that lies in `clip`; `playing` is the sound
@@ -40,7 +52,7 @@ pub fn tap_at(x: i32, y: i32) -> Option<usize> {
 pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, playing: Option<usize>) {
     theme::clear(target, clip);
     theme::title(target, clip, "SOUNDS", GREEN);
-    for (n, (label, _)) in SOUNDS.iter().enumerate() {
+    for (n, label) in SOUNDS.iter().map(|(label, _)| *label).chain(["RECORD 2 S"]).enumerate() {
         let row = row_rect(n);
         // What plays is a plate in green with black on it.
         let ink = if playing == Some(n) {
@@ -56,5 +68,5 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, playing: Option<usize>) 
         target.text(clip, x + 52, y + (height - NW_LABEL.height as i32) / 2, &NW_LABEL, label, ink);
     }
     let hint = if playing.is_some() { "TAP TO STOP" } else { "TAP TO PLAY" };
-    theme::centred(target, clip, TOP + SOUNDS.len() as i32 * ROW + 8, &NW_MONO, hint, CHROME);
+    theme::centred(target, clip, TOP + ROWS as i32 * ROW + 6, &NW_MONO, hint, CHROME);
 }

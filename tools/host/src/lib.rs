@@ -850,7 +850,7 @@ mod settings {
         let mut all = Vec::new();
         for brightness in std::iter::once(None).chain((0..LEVELS).map(Some)) {
             for &display_off_s in &TIMEOUTS {
-                for switches in 0..8 {
+                for switches in 0..16 {
                     all.push(Settings {
                         brightness,
                         display_off_s,
@@ -862,6 +862,7 @@ mod settings {
                         step_goal: 12_000,
                         heart_monitor: HeartMonitor::ALL[switches as usize % 3],
                         volume: switches % 4,
+                        event_sounds: switches & 8 != 0,
                     });
                 }
             }
@@ -1422,12 +1423,13 @@ mod menu {
                     Row::Volume => Some(Hit::Setting(Tap::NextVolume)),
                     Row::Quiet => Some(Hit::Setting(Tap::PickQuietTime)),
                     Row::MoveAlert => Some(Hit::Setting(Tap::PickMoveTime)),
-                    Row::RaiseToWake => None,
+                    Row::RaiseToWake | Row::EventSounds => None,
                 };
                 assert_eq!(hit, expected, "row {n}, list moved {moved}");
                 // On the switch, the rows that have one switch.
                 let switched = match row {
                     Row::RaiseToWake => Some(Hit::Setting(Tap::RaiseToWake)),
+                    Row::EventSounds => Some(Hit::Setting(Tap::EventSounds)),
                     Row::Quiet => Some(Hit::Setting(Tap::Quiet)),
                     Row::MoveAlert => Some(Hit::Setting(Tap::MoveReminder)),
                     _ => expected,
@@ -1493,12 +1495,13 @@ mod wav {
 
 #[cfg(test)]
 mod sounds {
-    use crate::app::sounds::{row_rect, tap_at, SOUNDS};
+    use crate::app::sounds::{row_rect, tap_at, RECORD, SOUNDS};
     use crate::app::theme::{C, SIZE};
 
     #[test]
     fn a_tap_on_a_row_names_its_sound_and_the_rows_are_on_the_glass() {
-        for n in 0..SOUNDS.len() {
+        assert_eq!(RECORD, SOUNDS.len());
+        for n in 0..=RECORD {
             let r = row_rect(n);
             let middle = r.center();
             assert_eq!(tap_at(middle.x, middle.y), Some(n));

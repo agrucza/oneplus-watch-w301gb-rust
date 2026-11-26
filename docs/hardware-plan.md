@@ -1256,7 +1256,60 @@ launcher lists six of them (alarm, call, message, low battery,
 charging, test tone); a tap plays one, a tap while one plays ends it.
 Volume is a setting now (line `volume=` in the file, a row in the
 settings app): four steps of 6 dB, from the stock speaker test's value
-(0x54) to 4 dB below full (0x78). No sound is tied to an event yet.
+(0x54) to 4 dB below full (0x78).
+
+**Sounds for what happens (2026-11-26; built, not yet tried on the
+watch).** A switch "event sounds" in the settings app (line
+`event_sounds=`, off unless switched on): the charger put on plays
+`connect_charging.wav`, the battery at 15 % or less plays
+`low_battery.wav` (once, and again only after it was charged or back at
+20 %; it is also an alert in the list, with the vibration), the
+reminder to move plays `sms.wav` with its vibration. None of them in
+the quiet hours, and none while another sound plays.
+
+**The microphone (2026-11-26; read and built, not yet tried on the
+watch).** Read in the stock app: its only plain recording is the
+factory's microphone test (`wav_recorder`, 0x080BE440, and 0x080BE39A),
+which loads nothing but the codec's settings for playing at 48 kHz
+(`switch_state(1, 7)`; the earlier note here said the voice branch,
+which was wrong): that file already switches the input IN1L on, analog
+with +15 dB, a 40 Hz high-pass, the microphone's supply, and routes it
+to both slots of the codec's second audio port. No DSP program, no
+voice file, no amplifier. The voice files are for calls only: there
+the microphone goes through the codec's DSP to the Bluetooth chip and
+not to the STM32 at all. On the STM32: SAI1 block B, a slave receiver
+that goes by block A's clock and frame, PB5 (AF13), mono mode, FIFO
+threshold 3/4, DMA2 channel 2 (request 37); stock records two seconds
+of 48 kHz in one channel to `0:tone/micRec.wav` and plays that back.
+Built here the same way: a row "record 2 s" on the sounds page; the
+codec comes up with the playing settings and without the amplifier,
+block B is started and then block A (the order of the stock app's loop
+test, 0x080BE81C; the HAL switches a block on when it is made, so A
+cannot stay off as in the stock app's plain recording), the first
+0.2 s are dropped, 96,000 samples go into the PSRAM at 0x6080_0000,
+the log tells the largest and the mean sample, and then the recording
+is played through the speaker.
+
+On the watch the same evening: three recordings, 96,000 samples each,
+none lost, and the voice came back from the speaker, but faint: the
+largest sample was 1,076 to 1,191 of 32,768 (29 dB below full) at the
+file's +15 dB. Changed after that (not yet tried): the input at +31 dB
+for a recording (0x310 = 0x80BE, as the stock app's second set of
+voice files has it), and a recording is played back up to 8 times as
+loud, until its largest sample is 3 dB below full. The charger's sound
+played six times; with the display dark it came late, because a sound
+set while the Apollo's messages are read was started by the next pass
+of the main loop, and that pass waited: now it does not wait.
+
+Tried: at +31 dB two recordings had 6,390 and 10,142 as their largest
+sample, so the input does not clip; played 3 and 2 times as loud at
+the loudest volume they sounded a little overdriven. The aim for
+playing back is now 9 dB below full, which leaves recordings like
+these as they are. The charger's sound now starts 29 ms after the
+Apollo's report, with the display dark too.
+
+With that the user found the played-back recording pretty good
+(2026-11-26).
 
 ### 3.7 NFC (item 9) - L, low priority
 

@@ -18,6 +18,8 @@ use crate::services::font_data::{NW_LABEL, NW_MONO};
 pub enum Kind {
     /// The Apollo's sedentary reminder: sitting for long.
     Move,
+    /// The battery has got low.
+    LowBattery,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,6 +58,7 @@ impl Alerts {
 fn look(kind: Kind) -> (Rgb565, &'static str, &'static str) {
     match kind {
         Kind::Move => (GREEN, "TIME TO MOVE", "SITTING FOR A WHILE"),
+        Kind::LowBattery => (YELLOW, "LOW BATTERY", "CHARGE SOON"),
     }
 }
 

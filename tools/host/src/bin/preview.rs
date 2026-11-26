@@ -111,6 +111,7 @@ fn main() {
             let mut alerts = Alerts::new();
             alerts.add(Alert { kind: Kind::Move, at: Some((11, 2)) });
             alerts.add(Alert { kind: Kind::Move, at: Some((15, 40)) });
+            alerts.add(Alert { kind: Kind::LowBattery, at: Some((17, 5)) });
             w301_host::app::alerts::draw(&mut frame, &whole, &alerts)
         }
         Some("faces") => panels::draw(&mut frame, &whole, Page::Faces),

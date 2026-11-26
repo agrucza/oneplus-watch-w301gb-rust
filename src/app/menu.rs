@@ -28,9 +28,10 @@ pub enum Row {
     StepGoal,
     HeartMonitor,
     Volume,
+    EventSounds,
 }
 
-pub const ROWS: [Row; 9] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::Volume, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal, Row::HeartMonitor];
+pub const ROWS: [Row; 10] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::Volume, Row::EventSounds, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal, Row::HeartMonitor];
 
 /// The left edge and the width of the rows, and the height of one.
 const LEFT: i32 = 66;
@@ -87,11 +88,12 @@ pub fn tap_at(x: i32, y: i32, moved: i32) -> Option<Hit> {
         (Row::HeartMonitor, _) => Hit::Setting(Tap::NextHeartMonitor),
         (Row::Volume, _) => Hit::Setting(Tap::NextVolume),
         (Row::RaiseToWake, true) => Hit::Setting(Tap::RaiseToWake),
+        (Row::EventSounds, true) => Hit::Setting(Tap::EventSounds),
         (Row::Quiet, true) => Hit::Setting(Tap::Quiet),
         (Row::MoveAlert, true) => Hit::Setting(Tap::MoveReminder),
         (Row::Quiet, false) => Hit::Setting(Tap::PickQuietTime),
         (Row::MoveAlert, false) => Hit::Setting(Tap::PickMoveTime),
-        (Row::RaiseToWake, false) => return None,
+        (Row::RaiseToWake | Row::EventSounds, false) => return None,
     })
 }
 
@@ -158,6 +160,7 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, settings: &Settings, mov
                 ("DISPLAY OFF", None)
             }
             Row::RaiseToWake => ("RAISE TO WAKE", Some(settings.raise_to_wake)),
+            Row::EventSounds => ("EVENT SOUNDS", Some(settings.event_sounds)),
             Row::Quiet => {
                 time(&mut value, settings.quiet_time);
                 ("QUIET", Some(settings.quiet))

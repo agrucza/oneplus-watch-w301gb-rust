@@ -39,6 +39,10 @@ pub const FRAMEBUFFER: usize = BASE + 0x00C0_0000;
 /// 0x080ABBD8 in B.70). Nine of them fit before the end of the memory.
 pub const FRAME_SPACING: usize = 0x0007_1800;
 const _: () = assert!(FRAMEBUFFER + 9 * FRAME_SPACING <= BASE + SIZE);
+/// Where a recording from the microphone is kept (`drivers::audio`), and
+/// how many bytes it may have; below the frames, used by nothing else.
+pub const RECORDING: usize = BASE + 0x0080_0000;
+pub const RECORDING_SIZE: usize = 0x0004_0000;
 
 const GPIOE: usize = 0x4800_1000;
 const CRE_PIN: u32 = 2;

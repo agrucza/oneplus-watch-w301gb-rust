@@ -66,7 +66,7 @@ use embassy_stm32::sai::{self, Sai};
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_stm32::{bind_interrupts, dma, peripherals, Peri};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -75,12 +75,14 @@ use embassy_time::{with_timeout, Duration, Timer};
 
 use crate::boot::watchdog;
 use crate::drivers::light::Bus;
+use crate::drivers::psram;
 use crate::services::log::Log;
 use crate::services::storage::{self, Partition};
 use crate::services::wav::{self, Wav};
 
 bind_interrupts!(struct Irqs {
     DMA2_CHANNEL1 => dma::InterruptHandler<peripherals::DMA2_CH1>;
+    DMA2_CHANNEL2 => dma::InterruptHandler<peripherals::DMA2_CH2>;
 });
 
 pub struct Resources {
@@ -104,6 +106,9 @@ pub struct Port {
     pub frame: Peri<'static, peripherals::PA9>,
     pub data: Peri<'static, peripherals::PA10>,
     pub dma: Peri<'static, peripherals::DMA2_CH1>,
+    /// The microphone's samples from the codec (block B of the port).
+    pub input: Peri<'static, peripherals::PB5>,
+    pub input_dma: Peri<'static, peripherals::DMA2_CH2>,
 }
 
 /// The codec's and the amplifier's side, without the port.
@@ -128,14 +133,68 @@ struct Live {
     _amplifier_supply: Output<'static>,
     _amplifier_reset: Output<'static>,
     _codec_reset: Output<'static>,
+    /// The amplifier was started (not so for a recording).
+    amplifier: bool,
 }
 
-/// A sound for the player task: the file and where its samples are.
+/// What to play.
 #[derive(Clone, Copy)]
-struct Job {
-    volume: Partition,
-    path: &'static str,
-    wav: Wav,
+pub enum Sound {
+    /// A WAV file on the image volume.
+    File(&'static str),
+    /// What was last recorded from the microphone.
+    Recording,
+}
+
+/// Work for the player task.
+#[derive(Clone, Copy)]
+enum Job {
+    /// A file's samples, at the place the head names.
+    File(Partition, &'static str, Wav),
+    /// The recording in memory.
+    Recording(Wav),
+    /// Record from the microphone.
+    Record,
+}
+
+/// A recording: 48 kHz, one channel, as the stock app's own microphone
+/// test records (0x080BE402), and two seconds as there (0x080BE61C). The
+/// first fifth of a second is left out: the microphone's supply and the
+/// input's high-pass filter settle in it (the stock app keeps it).
+const RECORD_RATE: u32 = 48_000;
+const RECORD_SAMPLES: usize = 2 * RECORD_RATE as usize;
+const RECORD_SKIP: usize = RECORD_RATE as usize / 5;
+const _: () = assert!(RECORD_SAMPLES * 2 <= psram::RECORDING_SIZE);
+/// How many samples the recording in memory has.
+static RECORDED: AtomicU32 = AtomicU32::new(0);
+/// Its largest sample, by which it is made louder when played.
+static RECORDED_PEAK: AtomicU32 = AtomicU32::new(0);
+/// The microphone input's register (IN1L control) and its value for
+/// recording: analog, +31 dB. The codec's file for playing has +15 dB
+/// (0x809E), at which speech from an arm's length reached 1,100 of
+/// 32,768 at most (measured 2026-11-26); +31 dB is what the stock app's
+/// second set of voice files has (0x80BE). The file's value is replaced
+/// as the file is written, since the gain is not to change while the
+/// input is on (datasheet).
+const INPUT_REGISTER: u32 = 0x0310;
+const INPUT_RECORDING: u32 = 0x80BE;
+/// Played back, a recording is made louder until its largest sample is
+/// at this (9 dB below full), by this factor at most. At 3 dB below
+/// full, speech sounded overdriven from the speaker at the loudest
+/// volume, though the recording was far from full (heard 2026-11-26).
+const REPLAY_PEAK: u32 = 11_500;
+const REPLAY_MOST: u32 = 8;
+
+/// The factor a recording is played back with.
+fn replay_gain() -> u32 {
+    (REPLAY_PEAK / RECORDED_PEAK.load(Ordering::Relaxed).max(1)).clamp(1, REPLAY_MOST)
+}
+
+/// The recording's place in memory.
+///
+/// Safety: for the player task alone, one use at a time.
+unsafe fn recording() -> &'static mut [i16] {
+    core::slice::from_raw_parts_mut(psram::RECORDING as *mut i16, RECORD_SAMPLES)
 }
 
 /// How a sound went.
@@ -149,6 +208,12 @@ pub struct Outcome {
     pub failed: bool,
     /// It was cut short on request.
     pub cut: bool,
+    /// It was a recording, of `sent` samples; `dry` then counts the times
+    /// samples were lost.
+    pub recorded: bool,
+    /// A recording's largest sample and the mean of all (without sign).
+    pub peak: u16,
+    pub level: u16,
 }
 
 static JOB: Signal<CriticalSectionRawMutex, Job> = Signal::new();
@@ -315,22 +380,34 @@ impl Audio {
     /// again. True if the sound is on its way: then `stop` has to follow
     /// once `finished` says so.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, image: Partition, files: Partition, path: &'static str, volume: u32, log: &mut Log) -> bool {
+    pub async fn start(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, image: Partition, files: Partition, sound: Sound, volume: u32, log: &mut Log) -> bool {
         if self.live.is_some() {
             return false;
         }
-        let _ = writeln!(log.stamp(), "sound: {} at volume {:#06x}", path, volume);
-        // What the file holds.
-        let mut head = [0u8; 1024];
-        let wav = match storage::FileReader::open(image, path) {
-            Ok(mut reader) => {
-                let n = reader.read(&mut head).unwrap_or(0);
-                reader.close();
-                wav::parse(&head[..n])
+        let (path, wav) = match sound {
+            Sound::File(path) => {
+                // What the file holds.
+                let mut head = [0u8; 1024];
+                let wav = match storage::FileReader::open(image, path) {
+                    Ok(mut reader) => {
+                        let n = reader.read(&mut head).unwrap_or(0);
+                        reader.close();
+                        wav::parse(&head[..n])
+                    }
+                    Err(_) => None,
+                };
+                (path, wav.filter(|w| w.bits == 16 && (1..=2).contains(&w.channels)))
             }
-            Err(_) => None,
+            Sound::Recording => {
+                let samples = RECORDED.load(Ordering::Relaxed);
+                ("the recording", (samples > 0).then_some(Wav { channels: 1, rate: RECORD_RATE, bits: 16, data_at: 0, data_len: samples * 2 }))
+            }
         };
-        let Some(wav) = wav.filter(|w| w.bits == 16 && (1..=2).contains(&w.channels)) else {
+        let _ = writeln!(log.stamp(), "sound: {} at volume {:#06x}", path, volume);
+        if matches!(sound, Sound::Recording) {
+            let _ = writeln!(log.stamp(), "sound: the recording is played {} times as loud as recorded", replay_gain());
+        }
+        let Some(wav) = wav else {
             let _ = writeln!(log.stamp(), "sound: {} is not there, or no WAV file of 16-bit samples in one or two channels", path);
             return false;
         };
@@ -338,6 +415,50 @@ impl Audio {
             let _ = writeln!(log.stamp(), "sound: {} Hz; the codec has settings for 48000 and 44100 only", wav.rate);
             return false;
         };
+        let mut live = self.up(codec_awake, true).await;
+        let ready = chain(&mut live.codec, &mut live.select, bus, image, files, codec_file, wav.rate, volume, true, None, log).await;
+        self.live = Some(live);
+        if !ready {
+            self.stop(codec_awake, bus, log);
+            return false;
+        }
+        CUT.store(false, Ordering::Relaxed);
+        DONE.reset();
+        JOB.signal(match sound {
+            Sound::File(path) => Job::File(image, path, wav),
+            Sound::Recording => Job::Recording(wav),
+        });
+        true
+    }
+
+    /// Bring the codec up and have the player task record two seconds
+    /// from the microphone into memory, as the stock app's microphone
+    /// test does (0x080BE39A): the codec with the settings it has for
+    /// playing at 48 kHz, which put the microphone on its second audio
+    /// port, and nothing else; the amplifier stays off. True if the
+    /// recording is on its way: then `stop` has to follow once `finished`
+    /// says so.
+    pub async fn record(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, image: Partition, files: Partition, log: &mut Log) -> bool {
+        if self.live.is_some() {
+            return false;
+        }
+        let _ = writeln!(log.stamp(), "sound: recording from the microphone");
+        let mut live = self.up(codec_awake, false).await;
+        let ready = chain(&mut live.codec, &mut live.select, bus, image, files, CODEC_FILES[0].1, RECORD_RATE, VOLUME_QUIET, false, Some(INPUT_RECORDING), log).await;
+        self.live = Some(live);
+        if !ready {
+            self.stop(codec_awake, bus, log);
+            return false;
+        }
+        CUT.store(false, Ordering::Relaxed);
+        DONE.reset();
+        JOB.signal(Job::Record);
+        true
+    }
+
+    /// Supplies, clock and buses on, in the stock app's order
+    /// (0x080A9B88); `amplifier` says whether it will be started.
+    async fn up(&mut self, codec_awake: &mut Output<'static>, amplifier: bool) -> Live {
 
         // Safety: the pins and peripherals are this driver's own, and
         // nothing made of them is alive (`live` is `None`).
@@ -368,18 +489,7 @@ impl Audio {
         amplifier_reset.set_low();
         Timer::after_millis(15).await;
         watchdog::feed();
-        let mut live = Live { codec, select, _clock: clock, _amplifier_supply: amplifier_supply, _amplifier_reset: amplifier_reset, _codec_reset: codec_reset };
-
-        let ready = chain(&mut live.codec, &mut live.select, bus, image, files, codec_file, wav.rate, volume, log).await;
-        self.live = Some(live);
-        if !ready {
-            self.stop(codec_awake, bus, log);
-            return false;
-        }
-        CUT.store(false, Ordering::Relaxed);
-        DONE.reset();
-        JOB.signal(Job { volume: image, path, wav });
-        true
+        Live { codec, select, _clock: clock, _amplifier_supply: amplifier_supply, _amplifier_reset: amplifier_reset, _codec_reset: codec_reset, amplifier }
     }
 
     /// Take codec and amplifier down again (0x080A9A78): the amplifier
@@ -389,11 +499,16 @@ impl Audio {
         let Some(live) = self.live.take() else {
             return;
         };
-        let muted = amplifier_change(bus, 0x08, 0, 1);
-        let down = amplifier_change(bus, 0x04, 0, 1);
+        let amplifier = live.amplifier;
+        let muted = amplifier && amplifier_change(bus, 0x08, 0, 1);
+        let down = amplifier && amplifier_change(bus, 0x04, 0, 1);
         codec_awake.set_low();
         drop(live);
         watchdog::feed();
+        if !amplifier {
+            let _ = writeln!(log.stamp(), "sound: codec and clock off");
+            return;
+        }
         let _ = writeln!(
             log.stamp(),
             "sound: amplifier {} and {}, codec and clock off",
@@ -403,10 +518,11 @@ impl Audio {
     }
 }
 
-/// Codec set up for `rate`, amplifier started and unmuted. Leaves the
+/// Codec set up for `rate` and, with `amplifier`, the amplifier started
+/// and unmuted. Leaves the
 /// amplifier as it is if a step fails; the caller takes everything down.
 #[allow(clippy::too_many_arguments)]
-async fn chain(codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus, image: Partition, files: Partition, codec_file: &str, rate: u32, volume: u32, log: &mut Log) -> bool {
+async fn chain(codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus, image: Partition, files: Partition, codec_file: &str, rate: u32, volume: u32, amplifier: bool, input: Option<u32>, log: &mut Log) -> bool {
     let id = codec_read(codec, select, 0);
     if id != 0x6370 {
         let _ = writeln!(log.stamp(), "sound: the codec's register 0 reads {:#06x}, not 0x6370", id);
@@ -427,6 +543,8 @@ async fn chain(codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus,
     for (n, record) in settings[4..].chunks_exact(8).enumerate() {
         let address = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
         let value = u32::from_be_bytes([record[4], record[5], record[6], record[7]]);
+        // The microphone's gain, where another than the file's is wanted.
+        let value = input.filter(|_| address == INPUT_REGISTER).unwrap_or(value);
         taken &= codec_write(codec, select, address, value);
         if n == 0 {
             // The first record resets the codec.
@@ -445,8 +563,8 @@ async fn chain(codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus,
     watchdog::feed();
     let status = codec_read(codec, select, 0x1881);
     let _ = writeln!(log.stamp(), "sound: codec settings {} for {} Hz, clock status {:#06x}, volume {:#06x}", if taken { "taken" } else { "NOT all taken" }, rate, status, codec_read(codec, select, 0x0703));
-    if !taken {
-        return false;
+    if !taken || !amplifier {
+        return taken;
     }
 
     // The amplifier, muted until the end.
@@ -537,49 +655,138 @@ pub async fn player(port: Port) -> ! {
     // Safety: there is one player task, and nothing else uses this.
     let ring = unsafe { &mut *core::ptr::addr_of_mut!(RING) };
     loop {
-        let job = JOB.wait().await;
-        let outcome = send(&port, ring, &job).await;
+        let outcome = match JOB.wait().await {
+            Job::File(volume, path, wav) => send(&port, ring, Some((volume, path)), &wav).await,
+            Job::Recording(wav) => send(&port, ring, None, &wav).await,
+            Job::Record => record(&port, ring).await,
+        };
         DONE.signal(outcome);
         // The main task may be waiting for something else.
         crate::hal::wake::nudge();
     }
 }
 
-/// Send one file's samples.
-async fn send(port: &Port, ring: &mut [u16], job: &Job) -> Outcome {
-    let mut outcome = Outcome { sent: 0, dry: 0, failed: false, cut: false };
-    // Safety: the port is this task's own, and what is made of it here is
-    // gone again when this returns.
-    let (sai1, clock, frame, data, channel) = unsafe { (port.port.clone_unchecked(), port.clock.clone_unchecked(), port.frame.clone_unchecked(), port.data.clone_unchecked(), port.dma.clone_unchecked()) };
-    let (block, _) = sai::split_subblocks(sai1);
+/// The port's frame, the same for both directions: two slots of 16 bits
+/// in 32 clocks, the frame signal low first and a bit early, the clocks
+/// the codec's.
+fn frame(direction: sai::TxRx, stereo_mono: sai::StereoMono, threshold: sai::FifoThreshold) -> sai::Config {
     let mut config = sai::Config::default();
     config.mode = sai::Mode::Slave;
-    config.tx_rx = sai::TxRx::Transmitter;
+    config.tx_rx = direction;
     config.protocol = sai::Protocol::Free;
     config.slot_size = sai::SlotSize::Channel16;
     config.data_size = sai::DataSize::Data16;
-    // A one-channel sound goes out on both slots.
-    config.stereo_mono = if job.wav.channels == 1 { sai::StereoMono::Mono } else { sai::StereoMono::Stereo };
+    config.stereo_mono = stereo_mono;
     config.bit_order = sai::BitOrder::MsbFirst;
     config.frame_sync_offset = sai::FrameSyncOffset::BeforeFirstBit;
     config.frame_sync_polarity = sai::FrameSyncPolarity::ActiveLow;
     config.frame_sync_definition = sai::FrameSyncDefinition::ChannelIdentification;
     config.frame_length = 32;
-    // Our data changes on the falling edge of the clock and is taken on
-    // the rising one.
+    // Data changes on the falling edge of the clock and is taken on the
+    // rising one.
     config.clock_strobe = sai::ClockStrobe::Rising;
-    config.fifo_threshold = sai::FifoThreshold::Quarter;
-    let mut out: Sai<'_, u16> = Sai::new_asynchronous(block, clock, data, frame, channel, Irqs, ring, config);
+    config.fifo_threshold = threshold;
+    config
+}
 
-    let Ok(mut reader) = storage::FileReader::open(job.volume, job.path) else {
-        outcome.failed = true;
-        return outcome;
+/// Record from the microphone into memory. The codec sends its samples
+/// in both slots of the frame; block B of the port, which goes by block
+/// A's clock and frame pins, keeps the first (mono mode), as the stock
+/// app has it (0x0809025A). Block B is started first and block A, which
+/// sends nothing, after it: the order of the stock app's loop test
+/// (0x080BE81C); the HAL switches a block on when it is made.
+async fn record(port: &Port, ring: &mut [u16]) -> Outcome {
+    let mut outcome = Outcome { sent: 0, dry: 0, failed: false, cut: false, recorded: true, peak: 0, level: 0 };
+    RECORDED.store(0, Ordering::Relaxed);
+    static mut IDLE: [u16; 64] = [0; 64];
+    // Safety: the port and these buffers are this task's own, and what is
+    // made of them here is gone again when this returns.
+    let idle = unsafe { &mut *core::ptr::addr_of_mut!(IDLE) };
+    let memory = unsafe { recording() };
+    let (sai1, clock, frame_pin, data, channel) = unsafe { (port.port.clone_unchecked(), port.clock.clone_unchecked(), port.frame.clone_unchecked(), port.data.clone_unchecked(), port.dma.clone_unchecked()) };
+    let (input, input_channel) = unsafe { (port.input.clone_unchecked(), port.input_dma.clone_unchecked()) };
+    let (block_a, block_b) = sai::split_subblocks(sai1);
+    let mut receiver: Sai<'_, u16> = Sai::new_synchronous(block_b, input, input_channel, Irqs, ring, frame(sai::TxRx::Receiver, sai::StereoMono::Mono, sai::FifoThreshold::ThreeQuarters));
+    receiver.start();
+    let _sender: Sai<'_, u16> = Sai::new_asynchronous(block_a, clock, data, frame_pin, channel, Irqs, idle, frame(sai::TxRx::Transmitter, sai::StereoMono::Mono, sai::FifoThreshold::Quarter));
+
+    let mut piece = [0u16; 1024];
+    let mut skip = RECORD_SKIP;
+    let mut kept = 0usize;
+    let mut sum = 0u64;
+    while kept < memory.len() {
+        if CUT.load(Ordering::Relaxed) {
+            outcome.cut = true;
+            break;
+        }
+        // Without the codec's clocks nothing arrives: half a second is
+        // the most a piece gets. Samples lost because they were not
+        // fetched in time are an error of the read, counted.
+        match with_timeout(Duration::from_millis(500), receiver.read(&mut piece)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                outcome.dry += 1;
+                if outcome.dry > 20 {
+                    outcome.failed = true;
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {
+                outcome.failed = true;
+                break;
+            }
+        }
+        let fresh = &piece[skip.min(piece.len())..];
+        skip = skip.saturating_sub(piece.len());
+        let n = fresh.len().min(memory.len() - kept);
+        for (to, from) in memory[kept..kept + n].iter_mut().zip(fresh) {
+            let sample = *from as i16;
+            *to = sample;
+            outcome.peak = outcome.peak.max(sample.unsigned_abs());
+            sum += sample.unsigned_abs() as u64;
+        }
+        kept += n;
+        watchdog::feed();
+    }
+    drop(receiver);
+    outcome.sent = kept as u32;
+    outcome.level = if kept > 0 { (sum / kept as u64) as u16 } else { 0 };
+    if !outcome.failed {
+        RECORDED_PEAK.store(outcome.peak as u32, Ordering::Relaxed);
+        RECORDED.store(kept as u32, Ordering::Relaxed);
+    }
+    outcome
+}
+
+/// Send a sound's samples: a file's, or with no file the recording's.
+async fn send(port: &Port, ring: &mut [u16], file: Option<(Partition, &'static str)>, wav: &Wav) -> Outcome {
+    let mut outcome = Outcome { sent: 0, dry: 0, failed: false, cut: false, recorded: false, peak: 0, level: 0 };
+    // Safety: the port is this task's own, and what is made of it here is
+    // gone again when this returns.
+    let (sai1, clock, frame_pin, data, channel) = unsafe { (port.port.clone_unchecked(), port.clock.clone_unchecked(), port.frame.clone_unchecked(), port.data.clone_unchecked(), port.dma.clone_unchecked()) };
+    let (block, _) = sai::split_subblocks(sai1);
+    // A one-channel sound goes out on both slots.
+    let config = frame(sai::TxRx::Transmitter, if wav.channels == 1 { sai::StereoMono::Mono } else { sai::StereoMono::Stereo }, sai::FifoThreshold::Quarter);
+    let mut out: Sai<'_, u16> = Sai::new_asynchronous(block, clock, data, frame_pin, channel, Irqs, ring, config);
+
+    let mut reader = match file {
+        Some((volume, path)) => match storage::FileReader::open(volume, path) {
+            Ok(reader) => Some(reader),
+            Err(_) => {
+                outcome.failed = true;
+                return outcome;
+            }
+        },
+        None => None,
     };
+    // Safety: the recording is this task's own.
+    let memory = unsafe { recording() };
     let mut bytes = [0u8; 4096];
     let mut samples = [0u16; 2048];
     // Past the file's head, to where the samples begin.
-    let mut skip = job.wav.data_at as usize;
-    while skip > 0 && !outcome.failed {
+    let mut skip = wav.data_at as usize;
+    while let Some(reader) = reader.as_mut().filter(|_| skip > 0 && !outcome.failed) {
         let n = skip.min(bytes.len());
         outcome.failed = reader.read(&mut bytes[..n]).unwrap_or(0) != n;
         skip -= n;
@@ -603,26 +810,42 @@ async fn send(port: &Port, ring: &mut [u16], job: &Job) -> Outcome {
     // HAL's rule for sending): a little silence.
     outcome.failed |= !push(&mut out, &[0u16; 2048], &mut outcome.dry).await;
     out.start();
-    let mut left = job.wav.data_len as usize;
+    let mut left = wav.data_len as usize;
     while left > 0 && !outcome.failed {
         if CUT.load(Ordering::Relaxed) {
             outcome.cut = true;
             break;
         }
         let want = left.min(bytes.len());
-        let n = reader.read(&mut bytes[..want]).unwrap_or(0) / 2;
+        let n = match reader.as_mut() {
+            Some(reader) => {
+                let n = reader.read(&mut bytes[..want]).unwrap_or(0) / 2;
+                for (sample, pair) in samples.iter_mut().zip(bytes.chunks_exact(2)) {
+                    *sample = u16::from_le_bytes([pair[0], pair[1]]);
+                }
+                n
+            }
+            None => {
+                let at = outcome.sent as usize;
+                let n = (want / 2).min(memory.len().saturating_sub(at));
+                let gain = replay_gain() as i32;
+                for (sample, from) in samples.iter_mut().zip(&memory[at..at + n]) {
+                    *sample = (*from as i32 * gain).clamp(-32768, 32767) as i16 as u16;
+                }
+                n
+            }
+        };
         if n == 0 {
             break;
-        }
-        for (sample, pair) in samples.iter_mut().zip(bytes.chunks_exact(2)) {
-            *sample = u16::from_le_bytes([pair[0], pair[1]]);
         }
         outcome.failed |= !push(&mut out, &samples[..n], &mut outcome.dry).await;
         outcome.sent += n as u32;
         left -= n * 2;
         watchdog::feed();
     }
-    reader.close();
+    if let Some(reader) = reader {
+        reader.close();
+    }
     // Silence until what was sent has left the buffer.
     for _ in 0..5 {
         if outcome.failed {
