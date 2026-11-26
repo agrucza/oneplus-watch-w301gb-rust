@@ -10,6 +10,7 @@
 #   tools/ota.sh log        fetch 3:log/rust.log into target/rust.log and show its end
 #   tools/ota.sh oldlog     fetch 3:log/rust.old (the log before the last fresh start) into target/rust.old
 #   tools/ota.sh clock      compare the watch's clock with this computer's (appends to target/clock.txt)
+#   tools/ota.sh put FILE NAME   put a small file into 3:log/ under a short name (Rust app only)
 #
 # `send` finds out which firmware is running. To the Rust app it sends a
 # compact package over a single connection (a few seconds). To the stock app
@@ -70,6 +71,9 @@ send)
     elif [ "$rc" != 0 ]; then
         exit "$rc"
     fi
+    ;;
+put) # a small file the firmware reads but does not carry
+    python3 tools/put.py "${2:?file}" "${3:?name}"
     ;;
 log) # fetch the Rust app's log (works with either firmware) and show its end
     bt pull 3:log/rust.log target/rust.log

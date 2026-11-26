@@ -1073,7 +1073,7 @@ Steps:
 Risk: the largest single driver in the stock app. The codec needs its
 register file in the right order before it makes a sound.
 
-**First contact, measured 2026-11-26** (`drivers::probe`, run at
+**First contact, measured 2026-11-26** (a probe run at
 start, each chip as the stock app approaches it, on the first try):
 the codec's register 0 reads 0x6370, so it is the CS47L15 and SPI2,
 PB1, PB6 and the 3 MHz clock are right; the amplifier's register 0
@@ -1082,7 +1082,7 @@ Awinic AW8896 and PG6 was what it lacked; the NFC controller took the
 core reset (see 3.7). All three were switched off again afterwards.
 
 **Read in the stock app B.70, 2026-11-26** (addresses in
-`drivers::probe`):
+the notes kept outside the repository):
 
 - The codec's control bus is SPI2 (PB10, PC1, PC2, chip select PB12;
   mode 0, 7.5 MHz). A transfer is four address bytes, top bit set for
@@ -1166,6 +1166,75 @@ reading notes; nothing of this is built yet):
   patch for the ROM must not be written; the codec's volume has to be
   set after its file, which resets it to 0 dB.
 
+**The amplifier's patch, looked up 2026-11-26.** The maker's Linux
+driver for this chip is public (github.com/awinic-driver/aw8896, GPL 2
+or later, 2017 to 2019) and does what the stock app does, value for
+value: chip ID 0x0310, the patch to memory 0x8C00, the settings to
+0x8380, the ROM version at 0x0F80 and 0x0F81 (0 or 0xDEAC97D6), all
+through registers 0x40 and 0x41 in pieces of 128 bytes with the byte
+pairs swapped, the PLL checked before and the watchdog register after.
+It loads four files it does not contain: `aw8896_fw_d.bin` (ROM
+version 0) or `aw8896_fw_e.bin` (0xDEAC97D6), `aw8896_cfg.bin` and
+`aw8896_reg.bin`; without them it stays muted, so there is no playing
+without a patch. A second public repository of the maker's
+(awinic-driver/aw889x, for the same chip ID, 2018) does contain two
+such files: a patch of 368 bytes and settings of 124. Compared with the
+stock app's: that patch is neither of the stock app's two (308 and 412
+bytes), but begins like the one for ROM version 0 and jumps to the same
+six ROM addresses, so it is another revision for that ROM and of no use
+on a chip of the other version; the settings have the same size and
+layout and other values (another speaker's tuning). Proposed, not
+yet decided by the user: no patch in this repository, but read from
+files on the watch's storage, as the Linux driver reads its files.
+Which patch that has to be depends on the chip's ROM version, which a probe at start
+reads at start (the codec's playback file in, the amplifier clocked,
+kept muted, nothing loaded, nothing played). Measured 2026-11-26: the
+codec started again 1 ms after its file's reset and took all 102
+settings (system clock register 0x0444, status 0x1881 = 0x0100, which
+is its FLL locked, volume 0x0040); the amplifier took its format and
+table and reported status 0x0311, its PLL locked to the codec's bit
+clock; its ROM version reads 0xDEAC97D6, the one patch "e" is for. So
+the public patch (for the other ROM) is of no use here and the one to
+load is the stock app's 412 bytes. The watchdog register read 0, as it
+should with nothing loaded.
+
+**First sound (`drivers::audio`, 2026-11-26).** First try on the watch:
+both files put on the watch with the new command; codec settings
+taken, clock locked; amplifier ROM 0xDEAC97D6, patch (412 bytes) and
+settings loaded, its watchdog register counting (0x19, 0x1F), up and
+unmuted with status 0x1311; then no samples went out, because the
+HAL's buffer for sending has to be filled before the port is started
+and reports the port running dry as an error of the next write. The
+user heard at most a very faint noise. Corrected: silence into the buffer first, then start, and a dry port
+is counted and carried on from. With that the speaker played, the
+same evening: the user heard the test tone (a sweep); 68,349 samples
+sent in 1.5 s, the port never dry, the amplifier's status 0x1311 before
+and after, everything off again afterwards; twice in a row. So the
+whole chain is right as read: the codec's second port is the STM32,
+its first feeds the amplifier, and the patch cut from the stock app
+runs on this chip's ROM. Not judged: the pitch (the 2.3 % of the
+codec file's clock settings). Agreed with the user: the amplifier's patch and settings
+are not in this repository but files on the watch, read when a sound
+starts: `3:log/AW8896FE.BIN` (the patch for this chip's ROM; `...FD.BIN`
+would be the other) and `3:log/AW8896CF.BIN`, cut once from the user's
+own copy of the stock app outside the repository and put there with
+`tools/ota.sh put FILE NAME` (a new command of the update server,
+`AT^W301PUT`, for files of up to 440 bytes in the log folder). A tile
+"sound" in the launcher plays the factory's speaker test tone
+(`packetA/audio/spkT.wav`, 48 kHz, one channel, 1.4 s) once: codec and
+amplifier up in the stock app's order, the codec's playback file, the
+volume at the stock speaker test's own value (0x54, 22 dB below full),
+the amplifier's table, PLL, ROM version, patch and settings, watchdog,
+power up, unmute, the samples through SAI1 by DMA with a little silence
+around them, then everything off again. Every step is logged and the
+first that fails ends it. Different from the stock app, each time to
+the careful side: muted until all is loaded, the amplifier's processor
+left in the path (the factory test bypasses it and plays at -1 dB), the
+patch written in pieces of 64 bytes because this bus allows a transfer
+10 ms. The main task does nothing else for the two seconds. The probe
+of the three chips at start is gone again; what it found is above and
+in 3.7.
+
 ### 3.7 NFC (item 9) - L, low priority
 
 Read in the stock app B.70, 2026-11-26: PF2 is the controller's supply,
@@ -1174,8 +1243,8 @@ The factory check (0x08026C4C): PF2 high, 100 ms, PB3 low, 100 ms, PB3
 high, 100 ms, then the four bytes `20 00 01 01` (core reset) written;
 that the chip takes them is the check. An answer is read as three bytes
 and then as many as the third says. Off: PB3 low, PF2 low.
-`drivers::probe` does exactly this at start and logs the answer.
-Measured 2026-11-26: the controller took the four bytes and answered
+A probe at start did exactly this and logged the answer (since
+removed). Measured 2026-11-26: the controller took the four bytes and answered
 `40 00 01 00` (reset accepted), then by itself `60 00 0a 02 01 20 04 05
 00 a4 01 10 53`: by the NCI standard's layout a reset notification
 saying NCI version 2.0, manufacturer 0x04 (NXP) and five bytes of its

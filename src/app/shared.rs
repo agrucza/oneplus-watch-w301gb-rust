@@ -69,6 +69,7 @@ static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 static POWER_OFF: AtomicBool = AtomicBool::new(false);
 static COMPASS: AtomicBool = AtomicBool::new(false);
+static SOUND: AtomicBool = AtomicBool::new(false);
 
 pub fn set_state(state: State) {
     STATE.lock(|cell| cell.set(state));
@@ -117,6 +118,17 @@ pub fn set_compass(wanted: bool) {
 /// Whether the compass is wanted.
 pub fn compass() -> bool {
     COMPASS.load(Ordering::Relaxed)
+}
+
+/// Ask the main task to play the test tone.
+pub fn request_sound() {
+    SOUND.store(true, Ordering::Relaxed);
+    crate::hal::wake::nudge();
+}
+
+/// Whether the test tone was asked for since the last call.
+pub fn take_sound() -> bool {
+    SOUND.swap(false, Ordering::Relaxed)
 }
 
 /// Ask the main task to have the Apollo switch the watch off.

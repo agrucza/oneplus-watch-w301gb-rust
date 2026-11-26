@@ -33,7 +33,7 @@ use pages::Page;
 
 // The pages share out exactly the frames the panel has.
 const _: () = assert!(pages::FRAMES == panel::FRAMES);
-use crate::drivers::{apollo, buttons, light, panel, psram, touch};
+use crate::drivers::{apollo, audio, buttons, light, panel, psram, touch};
 use crate::hal::{clocks, sdmmc};
 use crate::services::log::Log;
 use crate::services::update::server::{Activity, Server};
@@ -133,7 +133,7 @@ pub async fn run(spawner: Spawner, board: Board) {
         let _ = log.flush();
         let (revision, reading) = board.revision.measure();
         let _ = writeln!(log.stamp(), "board revision {} (reading {} of 4095, {} mV)", revision, reading, reading as u32 * 1800 / 4096);
-        let mut codec_awake = board.codec_supply.off(revision);
+        let codec_awake = board.codec_supply.off(revision);
         if codec_awake.is_some() {
             let _ = writeln!(log.stamp(), "audio codec supply (PB1) held off");
         }
@@ -177,17 +177,10 @@ pub async fn run(spawner: Spawner, board: Board) {
         // Sensor bus and light sensor. Nothing depends on them.
         let mut bus = board.sensor_bus.open();
         light::scan(&mut bus, &mut log);
-        // Codec, amplifier and NFC: asked once, logged, switched off again.
-        if PROBE_CHIPS {
-            if let Some(pin) = codec_awake.as_mut() {
-                crate::drivers::probe::run(board.probe, pin, &mut bus, &mut log).await;
-                let _ = log.flush();
-            } else {
-                let _ = writeln!(log.stamp(), "probe: not run, the stock app's steps for this board revision are not known");
-            }
-        }
-        // PB1 stays low for good.
-        core::mem::forget(codec_awake);
+        // Sound: the driver and the pin that wakes the codec, which stays
+        // low between sounds. Only on the board revisions whose steps
+        // are known.
+        let audio = codec_awake.map(|awake| (audio::Audio::new(board.audio), awake));
         let factor = factory::light_calibration(&mut log).unwrap_or_else(|| {
             let _ = writeln!(log.stamp(), "light sensor: using the stock default factor {}", light::DEFAULT_FACTOR);
             light::DEFAULT_FACTOR
@@ -196,6 +189,8 @@ pub async fn run(spawner: Spawner, board: Board) {
         let _ = log.flush();
         let sensors = Sensors {
             bus,
+            audio,
+            image: image_partition,
             light,
             last_raw: None,
             last_lux: None,
@@ -526,11 +521,6 @@ fn speed_up_card(log: &mut Log) -> bool {
 /// How long the display stays lit on the compass page without a finger
 /// or a button.
 const COMPASS_LIT: Duration = Duration::from_secs(300);
-
-/// Diagnosis: at every start, make first contact with the audio codec,
-/// the speaker amplifier and the NFC controller (`drivers::probe`). Takes
-/// about 0.7 s. On until all three have been seen to answer.
-const PROBE_CHIPS: bool = true;
 
 /// The settings file, beside the log.
 const SETTINGS_DIR: &str = "LOG";
@@ -1179,6 +1169,11 @@ impl Screen {
                                 launcher::App::Alerts => Page::Below,
                                 launcher::App::Status => Page::Status,
                                 launcher::App::Compass => Page::Compass,
+                                launcher::App::Sound => {
+                                    // No page: the main task plays the test tone.
+                                    shared::request_sound();
+                                    return;
+                                }
                                 launcher::App::Power => Page::Power,
                             };
                             self.go_to(page, log);
@@ -1976,6 +1971,11 @@ const LIGHT_FIRST_READING: Duration = Duration::from_millis(400);
 /// The sensor bus and what is on it.
 struct Sensors {
     bus: light::Bus,
+    /// Sound, and the pin that wakes the codec; `None` on a board
+    /// revision whose steps are not known.
+    audio: Option<(audio::Audio, embassy_stm32::gpio::Output<'static>)>,
+    /// The volume with the stock app's files (codec settings, sounds).
+    image: storage::Partition,
     light: Option<light::LightSensor>,
     last_raw: Option<light::Raw>,
     /// The last reading in lux.
@@ -2291,6 +2291,18 @@ async fn main_loop(
         }
         if let (Some(settings), Some(partition)) = (shared::take_changed_settings(), log.partition()) {
             settings_save(partition, &settings, &mut log);
+        }
+        if shared::take_sound() {
+            // Nothing else runs meanwhile, for the two seconds it takes.
+            match (sensors.audio.as_mut(), log.partition()) {
+                (Some((audio, awake)), Some(files)) => {
+                    audio.play_test_tone(awake, &mut sensors.bus, sensors.image, files, &mut log).await;
+                }
+                _ => {
+                    let _ = writeln!(log.stamp(), "sound: not on this board revision");
+                }
+            }
+            let _ = log.flush();
         }
         if shared::take_power_off() {
             let sent = match apollo.as_mut() {

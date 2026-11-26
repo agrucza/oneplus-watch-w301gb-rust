@@ -29,7 +29,7 @@ use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::time::Hertz;
 use embassy_time::{Duration, Timer};
 
-use crate::drivers::{apollo, cypress, light, panel, probe, touch};
+use crate::drivers::{apollo, audio, cypress, light, panel, touch};
 
 pub struct Board {
     pub power: PowerPins,
@@ -41,8 +41,8 @@ pub struct Board {
     pub touch: touch::Resources,
     pub revision: RevisionPin,
     pub codec_supply: CodecSupply,
-    /// What the first contact with codec, amplifier and NFC needs.
-    pub probe: probe::Resources,
+    /// Codec, amplifier and audio port (`drivers::audio`).
+    pub audio: audio::Resources,
 }
 
 /// The enables the bootloader's `bsp_gpio_power_init` sets. Which of them
@@ -96,7 +96,7 @@ impl Board {
             sensor_bus: SensorBus { i2c: p.I2C2, scl: p.PF1, sda: p.PF0 },
             revision: RevisionPin { adc: p.ADC1, pin: p.PB0 },
             codec_supply: CodecSupply { pb1: p.PB1 },
-            probe: probe::Resources {
+            audio: audio::Resources {
                 amplifier_supply: p.PG6,
                 amplifier_reset: p.PG10,
                 codec_reset: p.PB6,
@@ -107,10 +107,11 @@ impl Board {
                 codec_in: p.PC2,
                 master_clock_timer: p.TIM2,
                 master_clock: p.PA3,
-                nfc_supply: p.PF2,
-                nfc_enable: p.PB3,
-                nfc_download: p.PA4,
-                nfc_interrupt: p.PG2,
+                port: p.SAI1,
+                port_clock: p.PA8,
+                port_frame: p.PA9,
+                port_data: p.PA10,
+                port_dma: p.DMA2_CH1,
             },
             touch: touch::Resources { i2c: p.I2C3, scl: p.PC0, sda: p.PB4, reset: p.PF13, enable: p.PF4, irq: p.PA0 },
         }

@@ -270,6 +270,8 @@ impl Server {
                     report_len = clock::report(&mut report);
                 } else if let Some((_, time)) = text.split_once("AT^W301TIME=") {
                     answer = if clock::set_from_text(time.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
+                } else if let Some((_, put)) = text.split_once("AT^W301PUT=") {
+                    answer = if put_small_file(put.trim_end(), log) { b"OK\r\n" } else { b"ERROR\r\n" };
                 } else if text.contains("AT^W301STOCK") {
                     to_stock = true;
                     answer = b"OK\r\n";
@@ -476,4 +478,55 @@ async fn export_file(
         Some(reason) => Err(reason),
         None => Ok(total),
     }
+}
+
+/// "AT^W301PUT=<NAME>,<hex>": write a small file into the log folder of
+/// the log volume, in place of one of that name. For the few files this
+/// firmware reads but does not carry (the amplifier's patch and
+/// settings, see `drivers::audio`). The name is a short one of capitals
+/// and digits with an extension; the content comes as hex in the same
+/// packet, so 440 bytes are the most.
+fn put_small_file(put: &str, log: &mut Log) -> bool {
+    let Some((name, hex)) = put.split_once(',') else {
+        return false;
+    };
+    let named_well = name.len() <= 12
+        && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'.')
+        && name.split_once('.').is_some_and(|(stem, ext)| (1..=8).contains(&stem.len()) && (1..=3).contains(&ext.len()) && !ext.contains('.'));
+    // Not over the log, the settings or what the firmware keeps there.
+    let reserved = ["RUST.LOG", "RUST.OLD", "RUST.CFG"].contains(&name);
+    let mut content = [0u8; 440];
+    let digits = hex.as_bytes();
+    if !named_well || reserved || digits.is_empty() || digits.len() % 2 != 0 || digits.len() / 2 > content.len() {
+        let _ = writeln!(log.stamp(), "put: refused (name {:?}, {} hex digits)", name, digits.len());
+        return false;
+    }
+    let length = digits.len() / 2;
+    for (byte, pair) in content.iter_mut().zip(digits.chunks_exact(2)) {
+        let digit = |d: u8| (d as char).to_digit(16);
+        let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
+            let _ = writeln!(log.stamp(), "put: refused, {:?} is not hex", name);
+            return false;
+        };
+        *byte = (high << 4 | low) as u8;
+    }
+    let Some(partition) = log.partition() else {
+        return false;
+    };
+    let written = (|| {
+        // The file has to exist before it can be rewritten.
+        storage::append(partition, "LOG", name, &[]).map_err(|_| 1u8)?;
+        let mut writer = FileWriter::rewrite(partition, &["LOG"], name).map_err(|_| 2u8)?;
+        writer.write(&content[..length]).map_err(|()| 3u8)?;
+        writer.finish().map_err(|()| 4u8)
+    })();
+    match written {
+        Ok(()) => {
+            let _ = writeln!(log.stamp(), "put: 3:log/{} written, {} bytes", name, length);
+        }
+        Err(step) => {
+            let _ = writeln!(log.stamp(), "put: 3:log/{} could NOT be written (step {})", name, step);
+        }
+    }
+    written.is_ok()
 }
