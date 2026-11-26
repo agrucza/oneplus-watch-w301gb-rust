@@ -6,3 +6,5 @@ pub mod font;
 pub mod font_data;
 #[path = "../../../src/services/gestures.rs"]
 pub mod gestures;
+#[path = "../../../src/services/wav.rs"]
+pub mod wav;

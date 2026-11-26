@@ -50,7 +50,12 @@ pub struct Settings {
     pub step_goal: u32,
     /// Whether the Apollo measures the heart rate by itself.
     pub heart_monitor: HeartMonitor,
+    /// How loud sounds are, 0 (quiet) up to `VOLUMES - 1`.
+    pub volume: u8,
 }
+
+/// How many steps of loudness there are.
+pub const VOLUMES: u8 = 4;
 
 /// The Apollo's own heart-rate monitoring, while the watch is worn. Its
 /// periodic kind cannot be given another rhythm: 30 seconds in every
@@ -118,6 +123,7 @@ pub enum Tap {
     NextDisplayOff,
     NextStepGoal,
     NextHeartMonitor,
+    NextVolume,
 }
 
 /// The entry after `now` in `choices`, the first after the last; the
@@ -151,6 +157,7 @@ impl Settings {
         move_time: (9 * 60, 21 * 60),
         step_goal: 10_000,
         heart_monitor: HeartMonitor::Off,
+        volume: 0,
     };
 
     /// Whether the quiet hours are on and minute `now` of the day lies
@@ -197,6 +204,11 @@ impl Settings {
                         settings.heart_monitor = monitor;
                     }
                 }
+                ("volume", step) => {
+                    if let Some(step) = step.parse::<u8>().ok().filter(|step| (1..=VOLUMES).contains(step)) {
+                        settings.volume = step - 1;
+                    }
+                }
                 ("quiet_time", window) => settings.quiet_time = parse_window(window).unwrap_or(settings.quiet_time),
                 ("move_time", window) => settings.move_time = parse_window(window).unwrap_or(settings.move_time),
                 _ => {}
@@ -239,6 +251,7 @@ impl Settings {
         let _ = writeln!(into, "move_time={:02}:{:02}-{:02}:{:02}", a, b, c, d);
         let _ = writeln!(into, "step_goal={}", self.step_goal);
         let _ = writeln!(into, "heart_monitor={}", self.heart_monitor.word());
+        let _ = writeln!(into, "volume={}", self.volume + 1);
         into.1
     }
 
@@ -264,6 +277,7 @@ impl Settings {
             Tap::NextDisplayOff => Settings { display_off_s: next(&TIMEOUTS, self.display_off_s), ..self },
             Tap::NextStepGoal => Settings { step_goal: next(&STEP_GOALS, self.step_goal), ..self },
             Tap::NextHeartMonitor => Settings { heart_monitor: next(&HeartMonitor::ALL, self.heart_monitor), ..self },
+            Tap::NextVolume => Settings { volume: (self.volume + 1) % VOLUMES, ..self },
         }
     }
 }

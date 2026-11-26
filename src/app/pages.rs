@@ -36,6 +36,8 @@ pub enum Page {
     Settings,
     /// What the compass reports (`super::compass`).
     Compass,
+    /// The watch's sounds, to play (`super::sounds`).
+    Sounds,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
@@ -43,7 +45,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -57,6 +59,7 @@ impl Page {
             Page::Launcher => 8,
             Page::Settings => 9,
             Page::Compass => 10,
+            Page::Sounds => 11,
         }
     }
 
@@ -82,6 +85,7 @@ impl Page {
             Page::Picker => (6, 1),
             Page::Settings => (6, 1),
             Page::Compass => (6, 1),
+            Page::Sounds => (6, 1),
             Page::Launcher => (7, 1),
             Page::Power => (8, 1),
         }
@@ -92,7 +96,7 @@ impl Page {
     /// True for a page whose frame another page uses too: its picture
     /// may be gone when it is opened.
     pub fn shared_frame(self) -> bool {
-        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings | Page::Compass)
+        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings | Page::Compass | Page::Sounds)
     }
 }
 

@@ -1235,6 +1235,29 @@ patch written in pieces of 64 bytes because this bus allows a transfer
 of the three chips at start is gone again; what it found is above and
 in 3.7.
 
+**The watch's own sounds (2026-11-26).** On the watch the same
+evening: thirteen sounds played, all six of the list, at all four
+volumes; the port never ran dry and nothing failed; the alarm played
+whole (1,223,424 samples, 13.9 s) and sounds were cut short on a tap
+four times; the user found the sound very good. Stack 17,076 of 65,536
+bytes at most. The driver is in two parts now: the main task's `Audio`,
+which has the sensor bus, brings codec and amplifier up for a file
+(`start`) and takes them down (`stop`); a task of its own (`player`)
+sends the samples, so a sound of some seconds no longer holds the
+firmware up, says when it is through and can be cut short. A file's
+head is read (`services::wav`: the chunks walked to "data", so the
+files with a longer "fmt " or a "bext" chunk first are right too) and
+decides the rest: the codec's file for 48 or for 44.1 kHz (they differ
+in the clock's numbers only), the amplifier's rate, one channel or two
+on the port. Only the file's samples are sent, not what follows them.
+The stock files are 44.1 kHz in two channels but for the two test
+files; the alarm is 13.9 s, the ring 8.3 s. A "sounds" app in the
+launcher lists six of them (alarm, call, message, low battery,
+charging, test tone); a tap plays one, a tap while one plays ends it.
+Volume is a setting now (line `volume=` in the file, a row in the
+settings app): four steps of 6 dB, from the stock speaker test's value
+(0x54) to 4 dB below full (0x78). No sound is tied to an event yet.
+
 ### 3.7 NFC (item 9) - L, low priority
 
 Read in the stock app B.70, 2026-11-26: PF2 is the controller's supply,
@@ -1494,7 +1517,28 @@ before adding new chips.
 - The panel's driver IC (the commands fit several 454 x 454 AMOLED drivers).
 - Whether OCTOSPI2 is really used: one reference exists in the stock app,
   but no clock selection for it and no flash chip strings.
-- Format of the 279 MB resource file.
+- Format of the 279 MB resource file: worked out 2026-11-26 (notes,
+  an extractor and contact sheets of all pictures are kept outside the
+  repository). The stock user interface is TouchGFX. `stm32_res1.bin` is
+  nothing but uncompressed pixels, 2768 pictures one after the other:
+  1954 in RGB565 (two bytes a pixel, low byte first) and 814 in ARGB8888
+  (blue, green, red, alpha; alpha not multiplied in). Its index is the
+  TouchGFX bitmap table at the end of `stm32_res2.bin`: 20 bytes a
+  picture (address 0x70000000 + offset in res1, width, height, the
+  opaque rectangle, and the format in the top bits of two of its
+  fields), found from the file's end by the count at offset 8.
+  `stm32_res2.bin` starts with a magic word that must match the stock
+  app's build, a CRC-32 over everything from 0x1000 on, and the count;
+  the stock app copies it whole to PSRAM 0x60180000, and it also holds
+  its compiled-in fonts, all its texts and its AT command table, with
+  pointers into the app, so it belongs to one build of the stock app.
+  A picture is found by its number, a constant in the stock code;
+  there are no names. An animation is a run of consecutive pictures of
+  one size (126 such runs) that the stock code steps through; no frame
+  times are stored. The fonts with all of CJK are separate files
+  (`packetA/font/OPPOSans_*_4bpp.bin`, TouchGFX binary fonts, 2 bits a
+  pixel despite the name). Not worked out: frame times, which number
+  belongs to which screen beyond the boot and charging animations.
 
 ## 7. Datasheet check (2026-11-23)
 

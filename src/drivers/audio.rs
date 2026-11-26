@@ -1,9 +1,16 @@
 //! Sound out of the speaker: the audio codec (Cirrus CS47L15), the
 //! speaker amplifier (Awinic AW8896) and the STM32's audio port (SAI1),
-//! set up for one piece of sound and switched off again after it, as the
+//! set up for one sound file and switched off again after it, as the
 //! stock app does for its factory speaker test (`wav_play`, 0x080BCACC in
 //! B.70). Its everyday sounds take another way, through the Bluetooth
 //! chip; this one needs nothing but what is on the STM32.
+//!
+//! Two parts work together. `Audio` belongs to the main task, which has
+//! the sensor bus the amplifier is on: `start` brings codec and
+//! amplifier up for a file and `stop` takes them down. The samples are
+//! sent by a task of their own (`player`), so that a sound of some
+//! seconds does not hold the rest of the firmware up; it says when it
+//! is through (`finished`), and can be cut short (`cut`).
 //!
 //! The chain, each link read in the stock app and since seen to answer
 //! on the watch (2026-11-26):
@@ -59,13 +66,18 @@ use embassy_stm32::sai::{self, Sai};
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use embassy_stm32::{bind_interrupts, dma, peripherals, Peri};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
 
 use crate::boot::watchdog;
 use crate::drivers::light::Bus;
 use crate::services::log::Log;
 use crate::services::storage::{self, Partition};
+use crate::services::wav::{self, Wav};
 
 bind_interrupts!(struct Irqs {
     DMA2_CHANNEL1 => dma::InterruptHandler<peripherals::DMA2_CH1>;
@@ -82,26 +94,88 @@ pub struct Resources {
     pub codec_in: Peri<'static, peripherals::PC2>,
     pub master_clock_timer: Peri<'static, peripherals::TIM2>,
     pub master_clock: Peri<'static, peripherals::PA3>,
+    pub port: Port,
+}
+
+/// The audio port, which the task that sends the samples has.
+pub struct Port {
     pub port: Peri<'static, peripherals::SAI1>,
-    pub port_clock: Peri<'static, peripherals::PA8>,
-    pub port_frame: Peri<'static, peripherals::PA9>,
-    pub port_data: Peri<'static, peripherals::PA10>,
-    pub port_dma: Peri<'static, peripherals::DMA2_CH1>,
+    pub clock: Peri<'static, peripherals::PA8>,
+    pub frame: Peri<'static, peripherals::PA9>,
+    pub data: Peri<'static, peripherals::PA10>,
+    pub dma: Peri<'static, peripherals::DMA2_CH1>,
+}
+
+/// The codec's and the amplifier's side, without the port.
+struct Control {
+    amplifier_supply: Peri<'static, peripherals::PG6>,
+    amplifier_reset: Peri<'static, peripherals::PG10>,
+    codec_reset: Peri<'static, peripherals::PB6>,
+    codec_select: Peri<'static, peripherals::PB12>,
+    codec_spi: Peri<'static, peripherals::SPI2>,
+    codec_clock: Peri<'static, peripherals::PB10>,
+    codec_out: Peri<'static, peripherals::PC1>,
+    codec_in: Peri<'static, peripherals::PC2>,
+    master_clock_timer: Peri<'static, peripherals::TIM2>,
+    master_clock: Peri<'static, peripherals::PA3>,
+}
+
+/// What is switched on while a sound plays; given up, it all goes off.
+struct Live {
+    codec: CodecBus<'static>,
+    select: Output<'static>,
+    _clock: SimplePwm<'static, peripherals::TIM2>,
+    _amplifier_supply: Output<'static>,
+    _amplifier_reset: Output<'static>,
+    _codec_reset: Output<'static>,
+}
+
+/// A sound for the player task: the file and where its samples are.
+#[derive(Clone, Copy)]
+struct Job {
+    volume: Partition,
+    path: &'static str,
+    wav: Wav,
+}
+
+/// How a sound went.
+#[derive(Clone, Copy)]
+pub struct Outcome {
+    /// Samples sent, both channels counted.
+    pub sent: u32,
+    /// How often the port ran dry: gaps in the sound.
+    pub dry: u32,
+    /// It ended before its time: no clock from the codec, or the file.
+    pub failed: bool,
+    /// It was cut short on request.
+    pub cut: bool,
+}
+
+static JOB: Signal<CriticalSectionRawMutex, Job> = Signal::new();
+static DONE: Signal<CriticalSectionRawMutex, Outcome> = Signal::new();
+static CUT: AtomicBool = AtomicBool::new(false);
+
+/// How the sound that was playing went, once it is through.
+pub fn finished() -> Option<Outcome> {
+    DONE.try_take()
+}
+
+/// End the sound that is playing; `finished` reports it shortly.
+pub fn cut() {
+    CUT.store(true, Ordering::Relaxed);
 }
 
 const AMPLIFIER: u8 = 0x36;
-/// The codec's settings for playing at 48 kHz, on the image volume.
-const CODEC_FILE: &str = "packetA/codec/adsp_for_playback_48.bin";
-/// The factory's speaker test tone, on the image volume: 48 kHz, one
-/// channel, 16 bit, 1.4 s, samples from byte 44 on.
-const TONE_FILE: &str = "packetA/audio/spkT.wav";
-const TONE_DATA_AT: usize = 44;
+/// The codec's settings for playing at 48 kHz and at 44.1 kHz, on the
+/// image volume. They differ in the clock's numbers and nothing else.
+const CODEC_FILES: [(u32, &str); 2] = [(48_000, "packetA/codec/adsp_for_playback_48.bin"), (44_100, "packetA/codec/adsp_for_playback_441.bin")];
 /// The amplifier's files on the log volume (see the top of this file).
 const PATCH_FILES: [&str; 2] = ["LOG/AW8896FD.BIN", "LOG/AW8896FE.BIN"];
 const SETTINGS_FILE: &str = "LOG/AW8896CF.BIN";
-/// The volume the tone is played at: the codec's mixer value the stock
-/// app's own speaker test uses, 22 dB below full (0x080BCB78).
-const VOLUME: u32 = 0x0054;
+/// The quietest volume worth having: the codec's mixer value the stock
+/// app's own speaker test uses, 22 dB below full (0x080BCB78). Two units
+/// are a dB, 0x80 is full.
+pub const VOLUME_QUIET: u32 = 0x0054;
 
 /// The amplifier's table of start values (the stock app's, 0x081E3058),
 /// register and value, with the last one changed to stay muted.
@@ -206,23 +280,67 @@ fn read_file<'a>(volume: Partition, path: &str, into: &'a mut [u8]) -> Option<&'
 }
 
 pub struct Audio {
-    r: Resources,
+    r: Control,
+    live: Option<Live>,
 }
 
 impl Audio {
-    pub fn new(r: Resources) -> Self {
-        Self { r }
+    /// The driver for the main task, and the port for the player task.
+    pub fn new(r: Resources) -> (Self, Port) {
+        let control = Control {
+            amplifier_supply: r.amplifier_supply,
+            amplifier_reset: r.amplifier_reset,
+            codec_reset: r.codec_reset,
+            codec_select: r.codec_select,
+            codec_spi: r.codec_spi,
+            codec_clock: r.codec_clock,
+            codec_out: r.codec_out,
+            codec_in: r.codec_in,
+            master_clock_timer: r.master_clock_timer,
+            master_clock: r.master_clock,
+        };
+        (Self { r: control, live: None }, r.port)
     }
 
-    /// Play the factory's speaker test tone once, quietly, and switch
-    /// everything off again. `codec_awake` is PB1, low before and after;
-    /// `image` and `files` are the volumes with the stock app's files
-    /// and with the amplifier's. Every step is logged; the first one that
-    /// fails ends it. True if the tone went out.
-    pub async fn play_test_tone(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, image: Partition, files: Partition, log: &mut Log) -> bool {
-        let _ = writeln!(log.stamp(), "sound: the test tone, at volume {:#06x}", VOLUME);
-        // Safety: the pins and peripherals are this driver's own; what is
-        // made of them here is gone again when this returns.
+    /// True from `start` to `stop`.
+    pub fn playing(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Bring codec and amplifier up for the sound file `path` on the
+    /// volume `image` and have the player task send it, at `volume` (the
+    /// codec's mixer value). `codec_awake` is PB1, low between sounds;
+    /// `files` is the volume with the amplifier's files. Every step is
+    /// logged; the first one that fails ends it, with everything off
+    /// again. True if the sound is on its way: then `stop` has to follow
+    /// once `finished` says so.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, image: Partition, files: Partition, path: &'static str, volume: u32, log: &mut Log) -> bool {
+        if self.live.is_some() {
+            return false;
+        }
+        let _ = writeln!(log.stamp(), "sound: {} at volume {:#06x}", path, volume);
+        // What the file holds.
+        let mut head = [0u8; 1024];
+        let wav = match storage::FileReader::open(image, path) {
+            Ok(mut reader) => {
+                let n = reader.read(&mut head).unwrap_or(0);
+                reader.close();
+                wav::parse(&head[..n])
+            }
+            Err(_) => None,
+        };
+        let Some(wav) = wav.filter(|w| w.bits == 16 && (1..=2).contains(&w.channels)) else {
+            let _ = writeln!(log.stamp(), "sound: {} is not there, or no WAV file of 16-bit samples in one or two channels", path);
+            return false;
+        };
+        let Some(&(_, codec_file)) = CODEC_FILES.iter().find(|(rate, _)| *rate == wav.rate) else {
+            let _ = writeln!(log.stamp(), "sound: {} Hz; the codec has settings for 48000 and 44100 only", wav.rate);
+            return false;
+        };
+
+        // Safety: the pins and peripherals are this driver's own, and
+        // nothing made of them is alive (`live` is `None`).
         let r = &self.r;
         let (pg6, pg10, pb6, pb12) = unsafe { (r.amplifier_supply.clone_unchecked(), r.amplifier_reset.clone_unchecked(), r.codec_reset.clone_unchecked(), r.codec_select.clone_unchecked()) };
         let (spi2, pb10, pc1, pc2) = unsafe { (r.codec_spi.clone_unchecked(), r.codec_clock.clone_unchecked(), r.codec_out.clone_unchecked(), r.codec_in.clone_unchecked()) };
@@ -230,11 +348,11 @@ impl Audio {
 
         // Up, in the stock app's order (0x080A9B88).
         let mut amplifier_reset = Output::new(pg10, Level::Low, Speed::Low);
-        let mut select = Output::new(pb12, Level::High, Speed::VeryHigh);
+        let select = Output::new(pb12, Level::High, Speed::VeryHigh);
         let mut config = spi::Config::default();
         config.mode = spi::MODE_0;
         config.frequency = Hertz(7_500_000);
-        let mut codec = Spi::new_blocking(spi2, pb10, pc1, pc2, config);
+        let codec = Spi::new_blocking(spi2, pb10, pc1, pc2, config);
         let clock_pin = PwmPin::new(pa3, OutputType::PushPull);
         let mut clock = SimplePwm::new(tim2, None, None, None, Some(clock_pin), Hertz(3_000_000), Default::default());
         {
@@ -250,251 +368,270 @@ impl Audio {
         amplifier_reset.set_low();
         Timer::after_millis(15).await;
         watchdog::feed();
+        let mut live = Live { codec, select, _clock: clock, _amplifier_supply: amplifier_supply, _amplifier_reset: amplifier_reset, _codec_reset: codec_reset };
 
-        let played = self.chain(&mut codec, &mut select, bus, image, files, log).await;
+        let ready = chain(&mut live.codec, &mut live.select, bus, image, files, codec_file, wav.rate, volume, log).await;
+        self.live = Some(live);
+        if !ready {
+            self.stop(codec_awake, bus, log);
+            return false;
+        }
+        CUT.store(false, Ordering::Relaxed);
+        DONE.reset();
+        JOB.signal(Job { volume: image, path, wav });
+        true
+    }
 
-        // Down (0x080A9A78): amplifier muted and powered down, then the
-        // supplies, the buses, the clock and the resets.
+    /// Take codec and amplifier down again (0x080A9A78): the amplifier
+    /// muted and powered down, then the supplies, the buses, the clock
+    /// and the resets.
+    pub fn stop(&mut self, codec_awake: &mut Output<'static>, bus: &mut Bus, log: &mut Log) {
+        let Some(live) = self.live.take() else {
+            return;
+        };
         let muted = amplifier_change(bus, 0x08, 0, 1);
         let down = amplifier_change(bus, 0x04, 0, 1);
-        drop(amplifier_supply);
         codec_awake.set_low();
-        drop(codec);
-        drop(clock);
-        drop(amplifier_reset);
-        drop(codec_reset);
-        drop(select);
+        drop(live);
         watchdog::feed();
         let _ = writeln!(
             log.stamp(),
-            "sound: {}; amplifier {} and {}, codec and clock off",
-            if played { "the tone went out" } else { "NOT played" },
+            "sound: amplifier {} and {}, codec and clock off",
             if muted { "muted" } else { "NOT seen to mute" },
             if down { "powered down" } else { "NOT seen to power down" }
         );
-        played
+    }
+}
+
+/// Codec set up for `rate`, amplifier started and unmuted. Leaves the
+/// amplifier as it is if a step fails; the caller takes everything down.
+#[allow(clippy::too_many_arguments)]
+async fn chain(codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus, image: Partition, files: Partition, codec_file: &str, rate: u32, volume: u32, log: &mut Log) -> bool {
+    let id = codec_read(codec, select, 0);
+    if id != 0x6370 {
+        let _ = writeln!(log.stamp(), "sound: the codec's register 0 reads {:#06x}, not 0x6370", id);
+        return false;
+    }
+    // The codec's settings.
+    let mut buffer = [0u8; 1024];
+    let Some(settings) = read_file(image, codec_file, &mut buffer) else {
+        let _ = writeln!(log.stamp(), "sound: {} could not be read", codec_file);
+        return false;
+    };
+    let said = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
+    if settings.len() < 12 || said + 4 != settings.len() || said % 8 != 0 {
+        let _ = writeln!(log.stamp(), "sound: {} is {} bytes and says {}: not the file that was read", codec_file, settings.len(), said);
+        return false;
+    }
+    let mut taken = true;
+    for (n, record) in settings[4..].chunks_exact(8).enumerate() {
+        let address = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+        let value = u32::from_be_bytes([record[4], record[5], record[6], record[7]]);
+        taken &= codec_write(codec, select, address, value);
+        if n == 0 {
+            // The first record resets the codec.
+            let mut waited = 0;
+            while codec_read(codec, select, 0x1880) & 0x0080 == 0 && waited < 50 {
+                Timer::after_millis(1).await;
+                waited += 1;
+            }
+        }
+    }
+    for register in [0x0701, 0x0703, 0x0709, 0x070B] {
+        taken &= codec_write(codec, select, register, volume);
+    }
+    // The amplifier wants the bit clock for 5 ms before it is spoken to.
+    Timer::after_millis(20).await;
+    watchdog::feed();
+    let status = codec_read(codec, select, 0x1881);
+    let _ = writeln!(log.stamp(), "sound: codec settings {} for {} Hz, clock status {:#06x}, volume {:#06x}", if taken { "taken" } else { "NOT all taken" }, rate, status, codec_read(codec, select, 0x0703));
+    if !taken {
+        return false;
     }
 
-    /// Codec set up, amplifier started, the tone sent. Leaves the
-    /// amplifier as it is; the caller mutes and powers down either way.
-    async fn chain(&mut self, codec: &mut CodecBus<'_>, select: &mut Output<'_>, bus: &mut Bus, image: Partition, files: Partition, log: &mut Log) -> bool {
-        let id = codec_read(codec, select, 0);
-        if id != 0x6370 {
-            let _ = writeln!(log.stamp(), "sound: the codec's register 0 reads {:#06x}, not 0x6370", id);
+    // The amplifier, muted until the end.
+    if amplifier_read(bus, 0x00) != Some(0x0310) {
+        let _ = writeln!(log.stamp(), "sound: the amplifier does not answer with its ID");
+        return false;
+    }
+    // Mono of both channels, the rate (8 = 48 kHz, 7 = 44.1 kHz), 16 bit,
+    // 32 clocks a frame.
+    let rate_code = if rate == 48_000 { 8 } else { 7 };
+    let mut taken = amplifier_change(bus, 0x05, 0x000F | 3 << 4 | 3 << 6 | 3 << 10, rate_code | 3 << 10);
+    for (register, value) in AMPLIFIER_TABLE {
+        taken &= amplifier_write(bus, register, value);
+    }
+    if !taken || !pll_locked(bus).await {
+        let _ = writeln!(log.stamp(), "sound: amplifier table {}, its PLL NOT locked (status {:#06x})", if taken { "taken" } else { "NOT taken" }, amplifier_read(bus, 0x01).unwrap_or(0));
+        return false;
+    }
+    let version = {
+        let mut word = |at: u16| if amplifier_write(bus, 0x40, at) { amplifier_read(bus, 0x41) } else { None };
+        match (word(0x0F80), word(0x0F81)) {
+            (Some(low), Some(high)) => (high as u32) << 16 | low as u32,
+            _ => 1,
+        }
+    };
+    let patch_file = match version {
+        0 => PATCH_FILES[0],
+        0xDEAC_97D6 => PATCH_FILES[1],
+        _ => {
+            let _ = writeln!(log.stamp(), "sound: amplifier ROM version {:#010x}: no patch is known for it", version);
             return false;
         }
-        // The codec's settings.
-        let mut buffer = [0u8; 1024];
-        let Some(settings) = read_file(image, CODEC_FILE, &mut buffer) else {
-            let _ = writeln!(log.stamp(), "sound: {} could not be read", CODEC_FILE);
-            return false;
-        };
-        let said = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
-        if settings.len() < 12 || said + 4 != settings.len() || said % 8 != 0 {
-            let _ = writeln!(log.stamp(), "sound: {} is {} bytes and says {}: not the file that was read", CODEC_FILE, settings.len(), said);
-            return false;
-        }
-        let mut taken = true;
-        for (n, record) in settings[4..].chunks_exact(8).enumerate() {
-            let address = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
-            let value = u32::from_be_bytes([record[4], record[5], record[6], record[7]]);
-            taken &= codec_write(codec, select, address, value);
-            if n == 0 {
-                // The first record resets the codec.
-                let mut waited = 0;
-                while codec_read(codec, select, 0x1880) & 0x0080 == 0 && waited < 50 {
-                    Timer::after_millis(1).await;
-                    waited += 1;
-                }
-            }
-        }
-        for register in [0x0701, 0x0703, 0x0709, 0x070B] {
-            taken &= codec_write(codec, select, register, VOLUME);
-        }
-        // The amplifier wants the bit clock for 5 ms before it is spoken to.
-        Timer::after_millis(20).await;
-        watchdog::feed();
-        let status = codec_read(codec, select, 0x1881);
-        let _ = writeln!(log.stamp(), "sound: codec settings {}, clock status {:#06x}, volume {:#06x}", if taken { "taken" } else { "NOT all taken" }, status, codec_read(codec, select, 0x0703));
-        if !taken {
-            return false;
-        }
-
-        // The amplifier, muted until the end.
-        if amplifier_read(bus, 0x00) != Some(0x0310) {
-            let _ = writeln!(log.stamp(), "sound: the amplifier does not answer with its ID");
-            return false;
-        }
-        // Mono of both channels, 48 kHz, 16 bit, 32 clocks a frame.
-        let mut taken = amplifier_change(bus, 0x05, 0x000F | 3 << 4 | 3 << 6 | 3 << 10, 8 | 3 << 10);
-        for (register, value) in AMPLIFIER_TABLE {
-            taken &= amplifier_write(bus, register, value);
-        }
-        if !taken || !pll_locked(bus).await {
-            let _ = writeln!(log.stamp(), "sound: amplifier table {}, its PLL NOT locked (status {:#06x})", if taken { "taken" } else { "NOT taken" }, amplifier_read(bus, 0x01).unwrap_or(0));
-            return false;
-        }
-        let version = {
-            let mut word = |at: u16| if amplifier_write(bus, 0x40, at) { amplifier_read(bus, 0x41) } else { None };
-            match (word(0x0F80), word(0x0F81)) {
-                (Some(low), Some(high)) => (high as u32) << 16 | low as u32,
-                _ => 1,
-            }
-        };
-        let patch_file = match version {
-            0 => PATCH_FILES[0],
-            0xDEAC_97D6 => PATCH_FILES[1],
-            _ => {
-                let _ = writeln!(log.stamp(), "sound: amplifier ROM version {:#010x}: no patch is known for it", version);
-                return false;
-            }
-        };
-        let mut patch_buffer = [0u8; 512];
-        let mut settings_buffer = [0u8; 128];
-        let (Some(patch), Some(settings)) = (read_file(files, patch_file, &mut patch_buffer), read_file(files, SETTINGS_FILE, &mut settings_buffer)) else {
-            let _ = writeln!(log.stamp(), "sound: {} or {} is not on the log volume (put them there with tools/ota.sh put)", patch_file, SETTINGS_FILE);
-            return false;
-        };
-        if patch.len() % 2 != 0 || settings.len() != 124 {
-            let _ = writeln!(log.stamp(), "sound: the amplifier's files have {} and {} bytes; an even number and 124 are expected", patch.len(), settings.len());
-            return false;
-        }
-        // Muted, its processor out of the path, then the patch and the
-        // settings into its memory (0x080D8E64 on).
-        let mut loaded = amplifier_change(bus, 0x08, 0, 1) && amplifier_change(bus, 0x04, 0, 4);
-        loaded = loaded && amplifier_load(bus, 0x8C00, patch) && amplifier_load(bus, 0x8380, settings);
-        watchdog::feed();
-        // The processor back in; a millisecond later its watchdog
-        // register must count.
-        loaded = loaded && amplifier_change(bus, 0x04, 4, 0);
-        Timer::after_millis(1).await;
-        let watchdog_counts = amplifier_read(bus, 0x42).unwrap_or(0);
+    };
+    let mut patch_buffer = [0u8; 512];
+    let mut settings_buffer = [0u8; 128];
+    let (Some(patch), Some(settings)) = (read_file(files, patch_file, &mut patch_buffer), read_file(files, SETTINGS_FILE, &mut settings_buffer)) else {
+        let _ = writeln!(log.stamp(), "sound: {} or {} is not on the log volume (put them there with tools/ota.sh put)", patch_file, SETTINGS_FILE);
+        return false;
+    };
+    if patch.len() % 2 != 0 || settings.len() != 124 {
+        let _ = writeln!(log.stamp(), "sound: the amplifier's files have {} and {} bytes; an even number and 124 are expected", patch.len(), settings.len());
+        return false;
+    }
+    // Muted, its processor out of the path, then the patch and the
+    // settings into its memory (0x080D8E64 on).
+    let mut loaded = amplifier_change(bus, 0x08, 0, 1) && amplifier_change(bus, 0x04, 0, 4);
+    loaded = loaded && amplifier_load(bus, 0x8C00, patch) && amplifier_load(bus, 0x8380, settings);
+    watchdog::feed();
+    // The processor back in; a millisecond later its watchdog register
+    // must count.
+    loaded = loaded && amplifier_change(bus, 0x04, 4, 0);
+    Timer::after_millis(1).await;
+    let watchdog_counts = amplifier_read(bus, 0x42).unwrap_or(0);
+    if !loaded || watchdog_counts == 0 {
         let _ = writeln!(log.stamp(), "sound: amplifier ROM {:#010x}, {} ({} bytes) and settings {}, watchdog register {:#06x}", version, patch_file, patch.len(), if loaded { "loaded" } else { "NOT loaded" }, watchdog_counts);
-        if !loaded || watchdog_counts == 0 {
-            // As the stock app leaves it then: processor out, muted.
-            amplifier_change(bus, 0x04, 0, 4);
-            return false;
-        }
-        // Its data output on (and for the older ROM a bit of its own),
-        // power up, PLL locked, unmute (0x080D8BF0, 0x080D8B94).
-        let mut ready = amplifier_change(bus, 0x06, 0, 1);
-        if version == 0 {
-            ready &= amplifier_change(bus, 0x20, 0, 0x8000);
-        }
-        ready &= amplifier_change(bus, 0x04, 1, 0);
-        Timer::after_millis(2).await;
-        if !ready || !pll_locked(bus).await {
-            let _ = writeln!(log.stamp(), "sound: the amplifier did not come up (status {:#06x})", amplifier_read(bus, 0x01).unwrap_or(0));
-            return false;
-        }
-        // Read its three status registers, which clears what was pending,
-        // and let it report clock and supply trouble (0x080D8A0E, 0x080D89A4).
-        let before = [amplifier_read(bus, 0x01), amplifier_read(bus, 0x02), amplifier_read(bus, 0x03)].map(|v| v.unwrap_or(0));
-        amplifier_change(bus, 0x03, 0x4073, 0);
-        let unmuted = amplifier_change(bus, 0x08, 1, 0);
-        let _ = writeln!(log.stamp(), "sound: amplifier up, status {:#06x} {:#06x} {:#06x}, {}", before[0], before[1], before[2], if unmuted { "unmuted" } else { "NOT unmuted" });
-        if !unmuted {
-            return false;
-        }
-
-        let sent = self.send_tone(image, log).await;
-        let _ = writeln!(log.stamp(), "sound: amplifier status after the tone {:#06x}", amplifier_read(bus, 0x01).unwrap_or(0));
-        sent
+        // As the stock app leaves it then: processor out, muted.
+        amplifier_change(bus, 0x04, 0, 4);
+        return false;
     }
-
-    /// Send the tone's samples out of SAI1, with a little silence before
-    /// and after.
-    async fn send_tone(&mut self, image: Partition, log: &mut Log) -> bool {
-        static mut RING: [u16; 4096] = [0; 4096];
-        // Safety: used only here, and this is never entered twice.
-        let ring = unsafe { &mut *core::ptr::addr_of_mut!(RING) };
-        let r = &self.r;
-        let (port, clock, frame, data, channel) = unsafe { (r.port.clone_unchecked(), r.port_clock.clone_unchecked(), r.port_frame.clone_unchecked(), r.port_data.clone_unchecked(), r.port_dma.clone_unchecked()) };
-        let (block, _) = sai::split_subblocks(port);
-        let mut config = sai::Config::default();
-        config.mode = sai::Mode::Slave;
-        config.tx_rx = sai::TxRx::Transmitter;
-        config.protocol = sai::Protocol::Free;
-        config.slot_size = sai::SlotSize::Channel16;
-        config.data_size = sai::DataSize::Data16;
-        config.stereo_mono = sai::StereoMono::Mono;
-        config.bit_order = sai::BitOrder::MsbFirst;
-        config.frame_sync_offset = sai::FrameSyncOffset::BeforeFirstBit;
-        config.frame_sync_polarity = sai::FrameSyncPolarity::ActiveLow;
-        config.frame_sync_definition = sai::FrameSyncDefinition::ChannelIdentification;
-        config.frame_length = 32;
-        // Our data changes on the falling edge of the clock and is taken
-        // on the rising one.
-        config.clock_strobe = sai::ClockStrobe::Rising;
-        config.fifo_threshold = sai::FifoThreshold::Quarter;
-        let mut out: Sai<'_, u16> = Sai::new_asynchronous(block, clock, data, frame, channel, Irqs, ring, config);
-
-        let Ok(mut reader) = storage::FileReader::open(image, TONE_FILE) else {
-            let _ = writeln!(log.stamp(), "sound: {} could not be opened", TONE_FILE);
-            return false;
-        };
-        let mut bytes = [0u8; 2048];
-        let mut samples = [0u16; 1024];
-        // Past the file's head.
-        let mut skipped = false;
-        if let Ok(n) = reader.read(&mut bytes[..TONE_DATA_AT]) {
-            skipped = n == TONE_DATA_AT;
-        }
-        let mut sent = 0u32;
-        let mut failed = !skipped;
-        // How often the port ran dry: the HAL's buffer reports that as an
-        // error of the next write and starts afresh, which is a gap in
-        // the sound and no reason to give up.
-        let mut dry = 0u32;
-        // A piece into the buffer; false if it could not be got in. Without
-        // the codec's clocks nothing leaves the buffer, and a write would
-        // wait for ever: half a second is the most it gets.
-        async fn push(out: &mut Sai<'_, u16>, piece: &[u16], dry: &mut u32) -> bool {
-            for _ in 0..3 {
-                match with_timeout(Duration::from_millis(500), out.write(piece)).await {
-                    Ok(Ok(())) => return true,
-                    Ok(Err(_)) => *dry += 1,
-                    Err(_) => return false,
-                }
-            }
-            false
-        }
-        // The buffer has to hold something before the port is started
-        // (the HAL's rule for sending): a twentieth of a second of silence.
-        failed |= !push(&mut out, &[0u16; 1024], &mut dry).await;
-        failed |= !push(&mut out, &[0u16; 1024], &mut dry).await;
-        out.start();
-        while !failed {
-            let n = reader.read(&mut bytes).unwrap_or(0) / 2;
-            if n == 0 {
-                break;
-            }
-            for (sample, pair) in samples.iter_mut().zip(bytes.chunks_exact(2)) {
-                *sample = u16::from_le_bytes([pair[0], pair[1]]);
-            }
-            failed |= !push(&mut out, &samples[..n], &mut dry).await;
-            sent += n as u32;
-            watchdog::feed();
-        }
-        reader.close();
-        // Silence until what was sent has left the buffer.
-        for _ in 0..5 {
-            if failed {
-                break;
-            }
-            failed |= !push(&mut out, &[0u16; 1024], &mut dry).await;
-        }
-        drop(out);
-        let _ = writeln!(
-            log.stamp(),
-            "sound: {} samples sent, the port ran dry {} times{}{}",
-            sent,
-            dry,
-            if skipped { "" } else { "; the tone file is too short" },
-            if failed { "; then it FAILED (no clock from the codec, or the port did not take the samples)" } else { "" }
-        );
-        !failed && sent > 0
+    // Its data output on (and for the older ROM a bit of its own), power
+    // up, PLL locked, unmute (0x080D8BF0, 0x080D8B94).
+    let mut ready = amplifier_change(bus, 0x06, 0, 1);
+    if version == 0 {
+        ready &= amplifier_change(bus, 0x20, 0, 0x8000);
     }
+    ready &= amplifier_change(bus, 0x04, 1, 0);
+    Timer::after_millis(2).await;
+    if !ready || !pll_locked(bus).await {
+        let _ = writeln!(log.stamp(), "sound: the amplifier did not come up (status {:#06x})", amplifier_read(bus, 0x01).unwrap_or(0));
+        return false;
+    }
+    // Read its three status registers, which clears what was pending, and
+    // let it report clock and supply trouble (0x080D8A0E, 0x080D89A4).
+    let status = amplifier_read(bus, 0x01).unwrap_or(0);
+    let _ = (amplifier_read(bus, 0x02), amplifier_read(bus, 0x03));
+    amplifier_change(bus, 0x03, 0x4073, 0);
+    let unmuted = amplifier_change(bus, 0x08, 1, 0);
+    let _ = writeln!(log.stamp(), "sound: amplifier patched ({}), up with status {:#06x}, {}", patch_file, status, if unmuted { "unmuted" } else { "NOT unmuted" });
+    unmuted
+}
+
+/// The task that sends a sound's samples out of SAI1: it waits for a
+/// file from `Audio::start`, sends it with a little silence before and
+/// after, and says how it went.
+#[embassy_executor::task]
+pub async fn player(port: Port) -> ! {
+    static mut RING: [u16; 8192] = [0; 8192];
+    // Safety: there is one player task, and nothing else uses this.
+    let ring = unsafe { &mut *core::ptr::addr_of_mut!(RING) };
+    loop {
+        let job = JOB.wait().await;
+        let outcome = send(&port, ring, &job).await;
+        DONE.signal(outcome);
+        // The main task may be waiting for something else.
+        crate::hal::wake::nudge();
+    }
+}
+
+/// Send one file's samples.
+async fn send(port: &Port, ring: &mut [u16], job: &Job) -> Outcome {
+    let mut outcome = Outcome { sent: 0, dry: 0, failed: false, cut: false };
+    // Safety: the port is this task's own, and what is made of it here is
+    // gone again when this returns.
+    let (sai1, clock, frame, data, channel) = unsafe { (port.port.clone_unchecked(), port.clock.clone_unchecked(), port.frame.clone_unchecked(), port.data.clone_unchecked(), port.dma.clone_unchecked()) };
+    let (block, _) = sai::split_subblocks(sai1);
+    let mut config = sai::Config::default();
+    config.mode = sai::Mode::Slave;
+    config.tx_rx = sai::TxRx::Transmitter;
+    config.protocol = sai::Protocol::Free;
+    config.slot_size = sai::SlotSize::Channel16;
+    config.data_size = sai::DataSize::Data16;
+    // A one-channel sound goes out on both slots.
+    config.stereo_mono = if job.wav.channels == 1 { sai::StereoMono::Mono } else { sai::StereoMono::Stereo };
+    config.bit_order = sai::BitOrder::MsbFirst;
+    config.frame_sync_offset = sai::FrameSyncOffset::BeforeFirstBit;
+    config.frame_sync_polarity = sai::FrameSyncPolarity::ActiveLow;
+    config.frame_sync_definition = sai::FrameSyncDefinition::ChannelIdentification;
+    config.frame_length = 32;
+    // Our data changes on the falling edge of the clock and is taken on
+    // the rising one.
+    config.clock_strobe = sai::ClockStrobe::Rising;
+    config.fifo_threshold = sai::FifoThreshold::Quarter;
+    let mut out: Sai<'_, u16> = Sai::new_asynchronous(block, clock, data, frame, channel, Irqs, ring, config);
+
+    let Ok(mut reader) = storage::FileReader::open(job.volume, job.path) else {
+        outcome.failed = true;
+        return outcome;
+    };
+    let mut bytes = [0u8; 4096];
+    let mut samples = [0u16; 2048];
+    // Past the file's head, to where the samples begin.
+    let mut skip = job.wav.data_at as usize;
+    while skip > 0 && !outcome.failed {
+        let n = skip.min(bytes.len());
+        outcome.failed = reader.read(&mut bytes[..n]).unwrap_or(0) != n;
+        skip -= n;
+    }
+    // A piece into the buffer; false if it could not be got in. Without
+    // the codec's clocks nothing leaves the buffer, and a write would wait
+    // for ever: half a second is the most it gets. The HAL reports a port
+    // that ran dry as an error of the next write and starts afresh: a gap
+    // in the sound, counted, and no reason to give up.
+    async fn push(out: &mut Sai<'_, u16>, piece: &[u16], dry: &mut u32) -> bool {
+        for _ in 0..3 {
+            match with_timeout(Duration::from_millis(500), out.write(piece)).await {
+                Ok(Ok(())) => return true,
+                Ok(Err(_)) => *dry += 1,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+    // The buffer has to hold something before the port is started (the
+    // HAL's rule for sending): a little silence.
+    outcome.failed |= !push(&mut out, &[0u16; 2048], &mut outcome.dry).await;
+    out.start();
+    let mut left = job.wav.data_len as usize;
+    while left > 0 && !outcome.failed {
+        if CUT.load(Ordering::Relaxed) {
+            outcome.cut = true;
+            break;
+        }
+        let want = left.min(bytes.len());
+        let n = reader.read(&mut bytes[..want]).unwrap_or(0) / 2;
+        if n == 0 {
+            break;
+        }
+        for (sample, pair) in samples.iter_mut().zip(bytes.chunks_exact(2)) {
+            *sample = u16::from_le_bytes([pair[0], pair[1]]);
+        }
+        outcome.failed |= !push(&mut out, &samples[..n], &mut outcome.dry).await;
+        outcome.sent += n as u32;
+        left -= n * 2;
+        watchdog::feed();
+    }
+    reader.close();
+    // Silence until what was sent has left the buffer.
+    for _ in 0..5 {
+        if outcome.failed {
+            break;
+        }
+        outcome.failed |= !push(&mut out, &[0u16; 2048], &mut outcome.dry).await;
+    }
+    drop(out);
+    outcome
 }
 
 /// Wait for the amplifier's PLL to lock to the codec's bit clock: five

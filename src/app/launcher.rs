@@ -27,7 +27,7 @@ pub enum App {
     Alerts,
     Status,
     Compass,
-    /// Plays the speaker's test tone; has no page.
+    /// The watch's sounds, to play.
     Sound,
     Power,
 }
@@ -42,7 +42,7 @@ fn look(app: App) -> (&'static str, &'static Art, Rgb565) {
         App::Alerts => ("ALERTS", &NW_ICON_BELL, YELLOW),
         App::Status => ("STATUS", &NW_ICON_SIGNAL, CYAN),
         App::Compass => ("COMPASS", &NW_ICON_COMPASS, CYAN),
-        App::Sound => ("SOUND", &NW_ICON_PLAY, GREEN),
+        App::Sound => ("SOUNDS", &NW_ICON_PLAY, GREEN),
         App::Power => ("POWER", &NW_ICON_POWER, SIGNAL),
     }
 }

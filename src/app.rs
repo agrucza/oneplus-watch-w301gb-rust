@@ -13,6 +13,7 @@ mod panels;
 mod power;
 mod settings;
 mod shared;
+mod sounds;
 mod status;
 mod theme;
 
@@ -180,7 +181,12 @@ pub async fn run(spawner: Spawner, board: Board) {
         // Sound: the driver and the pin that wakes the codec, which stays
         // low between sounds. Only on the board revisions whose steps
         // are known.
-        let audio = codec_awake.map(|awake| (audio::Audio::new(board.audio), awake));
+        let audio = codec_awake.map(|awake| {
+            let (audio, port) = audio::Audio::new(board.audio);
+            // The samples are sent by a task of their own.
+            spawner.spawn(audio::player(port).unwrap());
+            (audio, awake)
+        });
         let factor = factory::light_calibration(&mut log).unwrap_or_else(|| {
             let _ = writeln!(log.stamp(), "light sensor: using the stock default factor {}", light::DEFAULT_FACTOR);
             light::DEFAULT_FACTOR
@@ -838,6 +844,8 @@ struct Screen {
     /// button then leads back to it.
     launcher: launcher::Launcher,
     from_launcher: bool,
+    /// The sound the sounds page shows as playing.
+    sound_shown: Option<usize>,
     /// The compass's report as the compass page shows it, and when it
     /// was last taken over.
     compass: Option<compass::View>,
@@ -909,6 +917,7 @@ impl Screen {
             alerts: alerts::Alerts::new(),
             launcher: launcher::Launcher::new(),
             from_launcher: false,
+            sound_shown: None,
             compass: None,
             compass_heading: 0.0,
             compass_at: Instant::now(),
@@ -1169,11 +1178,7 @@ impl Screen {
                                 launcher::App::Alerts => Page::Below,
                                 launcher::App::Status => Page::Status,
                                 launcher::App::Compass => Page::Compass,
-                                launcher::App::Sound => {
-                                    // No page: the main task plays the test tone.
-                                    shared::request_sound();
-                                    return;
-                                }
+                                launcher::App::Sound => Page::Sounds,
                                 launcher::App::Power => Page::Power,
                             };
                             self.go_to(page, log);
@@ -1196,6 +1201,11 @@ impl Screen {
                         Some(settings::Tap::PickMoveTime) => self.pick(PickFor::MoveFrom, log),
                         Some(tap) => self.set(tap, log),
                         None => {}
+                    }
+                } else if self.page == Page::Sounds {
+                    // The main task plays it, or ends what plays.
+                    if let Some(n) = sounds::tap_at(x, y) {
+                        shared::request_sound(n);
                     }
                 } else if self.page == Page::Settings {
                     match menu::tap_at(x, y, self.scroll.moved()) {
@@ -1616,6 +1626,19 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Sounds {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                sounds::draw(&mut canvas, &area, self.sound_shown);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -2077,6 +2100,11 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         // The compass runs while its page is to be seen.
         shared::set_compass(screen.visible && screen.page == Page::Compass);
         screen.compass_report(state.readings.as_ref().and_then(|r| r.compass));
+        if screen.sound_shown != shared::playing() {
+            screen.sound_shown = shared::playing();
+            screen.t.damage[Page::Sounds.index()].add(face::whole());
+            screen.changed |= screen.page == Page::Sounds;
+        }
         if screen.stays != state.stays {
             // The power page says where a restart leads.
             screen.stays = state.stays;
@@ -2292,11 +2320,20 @@ async fn main_loop(
         if let (Some(settings), Some(partition)) = (shared::take_changed_settings(), log.partition()) {
             settings_save(partition, &settings, &mut log);
         }
-        if shared::take_sound() {
-            // Nothing else runs meanwhile, for the two seconds it takes.
+        // Sound. A request while one plays ends that one; otherwise it
+        // starts the sound asked for. The samples are the player task's
+        // business; when it is through, everything is switched off.
+        if let Some(n) = shared::take_sound() {
             match (sensors.audio.as_mut(), log.partition()) {
+                (Some((audio, _)), _) if audio.playing() => audio::cut(),
                 (Some((audio, awake)), Some(files)) => {
-                    audio.play_test_tone(awake, &mut sensors.bus, sensors.image, files, &mut log).await;
+                    // The codec's mixer value: from the stock speaker
+                    // test's own, in steps of 6 dB up to 4 dB below full.
+                    let volume = audio::VOLUME_QUIET + 12 * shared::settings().volume.min(3) as u32;
+                    let path = sounds::SOUNDS[n % sounds::SOUNDS.len()].1;
+                    if audio.start(awake, &mut sensors.bus, sensors.image, files, path, volume, &mut log).await {
+                        shared::set_playing(Some(n));
+                    }
                 }
                 _ => {
                     let _ = writeln!(log.stamp(), "sound: not on this board revision");
@@ -2304,6 +2341,22 @@ async fn main_loop(
             }
             let _ = log.flush();
         }
+        if let Some(outcome) = audio::finished() {
+            if let Some((audio, awake)) = sensors.audio.as_mut() {
+                let _ = writeln!(
+                    log.stamp(),
+                    "sound: {} samples sent, the port ran dry {} times{}{}",
+                    outcome.sent,
+                    outcome.dry,
+                    if outcome.cut { "; cut short on request" } else { "" },
+                    if outcome.failed { "; it FAILED (no clock from the codec, or the file)" } else { "" }
+                );
+                audio.stop(awake, &mut sensors.bus, &mut log);
+            }
+            shared::set_playing(None);
+            let _ = log.flush();
+        }
+        let sounding = sensors.audio.as_ref().is_some_and(|(audio, _)| audio.playing());
         if shared::take_power_off() {
             let sent = match apollo.as_mut() {
                 Some(apollo) => {
@@ -2380,6 +2433,7 @@ async fn main_loop(
             && buttons.settled()
             && !taps.waiting()
             && power_off_at.is_none()
+            && !sounding
             && !server.transferring();
         // The Bluetooth link sleeps and the processor may stop, the way
         // the stock app does it (its routines at 0x080969B6 and

@@ -107,11 +107,7 @@ impl Board {
                 codec_in: p.PC2,
                 master_clock_timer: p.TIM2,
                 master_clock: p.PA3,
-                port: p.SAI1,
-                port_clock: p.PA8,
-                port_frame: p.PA9,
-                port_data: p.PA10,
-                port_dma: p.DMA2_CH1,
+                port: audio::Port { port: p.SAI1, clock: p.PA8, frame: p.PA9, data: p.PA10, dma: p.DMA2_CH1 },
             },
             touch: touch::Resources { i2c: p.I2C3, scl: p.PC0, sda: p.PB4, reset: p.PF13, enable: p.PF4, irq: p.PA0 },
         }

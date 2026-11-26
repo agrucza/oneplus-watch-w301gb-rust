@@ -2,7 +2,7 @@
 //! file (PPM), to look at a design without the watch.
 //!
 //!   cargo run --bin preview -- OUT.ppm [MILLISECONDS] [boxes]
-//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|compass|compass-waiting|menu|menu-moved|launcher|launcher-chosen|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
+//!   cargo run --bin preview -- OUT.ppm above|above-set|below|below-set|sounds|compass|compass-waiting|menu|menu-moved|launcher|launcher-chosen|picker|picker-turning|picker-seconds|faces|cards|power|power-chosen|status
 //!
 //! MILLISECONDS moves the animation; a third argument outlines every
 //! element's rectangle. Text is blended in software here, on black; on the
@@ -77,6 +77,7 @@ fn main() {
             let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
         }
+        Some("sounds") => w301_host::app::sounds::draw(&mut frame, &whole, Some(2)),
         Some("compass") => {
             let view = w301_host::app::compass::View { degrees: 291, calibrated: true };
             w301_host::app::compass::draw(&mut frame, &whole, Some(view))

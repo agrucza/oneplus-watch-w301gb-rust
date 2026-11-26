@@ -392,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 11] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass];
+    const PAGES: [Page; 12] = [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -462,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -472,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds] {
             assert_eq!(tap(page), None);
         }
     }
@@ -861,6 +861,7 @@ mod settings {
                         move_time: (8 * 60 + 30, 18 * 60),
                         step_goal: 12_000,
                         heart_monitor: HeartMonitor::ALL[switches as usize % 3],
+                        volume: switches % 4,
                     });
                 }
             }
@@ -967,6 +968,8 @@ mod settings {
         assert_eq!(Settings { step_goal: 15_000, ..start }.after(Tap::NextStepGoal).step_goal, 6_000);
         let monitors: Vec<_> = (0..3).scan(start, |s, _| { *s = s.after(Tap::NextHeartMonitor); Some(s.heart_monitor) }).collect();
         assert_eq!(monitors, [HeartMonitor::Periodic, HeartMonitor::Always, HeartMonitor::Off]);
+        let volumes: Vec<_> = (0..4).scan(start, |s, _| { *s = s.after(Tap::NextVolume); Some(s.volume) }).collect();
+        assert_eq!(volumes, [1, 2, 3, 0]);
         assert_eq!(start.after(Tap::QuietTime((60, 120))), Settings { quiet_time: (60, 120), ..start });
         assert_eq!(start.after(Tap::MoveTime((600, 660))), Settings { move_time: (600, 660), ..start });
     }
@@ -1416,6 +1419,7 @@ mod menu {
                     Row::DisplayOff => Some(Hit::Setting(Tap::NextDisplayOff)),
                     Row::StepGoal => Some(Hit::Setting(Tap::NextStepGoal)),
                     Row::HeartMonitor => Some(Hit::Setting(Tap::NextHeartMonitor)),
+                    Row::Volume => Some(Hit::Setting(Tap::NextVolume)),
                     Row::Quiet => Some(Hit::Setting(Tap::PickQuietTime)),
                     Row::MoveAlert => Some(Hit::Setting(Tap::PickMoveTime)),
                     Row::RaiseToWake => None,
@@ -1433,5 +1437,77 @@ mod menu {
         }
         // Above the window (the title) nothing is hit.
         assert_eq!(tap_at(C, 40, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod wav {
+    use crate::services::wav::{parse, Wav};
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The heads of two of the watch's own sound files.
+    #[test]
+    fn the_watchs_files() {
+        // sms.wav: a "fmt " chunk of 18 bytes, so the samples begin at 46.
+        let sms = bytes("5249464626f0030057415645666d7420120000000100020044ac000010b102000400100000006461746100f003000000010001000100ffff0000");
+        assert_eq!(parse(&sms), Some(Wav { channels: 2, rate: 44_100, bits: 16, data_at: 46, data_len: 0x3F000 }));
+        // spkT.wav, the factory's test tone.
+        let tone = bytes("524946461e16020057415645666d7420100000000100010080bb0000007701000200100064617461fa15020000000000");
+        assert_eq!(parse(&tone), Some(Wav { channels: 1, rate: 48_000, bits: 16, data_at: 44, data_len: 0x215FA }));
+    }
+
+    /// As typing_sound.wav has it: a long "bext" chunk first, then
+    /// "fmt ", a two-byte chunk of another name, then "data" at 864.
+    #[test]
+    fn chunks_before_the_samples_are_passed_over() {
+        let mut file = b"RIFF\x00\x00\x00\x00WAVEbext".to_vec();
+        file.extend_from_slice(&802u32.to_le_bytes());
+        file.extend_from_slice(&[0x55; 802]);
+        file.extend_from_slice(b"fmt \x10\x00\x00\x00\x01\x00\x02\x00\x44\xac\x00\x00\x10\xb1\x02\x00\x04\x00\x10\x00");
+        file.extend_from_slice(b"Fake\x02\x00\x00\x00\x00\x00");
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&14936u32.to_le_bytes());
+        file.extend_from_slice(&[0; 32]);
+        assert_eq!(parse(&file), Some(Wav { channels: 2, rate: 44_100, bits: 16, data_at: 864, data_len: 14936 }));
+        // With too little of the file at hand there is no answer.
+        assert_eq!(parse(&file[..860]), None);
+    }
+
+    #[test]
+    fn what_is_no_plain_wav_file_is_refused() {
+        assert_eq!(parse(b""), None);
+        assert_eq!(parse(b"RIFF\x00\x00\x00\x00AVI LIST"), None);
+        assert_eq!(parse(&[0xFF; 64]), None);
+        // A compressed kind (format 85, MP3) in a WAV wrapper.
+        let mp3 = bytes("5249464600000000574156 45666d74201000000055000200".replace(' ', "").as_str());
+        assert_eq!(parse(&[mp3, vec![0; 40]].concat()), None);
+        // "data" before "fmt ".
+        assert_eq!(parse(b"RIFF\x00\x00\x00\x00WAVEdata\x04\x00\x00\x00\x00\x00\x00\x00"), None);
+        // A chunk whose length runs past everything.
+        assert_eq!(parse(b"RIFF\x00\x00\x00\x00WAVEjunk\xff\xff\xff\xff\x00\x00"), None);
+    }
+}
+
+#[cfg(test)]
+mod sounds {
+    use crate::app::sounds::{row_rect, tap_at, SOUNDS};
+    use crate::app::theme::{C, SIZE};
+
+    #[test]
+    fn a_tap_on_a_row_names_its_sound_and_the_rows_are_on_the_glass() {
+        for n in 0..SOUNDS.len() {
+            let r = row_rect(n);
+            let middle = r.center();
+            assert_eq!(tap_at(middle.x, middle.y), Some(n));
+            let (x0, y0) = (r.top_left.x, r.top_left.y);
+            let (x1, y1) = (x0 + r.size.width as i32 - 1, y0 + r.size.height as i32 - 1);
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                assert!((x - C).pow(2) + (y - C).pow(2) <= (SIZE / 2).pow(2), "row {n}: {r:?}");
+            }
+        }
+        assert_eq!(tap_at(C, 40), None);
     }
 }

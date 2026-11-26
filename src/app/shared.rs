@@ -18,7 +18,7 @@
 //!   by the display task, written back to the file by the main task.
 
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -69,7 +69,11 @@ static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 static POWER_OFF: AtomicBool = AtomicBool::new(false);
 static COMPASS: AtomicBool = AtomicBool::new(false);
-static SOUND: AtomicBool = AtomicBool::new(false);
+/// The sound asked for and the sound playing, as numbers in
+/// `sounds::SOUNDS`; `NO_SOUND` for none.
+static SOUND: AtomicU8 = AtomicU8::new(NO_SOUND);
+static PLAYING: AtomicU8 = AtomicU8::new(NO_SOUND);
+const NO_SOUND: u8 = 0xFF;
 
 pub fn set_state(state: State) {
     STATE.lock(|cell| cell.set(state));
@@ -120,15 +124,28 @@ pub fn compass() -> bool {
     COMPASS.load(Ordering::Relaxed)
 }
 
-/// Ask the main task to play the test tone.
-pub fn request_sound() {
-    SOUND.store(true, Ordering::Relaxed);
+/// Ask the main task to play sound `n` of `sounds::SOUNDS`, or, while
+/// one plays, to end it.
+pub fn request_sound(n: usize) {
+    SOUND.store(n as u8, Ordering::Relaxed);
     crate::hal::wake::nudge();
 }
 
-/// Whether the test tone was asked for since the last call.
-pub fn take_sound() -> bool {
-    SOUND.swap(false, Ordering::Relaxed)
+/// The sound asked for since the last call, if one was.
+pub fn take_sound() -> Option<usize> {
+    let n = SOUND.swap(NO_SOUND, Ordering::Relaxed);
+    (n != NO_SOUND).then_some(n as usize)
+}
+
+/// Say which sound plays, for the page that lists them.
+pub fn set_playing(n: Option<usize>) {
+    PLAYING.store(n.map_or(NO_SOUND, |n| n as u8), Ordering::Relaxed);
+}
+
+/// The sound that plays, if one does.
+pub fn playing() -> Option<usize> {
+    let n = PLAYING.load(Ordering::Relaxed);
+    (n != NO_SOUND).then_some(n as usize)
 }
 
 /// Ask the main task to have the Apollo switch the watch off.

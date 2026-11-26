@@ -28,3 +28,5 @@ pub mod launcher;
 pub mod menu;
 #[path = "../../../src/app/compass.rs"]
 pub mod compass;
+#[path = "../../../src/app/sounds.rs"]
+pub mod sounds;

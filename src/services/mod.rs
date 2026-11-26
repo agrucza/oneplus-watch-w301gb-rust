@@ -14,3 +14,4 @@ pub mod log;
 pub mod storage;
 pub mod turn;
 pub mod update;
+pub mod wav;
