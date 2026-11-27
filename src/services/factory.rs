@@ -65,9 +65,13 @@ pub fn light_calibration(log: &mut Log) -> Option<f32> {
 
 /// The watch's Bluetooth address, first byte first. `None` (with the reason
 /// in the log) if the file or the record is missing or damaged. The address
-/// itself is never logged.
+/// itself is never logged. To be called from the main task only: the
+/// file is read into one buffer, every time it is asked for (after the
+/// Bluetooth chip was switched off and on, and for the watch's name).
 pub fn bluetooth_address(log: &mut Log) -> Option<[u8; 6]> {
-    let file = cortex_m::singleton!(: [u8; FILE_LEN] = [0; FILE_LEN])?;
+    // Safety: only the main task runs this, one call at a time.
+    static mut FILE_BUFFER: [u8; FILE_LEN] = [0; FILE_LEN];
+    let file = unsafe { &mut *(&raw mut FILE_BUFFER) };
     let read = storage::inspect(VOLUME).map_err(|_| 1u8).and_then(|p| storage::read_root_file(p, FILE, file));
     match read {
         Ok(FILE_LEN) => {}

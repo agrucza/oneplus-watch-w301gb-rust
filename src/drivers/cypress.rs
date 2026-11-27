@@ -54,6 +54,20 @@ pub const CMD_PUSH_NVRAM_DATA: u16 = 0x0005;
 pub const CMD_SET_VISIBILITY: u16 = 0x0008;
 /// Ask for the chip's Bluetooth address.
 pub const CMD_READ_LOCAL_BDA: u16 = 0x000F;
+/// Make the chip forget a record: its id (u16 LE). Only ever sent for a
+/// device the wearer removes, together with clearing its slot in the
+/// pairing file (stock: 0x08068922).
+pub const CMD_DELETE_NVRAM_DATA: u16 = 0x0006;
+/// Allow pairing: 1 byte, 1 = allowed. The stock app sends it once after
+/// the chip has started and never takes it back (0x0802AF58).
+pub const CMD_SET_PAIRING_MODE: u16 = 0x0009;
+/// Answer the chip's question whether a pairing's number is right: the
+/// peer's address, last byte first, then 1 for yes or 0 for no (stock:
+/// 0x080689F0).
+pub const CMD_USER_CONFIRMATION: u16 = 0x000B;
+/// The name the watch is found under: its bytes, no end mark (stock:
+/// 0x0806886C).
+pub const CMD_SET_LOCAL_NAME: u16 = 0x0012;
 
 // Events seen so far.
 /// Answer to most commands: 1 byte, 0 = accepted.
@@ -62,6 +76,17 @@ pub const EVT_COMMAND_STATUS: u16 = 0x0001;
 pub const EVT_DEVICE_STARTED: u16 = 0x0005;
 /// Answer to `CMD_READ_LOCAL_BDA`: 6 bytes, first byte of the address first.
 pub const EVT_LOCAL_BDA: u16 = 0x000D;
+/// A record the host is to keep and hand back after every start of the
+/// chip: id (u16 LE), then the peer's address and its keys. Never to be
+/// written to the log.
+pub const EVT_NVRAM_DATA: u16 = 0x0004;
+/// A pairing has ended; the stock app shows a failure if the first byte
+/// is 5 and does nothing otherwise (0x0802BBFC).
+pub const EVT_PAIRING_COMPLETE: u16 = 0x0008;
+/// The chip asks whether a pairing's number is right: the peer's address,
+/// first byte first (measured: the same order as in the record that
+/// follows), then the number (u32 LE).
+pub const EVT_USER_CONFIRMATION: u16 = 0x000B;
 
 /// Everything the Cypress link uses.
 pub struct Resources {
@@ -429,5 +454,9 @@ pub fn log_packet(log: &mut Log, packet: &Packet<'_>) {
         packet.opcode & 0xFF,
         packet.payload.len()
     );
+    // A record to keep holds keys: those never go to the log.
+    if packet.opcode == EVT_NVRAM_DATA {
+        return;
+    }
     log.hex(packet.payload);
 }

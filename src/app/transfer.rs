@@ -21,15 +21,18 @@ pub fn cancel_rect() -> Rectangle {
 }
 
 /// The question an offer puts to the wearer, for the confirmation
-/// screen (`super::confirm`); `None` for a transfer under way.
-pub fn question(transfer: Transfer) -> Option<Question> {
+/// screen (`super::confirm`); `None` for a transfer under way. `number`
+/// is the one a pairing is to be compared by.
+pub fn question(transfer: Transfer, number: u32) -> Option<Question> {
     let (color, question, detail) = match transfer {
         Transfer::Offered => (YELLOW, "NEW FIRMWARE?", ["A PC ASKS TO SEND", "FIRMWARE TO THIS WATCH"]),
         Transfer::OfferedGet => (CYAN, "TRANSFER FILE?", ["A PC ASKS FOR A FILE", "FROM THIS WATCH"]),
         Transfer::OfferedPut => (CYAN, "TRANSFER FILE?", ["A PC ASKS TO WRITE", "A FILE TO THIS WATCH"]),
+        Transfer::OfferedPairing => (CYAN, "PAIR DEVICE?", ["ACCEPT ONLY IF THE DEVICE", "SHOWS THIS NUMBER"]),
         Transfer::Receiving | Transfer::Sending | Transfer::Waiting => return None,
     };
-    Some(Question { title: "BLUETOOTH", color, question, detail, no: "DENY", yes: "ACCEPT", hint: "UPPER BUTTON : ACCEPT" })
+    let number = (transfer == Transfer::OfferedPairing).then_some(number);
+    Some(Question { title: "BLUETOOTH", color, question, detail, no: "DENY", yes: "ACCEPT", hint: "UPPER BUTTON : ACCEPT", number, danger: false })
 }
 
 /// Whether a tap at (x, y) is on the button.
@@ -38,10 +41,10 @@ pub fn cancel_at(x: i32, y: i32) -> bool {
 }
 
 /// Draw the part of the page that lies in `clip`: the transfer and how
-/// many percent of it are through.
-pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, transfer: Transfer, percent: u8) {
+/// many percent of it are through; for a pairing, its number.
+pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, transfer: Transfer, percent: u8, number: u32) {
     theme::clear(target, clip);
-    if let Some(question) = question(transfer) {
+    if let Some(question) = question(transfer, number) {
         confirm::draw(target, clip, &question);
         return;
     }

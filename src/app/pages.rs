@@ -42,6 +42,10 @@ pub enum Page {
     Transfer,
     /// What the satellite receiver reports (`super::gps`).
     Gps,
+    /// Pairing a new device over Bluetooth (`super::pair`).
+    Pair,
+    /// The paired devices, to look at and to remove (`super::devices`).
+    Devices,
 }
 
 /// How many frames the pages have between them (`Page::frames`).
@@ -49,7 +53,7 @@ pub const FRAMES: usize = 9;
 
 impl Page {
     /// A number for each page, from 0, for tables with an entry a page.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 16;
     pub fn index(self) -> usize {
         match self {
             Page::Face => 0,
@@ -66,6 +70,8 @@ impl Page {
             Page::Sounds => 11,
             Page::Transfer => 12,
             Page::Gps => 13,
+            Page::Pair => 14,
+            Page::Devices => 15,
         }
     }
 
@@ -94,6 +100,8 @@ impl Page {
             Page::Sounds => (6, 1),
             Page::Transfer => (6, 1),
             Page::Gps => (6, 1),
+            Page::Pair => (6, 1),
+            Page::Devices => (6, 1),
             Page::Launcher => (7, 1),
             Page::Power => (8, 1),
         }
@@ -104,7 +112,7 @@ impl Page {
     /// True for a page whose frame another page uses too: its picture
     /// may be gone when it is opened.
     pub fn shared_frame(self) -> bool {
-        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings | Page::Compass | Page::Sounds | Page::Transfer | Page::Gps)
+        matches!(self, Page::Faces | Page::Cards | Page::Picker | Page::Settings | Page::Compass | Page::Sounds | Page::Transfer | Page::Gps | Page::Pair | Page::Devices)
     }
 }
 

@@ -392,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 14] = [Page::Gps, Page::Transfer, Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
+    const PAGES: [Page; 16] = [Page::Devices, Page::Pair, Page::Gps, Page::Transfer, Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -462,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps, Page::Pair, Page::Devices] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -472,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps, Page::Pair, Page::Devices] {
             assert_eq!(tap(page), None);
         }
     }
@@ -1416,6 +1416,7 @@ mod menu {
                 }
                 let expected = match row {
                     Row::Quick => Some(Hit::Quick),
+                    Row::Pair => Some(Hit::Pair),
                     Row::Brightness => Some(Hit::Setting(Tap::NextBrightness)),
                     Row::DisplayOff => Some(Hit::Setting(Tap::NextDisplayOff)),
                     Row::StepGoal => Some(Hit::Setting(Tap::NextStepGoal)),
@@ -1531,12 +1532,15 @@ mod transfer {
         assert_eq!(answer_at(no.x, no.y), Some(false));
         assert_eq!(answer_at(227, 100), None);
         // Every offer has its question, a transfer under way has none.
-        for offer in [Transfer::Offered, Transfer::OfferedGet, Transfer::OfferedPut] {
-            assert!(offer.is_offer() && question(offer).is_some());
+        for offer in [Transfer::Offered, Transfer::OfferedGet, Transfer::OfferedPut, Transfer::OfferedPairing] {
+            assert!(offer.is_offer() && question(offer, 0).is_some());
         }
         for running in [Transfer::Receiving, Transfer::Sending, Transfer::Waiting] {
-            assert!(!running.is_offer() && question(running).is_none());
+            assert!(!running.is_offer() && question(running, 0).is_none());
         }
+        // Only a pairing's question carries a number to compare.
+        assert_eq!(question(Transfer::OfferedPairing, 482_913).and_then(|q| q.number), Some(482_913));
+        assert_eq!(question(Transfer::Offered, 482_913).and_then(|q| q.number), None);
     }
 
     /// One test for the shared state, which is the same for all.
@@ -1664,5 +1668,80 @@ mod gps {
         text.clear();
         degrees(-1_276_000, 'E', 'W', &mut text);
         assert_eq!(text, "0.12760 W");
+    }
+}
+
+/// `services::pair_table`: the table of paired devices. Made-up devices
+/// throughout.
+#[cfg(test)]
+mod pair_table {
+    use crate::services::pair_table::*;
+
+    fn made(id: u16, last: u8) -> [u8; RECORD_LEN] {
+        let mut r = [0x5A; RECORD_LEN];
+        r[..2].copy_from_slice(&id.to_le_bytes());
+        r[2..8].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, last]);
+        r
+    }
+
+    /// A table as found on the watch: something in the phone's slot, and
+    /// one device twice under one id in slots 1 and 2.
+    fn found() -> Table {
+        let mut t = [0u8; FILE_LEN];
+        for (n, id, last, kind) in [(0, 0x10, 1, 0), (1, 0x11, 2, 2), (2, 0x11, 2, 2)] {
+            t[n * SLOT_LEN..n * SLOT_LEN + RECORD_LEN].copy_from_slice(&made(id, last));
+            t[n * SLOT_LEN + 0xAD] = kind;
+        }
+        t
+    }
+
+    #[test]
+    fn the_table_is_the_stock_files_size() {
+        assert_eq!(FILE_LEN, 1575);
+        assert_eq!(entries(&found()).count(), 3);
+        assert_eq!(entry(&found(), 2).map(|e| (e.id, e.kind, e.address[5])), Some((0x11, 2, 2)));
+        assert_eq!(entry(&found(), 3), None);
+        assert_eq!(record(&found(), 0), &made(0x10, 1)[..]);
+    }
+
+    #[test]
+    fn a_new_device_goes_to_the_first_free_slot_of_ours_and_nothing_else_changes() {
+        let mut t = found();
+        let before = t;
+        assert_eq!(store(&mut t, &made(0x12, 9)), Ok(3));
+        assert_eq!(t[..3 * SLOT_LEN], before[..3 * SLOT_LEN]);
+        assert_eq!(t[4 * SLOT_LEN..], before[4 * SLOT_LEN..]);
+        assert_eq!(entry(&t, 3).map(|e| (e.id, e.kind, e.address[5])), Some((0x12, 2, 9)));
+        assert_eq!(record(&t, 3), &made(0x12, 9)[..]);
+        assert!(holds(&t, [0x02, 0, 0, 0, 0, 9]) && holds(&t, [9, 0, 0, 0, 0, 0x02]));
+        assert!(!holds(&t, [0x02, 0, 0, 0, 0, 8]));
+    }
+
+    #[test]
+    fn nothing_is_pushed_out_and_nothing_stored_twice() {
+        let mut t = found();
+        assert_eq!(store(&mut t, &made(0x13, 2)), Err(Refused::Held));
+        assert_eq!(store(&mut t, &[0u8; RECORD_LEN]), Err(Refused::NotARecord));
+        assert_eq!(store(&mut t, &made(0x13, 3)[..100]), Err(Refused::NotARecord));
+        for (n, last) in [(3, 3), (4, 4), (5, 5), (6, 6)] {
+            assert_eq!(store(&mut t, &made(0x20 + last as u16, last)), Ok(n));
+        }
+        let full = t;
+        assert_eq!(free_slot(&t), None);
+        assert_eq!(store(&mut t, &made(0x30, 7)), Err(Refused::Full));
+        assert_eq!(t, full);
+    }
+
+    #[test]
+    fn removing_clears_the_slot_and_says_whether_the_id_is_still_in_use() {
+        let mut t = found();
+        assert_eq!(remove(&mut t, 5), None);
+        // One of the two with the same id: the chip keeps the record.
+        assert_eq!(remove(&mut t, 1), Some((0x11, true)));
+        assert!(t[SLOT_LEN..2 * SLOT_LEN].iter().all(|&b| b == 0));
+        assert_eq!(remove(&mut t, 2), Some((0x11, false)));
+        assert_eq!(remove(&mut t, 0), Some((0x10, false)));
+        assert_eq!(entries(&t).count(), 0);
+        assert_eq!(free_slot(&t), Some(2));
     }
 }

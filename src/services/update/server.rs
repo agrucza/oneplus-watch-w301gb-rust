@@ -130,6 +130,8 @@ pub struct Server {
     image_partition: Partition,
     /// A peer is connected to the serial port.
     pub connected: bool,
+    /// Pairing a new device: it gets the chip's packets that are its own.
+    pub pairing: crate::services::pairing::Pairing,
 }
 
 impl Server {
@@ -152,6 +154,7 @@ impl Server {
             first_contact_deadline: Instant::now() + FIRST_CONTACT_LIMIT,
             image_partition,
             connected: false,
+            pairing: crate::services::pairing::Pairing::new(),
         })
     }
 
@@ -263,6 +266,11 @@ impl Server {
             match opcode {
                 EVT_SPP_CONNECTED => {
                     self.connected = true;
+                    // Who it is, for the page of paired devices: the
+                    // peer's address comes first, last byte first.
+                    if packet.payload.len() >= 6 {
+                        crate::services::pairing::serial_peer(&packet.payload[..6]);
+                    }
                     let _ = writeln!(log.stamp(), "bluetooth: peer connected");
                 }
                 EVT_SPP_DISCONNECTED => {
@@ -286,7 +294,11 @@ impl Server {
                     let _ = log.flush();
                 }
                 EVT_SPP_TX_COMPLETE => {} // one per answer we send; not worth a log line
-                _ => cypress::log_packet(log, &packet),
+                _ => {
+                    if !self.pairing.event(opcode, packet.payload, log) {
+                        cypress::log_packet(log, &packet);
+                    }
+                }
             }
             return Activity::Handled;
         }

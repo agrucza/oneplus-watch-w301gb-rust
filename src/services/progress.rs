@@ -2,7 +2,7 @@
 //! set by the update server, read by the display task, which can also
 //! ask for the transfer to be ended.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// A transfer over Bluetooth.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,12 +20,15 @@ pub enum Transfer {
     OfferedPut,
     /// The wearer said yes, and the PC has not begun yet.
     Waiting,
+    /// A device asks to be paired and shows a number (`number`): the
+    /// wearer is to say whether the watch shows the same.
+    OfferedPairing,
 }
 
 impl Transfer {
     /// Whether this is a question to the wearer.
     pub fn is_offer(self) -> bool {
-        matches!(self, Transfer::Offered | Transfer::OfferedGet | Transfer::OfferedPut)
+        matches!(self, Transfer::Offered | Transfer::OfferedGet | Transfer::OfferedPut | Transfer::OfferedPairing)
     }
 }
 
@@ -34,6 +37,8 @@ static PERCENT: AtomicU8 = AtomicU8::new(0);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 /// The answer to an offer: 0 none yet, 1 accepted, 2 denied.
 static DECISION: AtomicU8 = AtomicU8::new(0);
+/// The number of the pairing asked about.
+static NUMBER: AtomicU32 = AtomicU32::new(0);
 
 /// Say that `transfer` has begun; it has no request to end it yet.
 pub fn begin(transfer: Transfer) {
@@ -41,6 +46,17 @@ pub fn begin(transfer: Transfer) {
     CANCEL.store(false, Ordering::Relaxed);
     DECISION.store(0, Ordering::Relaxed);
     KIND.store(transfer as u8 + 1, Ordering::Relaxed);
+}
+
+/// Ask the wearer about a pairing whose number is `number`.
+pub fn begin_pairing(number: u32) {
+    NUMBER.store(number, Ordering::Relaxed);
+    begin(Transfer::OfferedPairing);
+}
+
+/// The number of the pairing asked about.
+pub fn number() -> u32 {
+    NUMBER.load(Ordering::Relaxed)
 }
 
 /// Say how far it is: `done` of `total` bytes.
@@ -62,6 +78,7 @@ pub fn now() -> Option<(Transfer, u8)> {
         4 => Transfer::OfferedGet,
         5 => Transfer::OfferedPut,
         6 => Transfer::Waiting,
+        7 => Transfer::OfferedPairing,
         _ => return None,
     };
     Some((transfer, PERCENT.load(Ordering::Relaxed)))

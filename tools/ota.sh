@@ -11,6 +11,7 @@
 #   tools/ota.sh oldlog     fetch 3:log/rust.old (the log before the last fresh start) into target/rust.old
 #   tools/ota.sh clock      compare the watch's clock with this computer's (appends to target/clock.txt)
 #   tools/ota.sh put FILE NAME   put a small file into 3:log/ under a short name (Rust app only)
+#   tools/ota.sh pairings   copy the watch's pairing file (it holds keys) into $OPW_DIR/pairings/, outside the project
 #
 # `send` finds out which firmware is running. To the Rust app it sends a
 # compact package over a single connection (a few seconds). To the stock app
@@ -87,6 +88,21 @@ oldlog) # the previous generation of the log, kept when the log was started afre
     python3 tools/offer.py GET
     bt pull 3:log/rust.old target/rust.old
     echo "[ota.sh] previous log: $PWD/target/rust.old"
+    ;;
+pairings) # a copy of the stored pairings, before anything writes that file
+    # The file holds the keys of every paired device: it goes to a folder
+    # outside the project, readable by its owner only.
+    mkdir -p "$OPW_DIR/pairings"
+    chmod 700 "$OPW_DIR/pairings"
+    copy="$OPW_DIR/pairings/bluethooth_pair-$(date +%Y%m%d-%H%M%S).cfg"
+    python3 tools/offer.py GET
+    (umask 077; bt pull 2:bluethooth_pair.cfg "$copy")
+    size=$(stat -c %s "$copy")
+    if [ "$size" != 1575 ]; then
+        echo "[ota.sh] the copy has $size bytes where 1575 are expected: NOT a good copy ($copy)" >&2
+        exit 1
+    fi
+    echo "[ota.sh] pairing file copied, 1575 bytes: $copy"
     ;;
 time) # Rust app is running: set its clock to this computer's local time
     python3 tools/settime.py

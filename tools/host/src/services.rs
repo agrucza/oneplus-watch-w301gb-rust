@@ -10,3 +10,5 @@ pub mod gestures;
 pub mod wav;
 #[path = "../../../src/services/progress.rs"]
 pub mod progress;
+#[path = "../../../src/services/pair_table.rs"]
+pub mod pair_table;

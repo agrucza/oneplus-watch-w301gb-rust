@@ -77,7 +77,7 @@ fn main() {
             let set = w301_host::app::settings::Settings { brightness: Some(2), display_off_s: 30, raise_to_wake: false, quiet: true, move_reminder: true, ..w301_host::app::settings::Settings::START };
             w301_host::app::settings::draw(&mut frame, &whole, &set)
         }
-        Some("waiting") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Waiting, 0),
+        Some("waiting") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Waiting, 0, 0),
         Some("gps") | Some("gps-fix") => {
             use w301_host::drivers::apollo::messages::Gps;
             let fix = args.get(2).map(|s| s.as_str()) == Some("gps-fix");
@@ -86,8 +86,15 @@ fn main() {
             let report = Gps { fix, used: if fix { 6 } else { 0 }, in_view: 8, strongest, lat_e7: 560_000_000, lon_e7: 30_000_000, speed_dmh: 12, utc: 0, ttff_ms: if fix { 187_000 } else { 0 } };
             w301_host::app::gps::draw(&mut frame, &whole, &w301_host::app::gps::View { report: Some(report), seconds: 73, stopped: false });
         }
-        Some("offer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Offered, 0),
-        Some("transfer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Receiving, 42),
+        Some("pairing") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::OfferedPairing, 0, 482_913),
+        Some("devices") | Some("devices-ask") => {
+            let asking = args.get(2).map(|s| s.as_str()) == Some("devices-ask");
+            let view = w301_host::app::devices::View { count: 3, index: 1, kind: 2, address: [0x02, 0x1A, 0x7D, 0x00, 0x3C, 0x5E], serial: true, asking, unsaved: false };
+            w301_host::app::devices::draw(&mut frame, &whole, &view);
+        }
+        Some("pair") => w301_host::app::pair::draw(&mut frame, &whole, &w301_host::app::pair::View { state: w301_host::app::pair::State::Ready, suffix: *b"1A2B" }),
+        Some("offer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Offered, 0, 0),
+        Some("transfer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Receiving, 42, 0),
         Some("sounds") => w301_host::app::sounds::draw(&mut frame, &whole, Some(2)),
         Some("compass") => {
             let view = w301_host::app::compass::View { degrees: 291, calibrated: true };

@@ -29,9 +29,11 @@ pub enum Row {
     HeartMonitor,
     Volume,
     EventSounds,
+    /// Opens the page for pairing a new device.
+    Pair,
 }
 
-pub const ROWS: [Row; 10] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::Volume, Row::EventSounds, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal, Row::HeartMonitor];
+pub const ROWS: [Row; 11] = [Row::Quick, Row::Brightness, Row::DisplayOff, Row::Volume, Row::EventSounds, Row::RaiseToWake, Row::Quiet, Row::MoveAlert, Row::StepGoal, Row::HeartMonitor, Row::Pair];
 
 /// The left edge and the width of the rows, and the height of one.
 const LEFT: i32 = 66;
@@ -66,6 +68,8 @@ pub fn longest() -> i32 {
 pub enum Hit {
     /// Open the panel with the quick settings.
     Quick,
+    /// Open the page for pairing a new device.
+    Pair,
     /// Change a setting, or open the page for one of the two times.
     Setting(Tap),
 }
@@ -82,6 +86,7 @@ pub fn tap_at(x: i32, y: i32, moved: i32) -> Option<Hit> {
     let on_switch = x >= LEFT + WIDTH - SWITCH.0 - 12;
     Some(match (row, on_switch) {
         (Row::Quick, _) => Hit::Quick,
+        (Row::Pair, _) => Hit::Pair,
         (Row::Brightness, _) => Hit::Setting(Tap::NextBrightness),
         (Row::DisplayOff, _) => Hit::Setting(Tap::NextDisplayOff),
         (Row::StepGoal, _) => Hit::Setting(Tap::NextStepGoal),
@@ -144,6 +149,7 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, settings: &Settings, mov
         };
         let (label, switch) = match row {
             Row::Quick => ("QUICK SETTINGS", None),
+            Row::Pair => ("PAIR DEVICE", None),
             Row::Brightness => {
                 match settings.brightness {
                     None => {
@@ -194,7 +200,7 @@ pub fn draw<D: Paint>(target: &mut D, clip: &Rectangle, settings: &Settings, mov
                 theme::switch(target, &window, right, y + (ROW - SWITCH.1) / 2, SWITCH, on);
                 right -= 12;
             }
-            (Row::Quick, _) => {
+            (Row::Quick | Row::Pair, _) => {
                 right -= NW_ICON_NEXT.width as i32;
                 target.art(&window, right, y + (ROW - NW_ICON_NEXT.height as i32) / 2, &NW_ICON_NEXT, CYAN);
             }

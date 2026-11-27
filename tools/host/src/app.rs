@@ -36,3 +36,7 @@ pub mod transfer;
 pub mod confirm;
 #[path = "../../../src/app/gps.rs"]
 pub mod gps;
+#[path = "../../../src/app/pair.rs"]
+pub mod pair;
+#[path = "../../../src/app/devices.rs"]
+pub mod devices;

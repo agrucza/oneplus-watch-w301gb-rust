@@ -27,12 +27,12 @@ runs its own stack. Each chip below hangs off one of them.
 | 4 | AMOLED panel 454 x 454 | DSI + LTDC, TE on PF11, PG5, PF12, PF5, PA11 | none | works: frames in step with the panel, two frame buffers, only what changed is drawn, hardware blitter, watch face and status page, brightness, blanking by button and by wrist gesture |
 | 5 | PSRAM 16 MB | FMC bank 1, ~30 pins, CRE on PE2 | none | works |
 | 6 | Touch controller | I2C3 (PB4, PC0), address 0x24 | `tp/tp_firmware.bin` | partly: position and events of one finger; tap and long press recognised; drags act in all 4 of the stock app's directions (pages left and right, two panels up and down, the panels with placeholder content). covering hand blanks the display. Open: what the panels and the long-press pages hold, sleep and wake (see 3.1) |
-| 7 | Audio codec Cirrus CS47L15 with DSP (by the user's datasheet; ID register not read yet) | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | nothing |
-| 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | nothing |
+| 7 | Audio codec Cirrus CS47L15 with DSP (by the user's datasheet; ID register not read yet) | SPI (control), SAI1 (audio) | `codec/adsp_for_*.bin` (13 files) | works for playback and recording: files loaded, speaker path, microphone path (3.6) |
+| 8 | Speaker and microphone | through the codec | tones in `audio/*.wav` | works: the six stock sounds at four volumes, sounds for events, a 2 s recording played back (3.6) |
 | 9 | NFC controller NXP SN100T with secure element | I2C2, address 0x28 | `nfc/nfc_firmware.bin`, two `.conf` files | nothing; does not answer on the bus yet |
 | 10 | Ambient light sensor STK31800 | I2C2 (PF1, PF0), address 0x45 | none | works: calibrated lux, automatic brightness as in the stock app |
 | 11 | Buttons: upper on PC13, lower through the Apollo (message kind 51) | GPIO; Apollo link | none | both work; they control the display. The Apollo's key logic is read; short presses of the lower one are counted on our side |
-| 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | nothing |
+| 12 | GPS Airoha AG3335, firmware side | shared with the Apollo | `gps/*.bin` (5 files) | not touched: the chip runs the firmware it has; the files are only for downloading one into it (3.9) |
 | 13 | Real-time clock, backup domain | internal, LSE crystal | none | works: read, set over Bluetooth with time zone, shown on screen |
 | 14 | Log UART | LPUART1 (PG7, PG8) | none | not used |
 
@@ -45,14 +45,14 @@ The Apollo names them itself in message kind 52 (**measured**).
 | # | Chip | Function | State in Rust |
 |---|---|---|---|
 | 15 | LSM6DSO (firmware also carries BMI270 and ICM-40608 drivers) | accelerometer and gyroscope | raw data not decoded; the Apollo's wrist gestures from it are used (raise-to-wake) |
-| 16 | MMC5603 | magnetometer | nothing decoded |
+| 16 | MMC5603 | magnetometer | decoded: heading and calibration state, compass app (3.5) |
 | 17 | ICP-101xx | barometer | decoded: pressure, altitude |
 | 18 | MediaTek MT6670 | heart rate and SpO2 optical front end | single heart-rate measurement works; its infrared check is one input of wear detection |
 | 19 | SX932x | capacitive wear detection | decoded: worn / not worn with reason |
 | 20 | BQ25618 | battery charger | partly: USB power flag |
 | 21 | CW2015 | fuel gauge | decoded: percent, millivolts |
 | 22 | AW8695 | haptic motor driver | pulses work; effects not done |
-| 23 | AG3335 | GPS, position data side | nothing decoded |
+| 23 | AG3335 | GPS, position data side | works: switched through the Apollo, reports decoded, GPS app; no orbit data (3.9) |
 | 24 | NTC thermistors | three temperatures | decoded |
 
 ## 2. The STM32's own buses and pins
@@ -1359,6 +1359,156 @@ Steps:
 5. Heartbeat towards the chip (`heartbeat timeout %d` in the stock app).
 6. Chip firmware update (`minidriver.bin` / `appdriver.bin` at 115200
    baud): only if ever needed.
+
+**Pairing as the stock app does it (read in B.70, 2026-11-27; nothing
+built yet).** The chip's packets go through a dispatcher by group
+(`0x0802C320`); group 0, the device itself, at `0x0802BBFC`:
+
+| Event | Meaning | What the stock app does |
+|---|---|---|
+| 0x0004 | a record to keep: id (chosen by the chip) and data | copies it to a waiting place behind the nine slots |
+| 0x0005 | chip started | the whole set-up below |
+| 0x0008 | pairing ended | shows a failure (first byte 5); nothing on success |
+| 0x0009 | encryption changed; last byte the transport | notes an LE one |
+| 0x000B | "is this number right?": peer address, number (u32) | answers yes at once (0x000B, address and 1) and only then shows the number; no when a phone is already connected |
+| 0x000D | the chip's address | compares, log only |
+| 0x0011 | connection status | |
+| 0x0012 | answer to the heartbeat question 0x0013 | |
+
+The stock app never looks at the command status and never asks the
+wearer: whoever sees the watch while it can be found can pair.
+
+A slot of `2:bluethooth_pair.cfg` (175 bytes): 0 id, 2 peer address,
+9 classic key, 0x1A LE address type, 0x22 LE keys, 0x8C a name of 33
+bytes (headsets), 0xAD type (0 phone by serial port, 1 phone by LE, 2
+headset, 3 a device paired in a special mode), 0xAE connection state
+(zeroed at every load). What is pushed to the chip is the id and bytes
+2 to 0x89. The waiting record is filed when the device then connects:
+serial port connected: type 0; LE encrypted and a further record: type
+1; audio connected: type 2. Type 0 goes to slot 0, type 1 to slot 1,
+type 2 to slots 2 to 6, type 3 to slots 7 and 8; the same address in
+the range is overwritten, else the first free slot is taken, else the
+oldest is pushed out. So a second phone replaces the first. The file
+is written whole in place (`0x0802BB3C`), no checksum, no second copy;
+a file of another size than 1575 bytes is ignored at start and all
+pairings are gone for that run.
+
+Set-up after "chip started" (`0x0802AF58`), in order: 0x0009 `01`
+(pairing allowed; never switched off again), 0x0002 `01 01`, 0xFF02,
+0x0016 `04 04`, the address, the name (0x0012), 0x000F, 0x0015 with
+four bytes, 0x0013, the records, then visibility (0x0008: to be found
+and connectable while there is no phone record; only connectable with
+one; neither while a phone is connected) and LE advertising (0x0116,
+0x0102, 0x0114/0x0115). Ours sends the address, 0x000F, the records
+and visibility `00 01` only, so nothing can pair with it.
+
+A record is removed with 0x0006 and its id, then the slot's id zeroed
+and the file saved. Every 30 minutes the stock app asks 0x0013 and
+switches the chip off and on after four unanswered.
+
+Never to be sent or done by accident: 0x0006 (removes a record on the
+chip), the address command with another address (breaks what the
+other side holds), a save of the table after ids were zeroed in RAM,
+a file of another length, the raw HCI commands of the stock app's
+factory AT handlers, its "cypress force update". Not known: what the
+chip really sends during a pairing and in which order (only the host
+side was read), the bytes of the name, what the commands 0x0013 to
+0x0016 and 0x0114 to 0x0116 mean to the chip.
+
+**Pairing here, first stage (2026-11-27; built, not yet tried on the
+watch).** Decided by the user: the watch asks before it pairs, it can
+be found only while a pairing page is shown, and the pairing file is
+copied to the PC before anything writes it (`tools/ota.sh pairings`,
+into a folder outside the project). Built: a row "pair device" at the
+end of the settings opens the page; while it is shown the chip is told
+that pairing is allowed (0x0009 with 1, once), given the name (0x0012:
+"OnePlus Watch " and the last four digits of the address, as a PC
+lists a watch of this kind; our firmware never set a name before, and
+the PC lists it under the chip's own, "OPPO Watch RX 1122") and made
+to be found (0x0008 `01 01`; `00 01` again when the page is left or
+the display goes dark). The chip's question about a number goes to the
+confirmation screen with the number; yes, no, or no after 25 s (the
+other side gives up at 30) is answered with 0x000B. A device the
+pairing file already holds is denied without asking: as long as
+records are not kept, a new key on its side would no longer fit the
+file, and for the PC that flashes that would be the end of flashing.
+The chip's record (0x0004) is looked at (id, length, whose, which
+keys are there) and not kept, nothing is written to the file, and its
+bytes never go to the log. Not built: keeping the record, removing a
+pairing, LE advertising, the rest of the stock set-up commands.
+
+Decided by the user after the first try: the pairing page keeps the
+display lit for two minutes without a touch (which is how long the
+watch can be found), and a lowered wrist does not blank the pairing
+page, a question or a transfer.
+
+First try on the watch (2026-11-27, with a phone): the three commands
+were taken (status 0), the phone found the watch and asked, the number
+came up, a tap accepted it 5.6 s later, the answer was taken (status
+0), and 35 s after the question the chip reported the pairing failed
+(0x0008, 7 bytes, first 5) and the connection ended; the same again on
+a second try. No record came. Cause, read afterwards: the answer has
+to carry the address in the other byte order than the question brings
+it (the stock app's builder at `0x080689F0` turns the six bytes
+round); ours sent them as they came, so the chip had an answer for a
+device it was not pairing with. Corrected, not yet tried. The pairing
+file as it is: slot 0 type 0 with a classic key (the PC), slots 1 and
+2 type 2 with classic and LE keys, both under the same record id.
+The copy to the PC worked (1575 bytes).
+
+Second try, with the address turned round (2026-11-27, same phone):
+question 18 s after the page was opened, accepted by a tap 3.5 s
+later, and 1.9 s after the answer the chip reported the pairing ended
+(0x0008, 7 bytes, first 0) and 4 ms later handed over the record
+(0x0004): id 0x0012 (the file holds 0x0010 and 0x0011, so the chip
+counts on), 138 bytes, which is the id and exactly the 136 bytes a
+slot carries, a classic key and no LE keys. Then "encryption changed"
+(0x0009) and the phone opening the hands-free service (group 3: codes
+0x01, 0x07, 0x08, 0x03, three of 0x2A) and one event of group 6; no
+serial port. So with a phone that has no app for the watch, the
+events at which the stock app would file the record (serial port or
+audio connected) do not come.
+
+**Pairings are kept (2026-11-27; measured on the watch).**
+Decided by the user: a record is stored as soon as an accepted pairing
+succeeds, in the first free slot of 2 to 6 (where the stock firmware
+put the PC), with type 2; nothing in the table is ever replaced, and
+with no slot free the watch is not made to be found and the page says
+so; a page lists the paired devices and removes one on request; and a
+second copy of the table is kept on the watch. Built: the table's
+rules in `services::pair_table` (tested on the PC); on the record of
+the device just accepted, the table is changed and written, first to
+`3:log/PAIRS.BAK`, then to `2:bluethooth_pair.cfg`, each read back and
+compared; at a start the second copy is used if the file is not there
+in its length. The pairing page has a button to the page of devices:
+one at a time with its type and address, "next" and "remove"; remove
+asks first, sends 0x0006 with the record's id unless another slot
+carries the same id, clears the slot and writes the table. The last
+device cannot be removed (without any the chip is not made
+connectable at a start). The device that opened the serial port since
+the start is marked as the PC that sends firmware, and the question
+says so. A device already in the table is still denied a new pairing:
+it has to be removed first. Measured on the way: the chip's question
+carries the address first byte first, as the record does; only the
+answer goes the other way round.
+
+Measured: a phone's record (id 0x0012) was written to slot 3 and the
+table read back 65 ms after the chip handed it over; the file pulled
+to the PC was 1575 bytes with the three older slots unchanged byte for
+byte. After a restart the chip took four records, and the phone
+connected and encrypted 22 s after the start without a pairing
+question. Removing slot 0 (record 0x0010, a phone of the watch's
+previous owner): the chip answered 0x0006 with status 0, the table was
+written and read back, and the PC connected afterwards as before. Not
+measured: the second copy being used at a start, the page with no slot
+free. The watch's name is given at every start now (step 4 of the
+set-up), not only on the pairing page: a paired phone that connected
+after a restart had shown the chip's own name, "OPPO Watch RX 1122".
+
+Found on the way: `factory::bluetooth_address` could be called once
+only (its buffer was a one-time one), so setting the chip up again
+after switching it off and on would have failed at the address. It
+reads into a buffer of its own now.
 
 **Transfers are shown and need a yes (2026-11-26; built, not yet tried
 on the watch).** Nothing goes over Bluetooth behind the wearer's back

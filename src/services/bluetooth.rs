@@ -8,17 +8,14 @@ use embassy_time::Duration;
 
 use crate::drivers::cypress;
 use crate::services::log::Log;
-use crate::services::{factory, storage};
+use crate::services::{factory, pair_table};
 
 /// Stored pairings: `2:bluethooth_pair.cfg`, a raw copy of the stock app's
-/// table of nine 175-byte slots (loaded at 0x0802AEEE). A slot is in use when
-/// its first two bytes (the record id) are not zero; the stock app pushes
-/// the id and the following 136 bytes to the chip (0x0802BB8A).
-const PAIRING_VOLUME: usize = 2;
-const PAIR_FILE: &str = "bluethooth_pair.cfg";
-const PAIR_FILE_LEN: usize = 1575;
-const PAIR_SLOT_LEN: usize = 175;
-const PAIR_RECORD_LEN: usize = 2 + 136;
+/// table of nine 175-byte slots (`pair_table`, read by `pairing::load`).
+/// A slot is in use when its first two bytes (the record id) are not
+/// zero; the stock app pushes the id and the following 136 bytes to the
+/// chip (0x0802BB8A).
+const PAIR_SLOT_LEN: usize = pair_table::SLOT_LEN;
 
 /// Start the chip, give it the watch's address and the stored pairing keys,
 /// and make it connectable. Returns the link only if all of that worked.
@@ -79,36 +76,29 @@ pub async fn set_up(link: &mut cypress::Link, log: &mut Log) -> bool {
             None => break 'setup false,
         }
 
-        // 3. Pairing keys from the stock app's file on volume 2.
-        // Safety: only the main task runs this, one call at a time.
-        static mut TABLE: [u8; PAIR_FILE_LEN] = [0; PAIR_FILE_LEN];
-        let table = unsafe { &mut *(&raw mut TABLE) };
-        let read = storage::inspect(PAIRING_VOLUME).map_err(|_| 1u8).and_then(|p| storage::read_root_file(p, PAIR_FILE, table));
-        match read {
-            Ok(PAIR_FILE_LEN) => {}
-            Ok(len) => {
-                let _ = writeln!(log.stamp(), "pairing file has {} bytes, expected {}", len, PAIR_FILE_LEN);
-                break 'setup false;
-            }
-            Err(step) => {
-                let _ = writeln!(log.stamp(), "pairing file could not be read (step {})", step);
-                break 'setup false;
-            }
-        }
+        // 3. Pairing keys from the stock app's file on volume 2, or
+        // from the second copy if that file is not there in its length.
+        let Some(table) = crate::services::pairing::load(log) else {
+            break 'setup false;
+        };
         let mut pushed = 0;
-        for (i, slot) in table.chunks_exact(PAIR_SLOT_LEN).enumerate() {
-            if slot[0] == 0 && slot[1] == 0 {
-                continue;
-            }
-            // Log who the record is for, never the key itself.
+        for entry in pair_table::entries(table) {
+            let slot = &table[entry.slot * PAIR_SLOT_LEN..(entry.slot + 1) * PAIR_SLOT_LEN];
+            // Log who the record is for, never the key itself: of the
+            // keys only whether there are any, and the stock app's type
+            // (0xAD: 0 phone by serial port, 1 phone by LE, 2 headset,
+            // 3 paired in its special mode).
             let _ = writeln!(
                 log.stamp(),
-                "pairing slot {}: id {:#06x}, peer {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                i,
-                u16::from_le_bytes([slot[0], slot[1]]),
-                slot[2], slot[3], slot[4], slot[5], slot[6], slot[7]
+                "pairing slot {}: id {:#06x}, peer {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, type {}, classic key {}, LE keys {}",
+                entry.slot,
+                entry.id,
+                slot[2], slot[3], slot[4], slot[5], slot[6], slot[7],
+                entry.kind,
+                if slot[0x09..0x19].iter().any(|&b| b != 0) { "yes" } else { "no" },
+                if slot[0x22..0x8A].iter().any(|&b| b != 0) { "yes" } else { "no" },
             );
-            if !link.command(log, cypress::CMD_PUSH_NVRAM_DATA, &slot[..PAIR_RECORD_LEN]).await {
+            if !link.command(log, cypress::CMD_PUSH_NVRAM_DATA, pair_table::record(table, entry.slot)).await {
                 break 'setup false;
             }
             pushed += 1;
@@ -118,7 +108,15 @@ pub async fn set_up(link: &mut cypress::Link, log: &mut Log) -> bool {
             break 'setup false;
         }
 
-        // 4. Connectable for already paired devices, not discoverable.
+        // 4. The watch's name, which paired devices read at every
+        // connection; without it the chip answers with its own.
+        // A chip that does not take it is still made connectable: the
+        // name is not worth losing the connection to the PC over.
+        if !link.command(log, cypress::CMD_SET_LOCAL_NAME, &crate::services::pairing::name(address)).await {
+            let _ = writeln!(log.stamp(), "cypress: the name was NOT taken");
+        }
+
+        // 5. Connectable for already paired devices, not discoverable.
         link.command(log, cypress::CMD_SET_VISIBILITY, &[0, 1]).await
     };
     let _ = writeln!(
@@ -127,5 +125,7 @@ pub async fn set_up(link: &mut cypress::Link, log: &mut Log) -> bool {
         if connectable { "connectable as the watch" } else { "NOT made connectable" }
     );
 
+    // Not to be found again, whatever it was before.
+    crate::services::pairing::chip_set_up();
     connectable
 }

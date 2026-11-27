@@ -4,12 +4,14 @@ mod alerts;
 mod compass;
 mod confirm;
 mod controls;
+mod devices;
 mod face;
 mod gps;
 mod launcher;
 mod menu;
 mod motion;
 mod pages;
+mod pair;
 mod picker;
 mod panels;
 mod power;
@@ -532,6 +534,10 @@ fn speed_up_card(log: &mut Log) -> bool {
 /// minutes, and an end to it if the page was forgotten.
 const GPS_LIT: Duration = Duration::from_secs(15 * 60);
 
+/// How long the display stays lit on the pairing page without a finger
+/// or a button, which is also how long the watch can be found.
+const PAIR_LIT: Duration = Duration::from_secs(2 * 60);
+
 /// How long the receiver runs at most after its page was opened, lit or
 /// dark; after that the page says so and has to be opened again.
 const GPS_RUNS: Duration = Duration::from_secs(15 * 60);
@@ -862,6 +868,13 @@ struct Screen {
     /// What the GPS page shows, and since when the receiver is wanted.
     gps: gps::View,
     gps_since: Option<Instant>,
+    /// What the pairing page shows.
+    pair: pair::View,
+    /// What the page of paired devices shows, which of them, and whether
+    /// the question to remove it is up.
+    devices: devices::View,
+    device: usize,
+    device_asking: bool,
     /// The Bluetooth transfer the transfer page shows.
     transfer: Option<(crate::services::progress::Transfer, u8)>,
     /// The compass's report as the compass page shows it, and when it
@@ -937,6 +950,10 @@ impl Screen {
             sound_shown: None,
             gps: gps::View { report: None, seconds: 0, stopped: false },
             gps_since: None,
+            pair: pair::View { state: pair::State::Starting, suffix: [0; 4] },
+            devices: devices::View { count: 0, index: 0, kind: 0, address: [0; 6], serial: false, asking: false, unsaved: false },
+            device: 0,
+            device_asking: false,
             transfer: None,
             compass: None,
             compass_heading: 0.0,
@@ -1059,12 +1076,15 @@ impl Screen {
 
     /// React to a wrist gesture from the Apollo: raising the wrist shows
     /// a blanked display, lowering it blanks a lit one, however it was
-    /// lit. With the setting off neither does anything.
+    /// lit, except on the pairing page, a question and a transfer. With
+    /// the setting off neither does anything.
     /// Returns true if the display changed.
     async fn gesture(&mut self, gesture: WristGesture, log: &mut Log) -> bool {
         let show = match gesture {
             WristGesture::Raised if !self.visible && self.settings.raise_to_wake => true,
-            WristGesture::Lowered if self.visible && self.settings.raise_to_wake => false,
+            // What is to be seen through stays: the pairing page, a
+            // question, a transfer.
+            WristGesture::Lowered if self.visible && self.settings.raise_to_wake && !matches!(self.page, Page::Pair | Page::Transfer) => false,
             _ => return false,
         };
         self.visible = show;
@@ -1098,6 +1118,8 @@ impl Screen {
             // A first position takes minutes, to be watched without
             // touching.
             Page::Gps => GPS_LIT,
+            // As long as the watch is to be found by new devices.
+            Page::Pair => PAIR_LIT,
             _ => Duration::from_secs(self.settings.display_off_s as u64),
         };
         if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < timeout {
@@ -1246,6 +1268,27 @@ impl Screen {
                         let _ = writeln!(log.stamp(), "transfer: ended by a tap on the watch");
                         progress::cancel();
                     }
+                } else if self.page == Page::Pair {
+                    if pair::devices_at(x, y) {
+                        self.device = 0;
+                        self.device_asking = false;
+                        self.go_to(Page::Devices, log);
+                    }
+                } else if self.page == Page::Devices {
+                    match devices::tap_at(x, y, &self.devices) {
+                        Some(devices::Tap::Next) => self.device += 1,
+                        Some(devices::Tap::Ask) => self.device_asking = true,
+                        Some(devices::Tap::Answer(remove)) => {
+                            self.device_asking = false;
+                            // The main task does it (`services::pairing`).
+                            let slot = (0..crate::services::pair_table::SLOTS).filter(|&n| crate::services::pairing::shown(n).is_some()).nth(self.devices.index as usize);
+                            if let (true, Some(slot)) = (remove, slot) {
+                                let _ = writeln!(log.stamp(), "devices: removing the device in slot {} was asked for by a tap", slot);
+                                crate::services::pairing::request_remove(slot);
+                            }
+                        }
+                        None => {}
+                    }
                 } else if self.page == Page::Sounds {
                     // The main task plays it, or ends what plays.
                     if let Some(n) = sounds::tap_at(x, y) {
@@ -1254,6 +1297,7 @@ impl Screen {
                 } else if self.page == Page::Settings {
                     match menu::tap_at(x, y, self.scroll.moved()) {
                         Some(menu::Hit::Quick) => self.go_to(Page::Above, log),
+                        Some(menu::Hit::Pair) => self.go_to(Page::Pair, log),
                         Some(menu::Hit::Setting(settings::Tap::PickQuietTime)) => self.pick(PickFor::QuietFrom, log),
                         Some(menu::Hit::Setting(settings::Tap::PickMoveTime)) => self.pick(PickFor::MoveFrom, log),
                         Some(menu::Hit::Setting(tap)) => self.set(tap, log),
@@ -1687,6 +1731,32 @@ impl Screen {
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
         }
+        if self.page == Page::Devices {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                devices::draw(&mut canvas, &area, &self.devices);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Pair {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                pair::draw(&mut canvas, &area, &self.pair);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
         if self.page == Page::Transfer {
             let changes = self.t.damage[page].take(back);
             if changes.is_empty() {
@@ -1696,7 +1766,7 @@ impl Screen {
             let mut canvas = self.panel.canvas(frame);
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
-                transfer::draw(&mut canvas, &area, kind, percent);
+                transfer::draw(&mut canvas, &area, kind, percent, crate::services::progress::number());
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -2238,11 +2308,60 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
                 }
             }
             None => {
-                if screen.transfer.take().is_some() && screen.page == Page::Transfer {
-                    screen.go_to(Page::Face, &mut log);
+                if let Some((ended, _)) = screen.transfer.take().filter(|_| screen.page == Page::Transfer) {
+                    // After the question about a pairing the pairing page
+                    // again, which says how it went; else the face.
+                    let back = if ended == crate::services::progress::Transfer::OfferedPairing { Page::Pair } else { Page::Face };
+                    screen.go_to(back, &mut log);
                     screen.active_at = Instant::now();
                 }
             }
+        }
+        // New devices can find the watch while the pairing page is
+        // shown, and while a device that asked there is put to the
+        // wearer.
+        let asked = crate::services::progress::now().is_some_and(|(what, _)| what == crate::services::progress::Transfer::OfferedPairing);
+        crate::services::pairing::want(screen.visible && (screen.page == Page::Pair || (asked && screen.page == Page::Transfer)));
+        if !matches!(screen.page, Page::Pair | Page::Transfer) && crate::services::pairing::stage() != crate::services::pairing::Stage::Starting {
+            crate::services::pairing::left();
+        }
+        if screen.page == Page::Pair {
+            use crate::services::pairing::Stage;
+            let state = match crate::services::pairing::stage() {
+                Stage::Starting => pair::State::Starting,
+                Stage::Ready => pair::State::Ready,
+                Stage::Accepted => pair::State::Accepted,
+                Stage::Denied => pair::State::Denied,
+                Stage::Paired => pair::State::Paired,
+                Stage::Failed => pair::State::Failed,
+                Stage::Full => pair::State::Full,
+                Stage::NotKept => pair::State::NotKept,
+            };
+            let view = pair::View { state, suffix: crate::services::pairing::suffix() };
+            if screen.visible && screen.pair != view {
+                screen.pair = view;
+                screen.t.damage[Page::Pair.index()].add(face::whole());
+                screen.changed = true;
+            }
+        }
+        if screen.page == Page::Devices {
+            use crate::services::{pair_table::SLOTS, pairing};
+            let count = (0..SLOTS).filter(|&n| pairing::shown(n).is_some()).count();
+            if count > 0 {
+                screen.device %= count;
+            }
+            let shown = (0..SLOTS).filter_map(pairing::shown).nth(screen.device);
+            let (kind, address) = shown.unwrap_or((0, [0; 6]));
+            // The PC that flashes, if this is its only entry.
+            let serial = pairing::serial(address) && (0..SLOTS).filter_map(pairing::shown).filter(|&(_, other)| other == address).count() == 1;
+            let view = devices::View { count: count as u8, index: screen.device as u8, kind, address, serial, asking: screen.device_asking && count > 1, unsaved: pairing::unsaved() };
+            if screen.visible && screen.devices != view {
+                screen.devices = view;
+                screen.t.damage[Page::Devices.index()].add(face::whole());
+                screen.changed = true;
+            }
+        } else {
+            screen.device_asking = false;
         }
         // The touch controller sleeps while the display is dark.
         if let Some(touch) = touch.as_mut() {
@@ -2708,6 +2827,7 @@ async fn main_loop(
             passes_since = Instant::now();
         }
         let activity = server.step(&mut link, if quiet { QUIET_WAIT } else { BUSY_WAIT }, &mut log).await;
+        server.pairing.poll(&mut link, &mut log).await;
         // The chip woke the link and then said nothing: that is how the
         // chip looked when it was lost once (2026-11-23, with the "ready"
         // line not yet driven by hand). Switched off and on, it works

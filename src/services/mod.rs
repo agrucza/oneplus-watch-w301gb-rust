@@ -10,6 +10,8 @@ pub mod font;
 pub mod font_data;
 pub mod gestures;
 pub mod log;
+pub mod pair_table;
+pub mod pairing;
 pub mod progress;
 #[allow(dead_code)] // some read helpers have no caller at the moment
 pub mod storage;
