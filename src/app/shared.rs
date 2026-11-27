@@ -68,6 +68,7 @@ static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 static POWER_OFF: AtomicBool = AtomicBool::new(false);
 static COMPASS: AtomicBool = AtomicBool::new(false);
+static GPS: AtomicBool = AtomicBool::new(false);
 /// The sound asked for and the sound playing, as numbers in
 /// `sounds::SOUNDS`; `NO_SOUND` for none.
 static SOUND: AtomicU8 = AtomicU8::new(NO_SOUND);
@@ -121,6 +122,17 @@ pub fn set_compass(wanted: bool) {
 /// Whether the compass is wanted.
 pub fn compass() -> bool {
     COMPASS.load(Ordering::Relaxed)
+}
+
+/// The same for the satellite receiver.
+pub fn set_gps(wanted: bool) {
+    if GPS.swap(wanted, Ordering::Relaxed) != wanted {
+        crate::hal::wake::nudge();
+    }
+}
+
+pub fn gps() -> bool {
+    GPS.load(Ordering::Relaxed)
 }
 
 /// Ask the main task to play sound `n` of `sounds::SOUNDS`, or, while

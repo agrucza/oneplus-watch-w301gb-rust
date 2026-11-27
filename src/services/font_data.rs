@@ -48,6 +48,9 @@ pub static NW_ICON_SIGNAL: Art = Art { width: 26, height: 26, coverage: include_
 /// The design's diamond icon with a needle in it, for the compass (26 x 26).
 pub static NW_ICON_COMPASS: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_compass.bin") };
 
+/// A map pin in the manner of the design's icons, for the satellite receiver (26 x 26).
+pub static NW_ICON_PIN: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_pin.bin") };
+
 /// The design's play icon (26 x 26).
 pub static NW_ICON_PLAY: Art = Art { width: 26, height: 26, coverage: include_bytes!("fonts/nw_icon_play.bin") };
 

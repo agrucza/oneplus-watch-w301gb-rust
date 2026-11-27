@@ -176,6 +176,13 @@ pub struct Apollo {
     /// Its start state is off, so nothing is sent until it is wanted.
     compass: bool,
     compass_told: bool,
+    /// The same for the satellite receiver; `gps_time_due` once the
+    /// Apollo has said that the chip is up and the time of day is to be
+    /// given to it.
+    gps: bool,
+    gps_told: bool,
+    gps_time_due: bool,
+    gps_logged_at: Instant,
     /// The Apollo reminded the wearer to move.
     move_reminder_pending: bool,
     /// The step count last written to the log.
@@ -280,6 +287,10 @@ impl Apollo {
             heart_monitor_told: None,
             compass: false,
             compass_told: false,
+            gps: false,
+            gps_told: false,
+            gps_time_due: false,
+            gps_logged_at: Instant::now(),
             move_reminder_pending: false,
             steps_logged: None,
             compass_logged_at: Instant::now(),
@@ -571,6 +582,23 @@ impl Apollo {
                 }
             }
         }
+        // The satellite receiver, on while its page is shown: the stock
+        // app's own two messages, and when the Apollo says the chip is
+        // up, the one that has it give the chip the time of day.
+        if self.setup_acknowledged && self.gps_told != self.gps {
+            let on = self.gps;
+            if self.send(messages::SENSOR_SWITCH, messages::gps(on).as_bytes(), log).await {
+                self.gps_told = on;
+                self.gps_time_due = false;
+                self.readings.gps = None;
+                let _ = writeln!(log.stamp(), "apollo: gps switched {}", if on { "on" } else { "off" });
+            }
+        }
+        if self.gps_time_due && self.gps_told {
+            self.gps_time_due = false;
+            let sent = self.send(messages::GPS_REFERENCE, messages::gps_time().as_bytes(), log).await;
+            let _ = writeln!(log.stamp(), "apollo: gps: the chip is up; time of day {}", if sent { "given" } else { "NOT given" });
+        }
         // Heart-rate monitoring, as the stock app sends it at start (there
         // always "none") and when the setting changes.
         if SEND_SETTINGS && self.setup_acknowledged && self.heart_monitor_told != Some(self.heart_monitor) {
@@ -687,6 +715,12 @@ impl Apollo {
     /// Apollo is told when this changes.
     pub fn set_compass(&mut self, on: bool) {
         self.compass = on;
+    }
+
+    /// Whether the satellite receiver is to run (while its page is
+    /// shown). The Apollo is told when this changes.
+    pub fn set_gps(&mut self, on: bool) {
+        self.gps = on;
     }
 
     /// The Apollo's own heart-rate monitoring: 0 none, 1 periodic, 2
@@ -949,6 +983,35 @@ impl Apollo {
                     n(2), n(3), n(4), n(5), n(6), n(7), n(8)
                 );
             }
+            if kind == Some(messages::GPS_READY) {
+                let up = Fields(payload).find(|&(tag, _)| tag == 1).and_then(|(_, v)| v.as_u32()) == Some(1);
+                self.gps_time_due = up;
+                if !up {
+                    let _ = writeln!(log.stamp(), "apollo: gps: a readiness report that does not say the chip is up");
+                }
+            }
+            if kind == Some(messages::GPS_WANTS) {
+                // The chip asks for orbit data, a place or the time; there
+                // is no orbit data on the watch to give.
+                let n = |i| Fields(payload).find(|&(tag, _)| tag == i).and_then(|(_, v)| v.as_u32()).unwrap_or(0);
+                let _ = writeln!(log.stamp(), "apollo: gps asks for aiding: system {}, orbit data {}, place {}, time {}", n(1), n(2), n(3), n(4));
+            }
+            if kind == Some(messages::GPS_REPORT) && self.gps_logged_at.elapsed() >= Duration::from_secs(5) {
+                // One in five or so. The position itself stays out of the
+                // log: where the wearer is, is nobody's business.
+                self.gps_logged_at = Instant::now();
+                if let Some(g) = self.readings.gps {
+                    let _ = write!(log.stamp(), "apollo: gps: {}, {} in view, {} used, first position after {} ms, strongest signals", if g.fix { "position" } else { "no position" }, g.in_view, g.used, g.ttff_ms);
+                    for [id, signal] in g.strongest.iter().filter(|s| s[1] != 0) {
+                        let _ = write!(log, " {}:{}", id, signal);
+                    }
+                    // Field 12 as it came and whether the chip has a time
+                    // of its own yet (field 1), to check the reading of
+                    // the report against a first position.
+                    let n = |i| Fields(payload).find(|&(tag, _)| tag == i).and_then(|(_, v)| v.as_u32());
+                    let _ = writeln!(log, "; quality {:?}, chip time {:?} ({} bytes)", n(12), n(1), payload.len());
+                }
+            }
             if kind == Some(messages::COMPASS) && self.compass_logged_at.elapsed() >= COMPASS_LOG_EVERY {
                 // Two a second of some 46, to see afterwards how the
                 // heading behaved while the watch was moved.
@@ -1026,7 +1089,10 @@ impl Apollo {
                     block[i + 3],
                     n
                 );
-                log.hex(body);
+                // Not the receiver's report: it may hold where the wearer is.
+                if kind != Some(messages::GPS_REPORT) {
+                    log.hex(body);
+                }
             }
             i = end + 1;
         }

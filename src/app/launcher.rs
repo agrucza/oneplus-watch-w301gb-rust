@@ -16,7 +16,7 @@ use embedded_graphics::primitives::Rectangle;
 use super::face::{direction, ring_segment};
 use super::theme::{self, BLACK, C, CHROME, CYAN, GREEN, INK_3, SIGNAL, STEEL, YELLOW};
 use crate::services::font::{Art, Paint};
-use crate::services::font_data::{NW_ICON_BELL, NW_ICON_COMPASS, NW_ICON_GEAR, NW_ICON_PLAY, NW_ICON_POWER, NW_ICON_SIGNAL, NW_MONO, NW_TITLE};
+use crate::services::font_data::{NW_ICON_BELL, NW_ICON_COMPASS, NW_ICON_GEAR, NW_ICON_PIN, NW_ICON_PLAY, NW_ICON_POWER, NW_ICON_SIGNAL, NW_MONO, NW_TITLE};
 
 /// What the launcher opens.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -27,13 +27,15 @@ pub enum App {
     Alerts,
     Status,
     Compass,
+    /// The satellite receiver.
+    Gps,
     /// The watch's sounds, to play.
     Sound,
     Power,
 }
 
 /// The apps in the order they stand on the ring, clockwise from the top.
-pub const APPS: [App; 6] = [App::Settings, App::Alerts, App::Status, App::Compass, App::Sound, App::Power];
+pub const APPS: [App; 7] = [App::Settings, App::Alerts, App::Status, App::Compass, App::Gps, App::Sound, App::Power];
 
 /// An app's name, icon and colour.
 fn look(app: App) -> (&'static str, &'static Art, Rgb565) {
@@ -42,6 +44,7 @@ fn look(app: App) -> (&'static str, &'static Art, Rgb565) {
         App::Alerts => ("ALERTS", &NW_ICON_BELL, YELLOW),
         App::Status => ("STATUS", &NW_ICON_SIGNAL, CYAN),
         App::Compass => ("COMPASS", &NW_ICON_COMPASS, CYAN),
+        App::Gps => ("GPS", &NW_ICON_PIN, CYAN),
         App::Sound => ("SOUNDS", &NW_ICON_PLAY, GREEN),
         App::Power => ("POWER", &NW_ICON_POWER, SIGNAL),
     }

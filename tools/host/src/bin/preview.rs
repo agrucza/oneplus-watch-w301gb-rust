@@ -78,6 +78,14 @@ fn main() {
             w301_host::app::settings::draw(&mut frame, &whole, &set)
         }
         Some("waiting") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Waiting, 0),
+        Some("gps") | Some("gps-fix") => {
+            use w301_host::drivers::apollo::messages::Gps;
+            let fix = args.get(2).map(|s| s.as_str()) == Some("gps-fix");
+            let strongest = [[31, 44], [17, 38], [8, 33], [3, 30], [22, 26], [14, 22], [9, 18], [5, 12], [0, 0], [0, 0], [0, 0], [0, 0]];
+            // A made-up place: the middle of the North Sea.
+            let report = Gps { fix, used: if fix { 6 } else { 0 }, in_view: 8, strongest, lat_e7: 560_000_000, lon_e7: 30_000_000, speed_dmh: 12, utc: 0, ttff_ms: if fix { 187_000 } else { 0 } };
+            w301_host::app::gps::draw(&mut frame, &whole, &w301_host::app::gps::View { report: Some(report), seconds: 73, stopped: false });
+        }
         Some("offer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Offered, 0),
         Some("transfer") => w301_host::app::transfer::draw(&mut frame, &whole, w301_host::services::progress::Transfer::Receiving, 42),
         Some("sounds") => w301_host::app::sounds::draw(&mut frame, &whole, Some(2)),

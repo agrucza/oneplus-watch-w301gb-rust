@@ -392,7 +392,7 @@ mod pages {
     use crate::app::pages::{drag, long_press, tap, Page};
     use crate::services::gestures::Direction::{self, Down, Left, Right, Up};
 
-    const PAGES: [Page; 13] = [Page::Transfer, Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
+    const PAGES: [Page; 14] = [Page::Gps, Page::Transfer, Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds];
     const DIRECTIONS: [Direction; 4] = [Left, Right, Up, Down];
 
     /// Every page with every direction: the whole table.
@@ -462,7 +462,7 @@ mod pages {
     fn long_press_and_back() {
         assert_eq!(long_press(Page::Face), Some(Page::Faces));
         assert_eq!(long_press(Page::Status), Some(Page::Cards));
-        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer] {
+        for page in [Page::Launcher, Page::Above, Page::Below, Page::Faces, Page::Cards, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps] {
             assert_eq!(long_press(page), None);
         }
         // A tap leaves what a long press opened, back to where it came from.
@@ -472,7 +472,7 @@ mod pages {
                 None => {}
             }
         }
-        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer] {
+        for page in [Page::Face, Page::Launcher, Page::Status, Page::Above, Page::Below, Page::Power, Page::Picker, Page::Settings, Page::Compass, Page::Sounds, Page::Transfer, Page::Gps] {
             assert_eq!(tap(page), None);
         }
     }
@@ -1570,5 +1570,99 @@ mod transfer {
         progress::decide(true);
         assert_eq!(progress::decision(), Some(true));
         progress::end();
+    }
+}
+
+#[cfg(test)]
+mod gps {
+    use crate::app::gps::degrees;
+    use crate::drivers::apollo::messages::{gps, gps_time, Gps};
+
+    fn varint(field: u8, mut value: u64, into: &mut Vec<u8>) {
+        into.push(field << 3);
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            into.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn double(field: u8, value: f64, into: &mut Vec<u8>) {
+        into.push(field << 3 | 1);
+        into.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn bytes(field: u8, value: &[u8], into: &mut Vec<u8>) {
+        into.push(field << 3 | 2);
+        into.push(value.len() as u8);
+        into.extend_from_slice(value);
+    }
+
+    /// The switch as the stock app sends it: sensor 4, on, a gap of
+    /// 1000; off without the "on" field; and never a sub-command.
+    #[test]
+    fn the_switch_is_the_stock_apps() {
+        assert_eq!(gps(true).as_bytes(), [0x08, 4, 0x10, 1, 0x18, 0xE8, 0x07]);
+        assert_eq!(gps(false).as_bytes(), [0x08, 4, 0x18, 0xE8, 0x07]);
+        assert!(gps_time().as_bytes().is_empty());
+    }
+
+    #[test]
+    fn a_report_without_a_position_has_its_satellites_strongest_first() {
+        let mut report = Vec::new();
+        varint(5, 5, &mut report);
+        let mut ids = [0u8; 40];
+        let mut signals = [0u8; 40];
+        ids[..5].copy_from_slice(&[3, 17, 22, 31, 8]);
+        signals[..5].copy_from_slice(&[21, 38, 0, 44, 30]);
+        // Beyond the count stands what was there before: not looked at.
+        ids[5] = 99;
+        signals[5] = 50;
+        bytes(6, &ids, &mut report);
+        bytes(7, &signals, &mut report);
+        varint(12, 0xFF, &mut report);
+        let g = Gps::parse(&report);
+        assert!(!g.fix);
+        assert_eq!((g.in_view, g.used), (5, 0));
+        assert_eq!(&g.strongest[..5], &[[31, 44], [17, 38], [8, 30], [3, 21], [0, 0]]);
+        assert_eq!(Gps::parse(&[]), Gps::default());
+    }
+
+    #[test]
+    fn a_position_is_one_with_quality_and_a_time_to_it() {
+        let mut report = Vec::new();
+        varint(1, 1_795_000_000, &mut report);
+        double(2, -0.1276, &mut report);
+        double(3, 51.5072, &mut report);
+        varint(4, 9, &mut report);
+        varint(10, 48_200, &mut report);
+        varint(12, 1, &mut report);
+        double(14, 4.26, &mut report);
+        let g = Gps::parse(&report);
+        assert!(g.fix);
+        assert_eq!((g.lat_e7, g.lon_e7), (515_072_000, -1_276_000));
+        assert_eq!((g.used, g.ttff_ms, g.speed_dmh, g.utc), (9, 48_200, 42, 1_795_000_000));
+        // Quality without a time to the first position is none yet.
+        let mut early = Vec::new();
+        varint(12, 1, &mut early);
+        assert!(!Gps::parse(&early).fix);
+        // What is no number of degrees is left at nothing.
+        let mut odd = Vec::new();
+        double(3, f64::NAN, &mut odd);
+        double(2, 400.0, &mut odd);
+        assert_eq!((Gps::parse(&odd).lat_e7, Gps::parse(&odd).lon_e7), (0, 0));
+    }
+
+    #[test]
+    fn degrees_are_written_to_five_places() {
+        let mut text = String::new();
+        degrees(515_072_000, 'N', 'S', &mut text);
+        assert_eq!(text, "51.50720 N");
+        text.clear();
+        degrees(-1_276_000, 'E', 'W', &mut text);
+        assert_eq!(text, "0.12760 W");
     }
 }

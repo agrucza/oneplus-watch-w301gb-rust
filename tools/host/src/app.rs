@@ -34,3 +34,5 @@ pub mod sounds;
 pub mod transfer;
 #[path = "../../../src/app/confirm.rs"]
 pub mod confirm;
+#[path = "../../../src/app/gps.rs"]
+pub mod gps;

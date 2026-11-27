@@ -59,6 +59,13 @@ pub const DAILY: u32 = 81;
 pub const LIGHT: u32 = 58;
 pub const WRIST_GESTURE: u32 = 41;
 pub const COMPASS: u32 = 42;
+/// The satellite receiver's report (see `Gps`), its word that the chip
+/// is up (field 1 = 1), its wish for aiding data, and the kind that
+/// gives it time and place (see `gps_time`).
+pub const GPS_REPORT: u32 = 46;
+pub const GPS_READY: u32 = 60;
+pub const GPS_WANTS: u32 = 53;
+pub const GPS_REFERENCE: u32 = 133;
 pub const BAROMETER: u32 = 43;
 pub const SENSOR_USERS: u32 = 54;
 pub const SENSOR_SWITCH: u32 = 120;
@@ -330,6 +337,109 @@ pub fn compass(on: bool) -> Encoder {
     Encoder::new().number(2, on as u32).number(3, 20)
 }
 
+/// Switch the satellite receiver (Airoha AG3335, on the Apollo) on or
+/// off: kind 120 with sensor 4 and a gap of 1000, the stock app's own
+/// two messages (B.70: 0x08070518 on, 0x08070B30 off). The Apollo powers
+/// the chip, sets it up and says so with kind `GPS_READY`; then its
+/// reports come as kind `GPS_REPORT`, about one a second. "Off" powers
+/// the chip down.
+///
+/// Fields 4 and 5, a sub-command and its value, are never sent from
+/// here: the sub-commands are the factory's (cold starts that drop what
+/// the chip has learnt, test modes, the raw power pin; read in the
+/// Apollo's image 0704 at 0x1377E).
+pub fn gps(on: bool) -> Encoder {
+    Encoder::new().number(1, 4).number(2, on as u32).number(3, 1000)
+}
+
+/// Have the Apollo give the receiver the time of day from its own clock
+/// (kind `GPS_REFERENCE` with no fields; the stock app sends it when the
+/// chip is up, 0x08071A94). With field 1 = 1 and a position it would give
+/// a place to start from; with 1 = 2 it sends a command taken to erase
+/// the chip's stored orbit data, which is never sent from here.
+pub fn gps_time() -> Encoder {
+    Encoder::new()
+}
+
+/// What the satellite receiver reports (kind `GPS_REPORT`; encoder in
+/// the Apollo's image 0704 at 0x11D84, the stock app's decoder at
+/// 0x0806CE44): field 1 the time of the position in seconds since 1970,
+/// 2 longitude and 3 latitude in degrees as doubles (east and north
+/// positive), 4 satellites used, 5 satellites in view, 6 their numbers
+/// and 7 their signals (dB-Hz) as 40 bytes each, 10 the time to the
+/// first position in ms, 12 the position's quality (0 none), 14 the
+/// speed in km/h as a double. Reports come without a position too, with
+/// the satellites in view.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Gps {
+    /// A position is there: quality and time to the first one not zero,
+    /// the stock app's rule.
+    pub fix: bool,
+    pub used: u8,
+    pub in_view: u8,
+    /// The twelve strongest satellites in view, strongest first: number
+    /// and signal in dB-Hz; zeros where there are fewer.
+    pub strongest: [[u8; 2]; 12],
+    /// Latitude and longitude in ten-millionths of a degree.
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+    /// Speed in tenths of a km/h.
+    pub speed_dmh: u16,
+    /// Seconds since 1970 of the position.
+    pub utc: u32,
+    /// How long the first position took, in ms; 0 before it.
+    pub ttff_ms: u32,
+}
+
+impl Gps {
+    /// Take a report apart.
+    pub fn parse(payload: &[u8]) -> Gps {
+        let field = |n: u32| Fields(payload).find(|&(tag, _)| tag == n).map(|(_, v)| v);
+        let number = |n: u32| field(n).and_then(|v| v.as_u32()).unwrap_or(0);
+        let double = |n: u32| match field(n) {
+            Some(Value::Fixed64(bits)) => f64::from_bits(bits),
+            _ => 0.0,
+        };
+        let bytes = |n: u32| match field(n) {
+            Some(Value::Bytes(bytes)) => bytes,
+            _ => &[][..],
+        };
+        let in_view = number(5).min(40) as u8;
+        let (ids, signals) = (bytes(6), bytes(7));
+        // The strongest twelve, by putting each in its place.
+        let mut strongest = [[0u8; 2]; 12];
+        for (&id, &signal) in ids.iter().zip(signals).take(in_view as usize) {
+            let mut entry = [id, signal];
+            for place in strongest.iter_mut() {
+                if entry[1] > place[1] {
+                    core::mem::swap(place, &mut entry);
+                }
+            }
+        }
+        let quality = match number(12) {
+            0xFF => 0,
+            quality => quality,
+        };
+        let ttff_ms = number(10);
+        let degrees = |n: u32| {
+            let value = double(n);
+            if value.is_finite() && (-180.0..=180.0).contains(&value) { (value * 1e7) as i32 } else { 0 }
+        };
+        let speed = double(14);
+        Gps {
+            fix: quality != 0 && ttff_ms != 0,
+            used: number(4).min(255) as u8,
+            in_view,
+            strongest,
+            lat_e7: degrees(3),
+            lon_e7: degrees(2),
+            speed_dmh: if speed.is_finite() && (0.0..6000.0).contains(&speed) { (speed * 10.0) as u16 } else { 0 },
+            utc: number(1),
+            ttff_ms,
+        }
+    }
+}
+
 /// What the compass says (kind `COMPASS`), about 23 times a second
 /// while it is on (measured): field 2 the heading in degrees as a
 /// float, 3 how sure the chip's driver is of its calibration, 4 to 6
@@ -432,7 +542,6 @@ pub fn motor_stop() -> Encoder {
 pub enum Value<'a> {
     Varint(u64),
     Fixed32(u32),
-    #[allow(dead_code)] // decoded for completeness; no known message uses it yet
     Fixed64(u64),
     Bytes(&'a [u8]),
 }
@@ -514,6 +623,8 @@ pub struct Readings {
     pub heart_bpm: Option<u32>,
     /// The compass's latest report, while it is switched on.
     pub compass: Option<Compass>,
+    /// The satellite receiver's latest report, while it is switched on.
+    pub gps: Option<Gps>,
     /// The latest heart rate the Apollo called valid (field 25 = 1) and
     /// of some quality (field 4 at least 3, the limit its own warning for
     /// a high heart rate takes), from a measurement by hand or from its
@@ -638,6 +749,7 @@ impl Readings {
                     self.off_wrist_long = Some(field(2).and_then(|v| v.as_u32()).unwrap_or(0) != 0);
                 }
             }
+            GPS_REPORT => self.gps = Some(Gps::parse(payload)),
             COMPASS => {
                 let float = |n| field(n).and_then(|v| v.as_f32()).unwrap_or(0.0);
                 // A report without a heading is none.

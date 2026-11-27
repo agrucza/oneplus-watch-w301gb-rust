@@ -5,6 +5,7 @@ mod compass;
 mod confirm;
 mod controls;
 mod face;
+mod gps;
 mod launcher;
 mod menu;
 mod motion;
@@ -526,6 +527,15 @@ fn speed_up_card(log: &mut Log) -> bool {
     true
 }
 
+/// How long the display stays lit on the GPS page without a finger or
+/// a button: long enough for a first position without help, which takes
+/// minutes, and an end to it if the page was forgotten.
+const GPS_LIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long the receiver runs at most after its page was opened, lit or
+/// dark; after that the page says so and has to be opened again.
+const GPS_RUNS: Duration = Duration::from_secs(15 * 60);
+
 /// How long the display stays lit on the compass page without a finger
 /// or a button.
 const COMPASS_LIT: Duration = Duration::from_secs(300);
@@ -833,8 +843,6 @@ struct Screen {
     /// The last level written to the log.
     level_logged: u8,
     faded_at: Instant,
-    /// The display was shown by a wrist raise, not by the button.
-    shown_by_raise: bool,
     /// Since when the display has been on.
     visible_since: Instant,
     /// When a finger or a button was last used.
@@ -851,6 +859,9 @@ struct Screen {
     from_launcher: bool,
     /// The sound the sounds page shows as playing.
     sound_shown: Option<usize>,
+    /// What the GPS page shows, and since when the receiver is wanted.
+    gps: gps::View,
+    gps_since: Option<Instant>,
     /// The Bluetooth transfer the transfer page shows.
     transfer: Option<(crate::services::progress::Transfer, u8)>,
     /// The compass's report as the compass page shows it, and when it
@@ -915,7 +926,6 @@ impl Screen {
             level: START_BRIGHTNESS,
             level_logged: START_BRIGHTNESS,
             faded_at: Instant::now(),
-            shown_by_raise: false,
             visible_since: Instant::now(),
             active_at: Instant::now(),
             wear: WearView::new(),
@@ -925,6 +935,8 @@ impl Screen {
             launcher: launcher::Launcher::new(),
             from_launcher: false,
             sound_shown: None,
+            gps: gps::View { report: None, seconds: 0, stopped: false },
+            gps_since: None,
             transfer: None,
             compass: None,
             compass_heading: 0.0,
@@ -973,7 +985,6 @@ impl Screen {
                 } else {
                     self.visible = !self.visible;
                     self.visible_since = Instant::now();
-                    self.shown_by_raise = false;
                     let _ = writeln!(log.stamp(), "display: {}", if self.visible { "shown" } else { "blanked" });
                     self.panel_visible(self.visible, log).await
                 }
@@ -1042,26 +1053,22 @@ impl Screen {
         }
         self.visible = true;
         self.visible_since = Instant::now();
-        self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: shown");
         self.panel_visible(true, log).await
     }
 
-    /// React to a wrist gesture from the Apollo. Raising the wrist shows a
-    /// blanked display, as in the stock app. Lowering it blanks the
-    /// display again only if it was a raise that showed it: the stock
-    /// app's own condition for that is a setting not read yet, and a
-    /// display switched on by hand should not go dark on every movement.
+    /// React to a wrist gesture from the Apollo: raising the wrist shows
+    /// a blanked display, lowering it blanks a lit one, however it was
+    /// lit. With the setting off neither does anything.
     /// Returns true if the display changed.
     async fn gesture(&mut self, gesture: WristGesture, log: &mut Log) -> bool {
         let show = match gesture {
             WristGesture::Raised if !self.visible && self.settings.raise_to_wake => true,
-            WristGesture::Lowered if self.visible && self.shown_by_raise => false,
+            WristGesture::Lowered if self.visible && self.settings.raise_to_wake => false,
             _ => return false,
         };
         self.visible = show;
         self.visible_since = Instant::now();
-        self.shown_by_raise = show;
         let _ = writeln!(log.stamp(), "display: {} by wrist gesture", if show { "shown" } else { "blanked" });
         if !self.panel_visible(show, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
@@ -1086,13 +1093,18 @@ impl Screen {
     async fn idle(&mut self, log: &mut Log) {
         // The compass is looked at without touching it: there the display
         // stays on, for `COMPASS_LIT` at most in case it was forgotten.
-        let timeout = if self.page == Page::Compass { COMPASS_LIT } else { Duration::from_secs(self.settings.display_off_s as u64) };
+        let timeout = match self.page {
+            Page::Compass => COMPASS_LIT,
+            // A first position takes minutes, to be watched without
+            // touching.
+            Page::Gps => GPS_LIT,
+            _ => Duration::from_secs(self.settings.display_off_s as u64),
+        };
         if !self.visible || self.pull.is_some() || self.visible_since.max(self.active_at).elapsed() < timeout {
             return;
         }
         self.visible = false;
         self.visible_since = Instant::now();
-        self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: blanked after {} s without a finger or a button", timeout.as_secs());
         if !self.panel_visible(false, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
@@ -1112,7 +1124,6 @@ impl Screen {
         }
         self.visible = false;
         self.visible_since = Instant::now();
-        self.shown_by_raise = false;
         let _ = writeln!(log.stamp(), "display: blanked by a covering hand");
         if !self.panel_visible(false, log).await {
             let _ = writeln!(log.stamp(), "display: the panel did not take the command");
@@ -1200,6 +1211,7 @@ impl Screen {
                                 launcher::App::Alerts => Page::Below,
                                 launcher::App::Status => Page::Status,
                                 launcher::App::Compass => Page::Compass,
+                                launcher::App::Gps => Page::Gps,
                                 launcher::App::Sound => Page::Sounds,
                                 launcher::App::Power => Page::Power,
                             };
@@ -1658,6 +1670,19 @@ impl Screen {
             for area in changes.rects(face::whole()) {
                 canvas.clip_to(&area);
                 settings::draw(&mut canvas, &area, &self.settings);
+            }
+            self.t.front[page] = back;
+            return Some((started, changes.area(face::whole())));
+        }
+        if self.page == Page::Gps {
+            let changes = self.t.damage[page].take(back);
+            if changes.is_empty() {
+                return None;
+            }
+            let mut canvas = self.panel.canvas(frame);
+            for area in changes.rects(face::whole()) {
+                canvas.clip_to(&area);
+                gps::draw(&mut canvas, &area, &self.gps);
             }
             self.t.front[page] = back;
             return Some((started, changes.area(face::whole())));
@@ -2150,6 +2175,24 @@ async fn display_task(mut screen: Screen, mut touch: Option<touch::Touch>) -> ! 
         // The compass runs while its page is to be seen.
         shared::set_compass(screen.visible && screen.page == Page::Compass);
         screen.compass_report(state.readings.as_ref().and_then(|r| r.compass));
+        // The satellite receiver runs from the opening of its page until
+        // the page is left, through a dark display too: a wrist going
+        // down must not throw away minutes of searching. `GPS_RUNS` ends
+        // it if the page was forgotten.
+        let gps_wanted = screen.page == Page::Gps && screen.gps_since.map_or(true, |since| since.elapsed() < GPS_RUNS);
+        shared::set_gps(gps_wanted);
+        if screen.page != Page::Gps {
+            screen.gps_since = None;
+        } else {
+            let since = *screen.gps_since.get_or_insert_with(Instant::now);
+            let report = if gps_wanted { state.readings.as_ref().and_then(|r| r.gps) } else { None };
+            let view = gps::View { report, seconds: since.elapsed().as_secs() as u32, stopped: !gps_wanted };
+            if screen.visible && screen.gps != view {
+                screen.gps = view;
+                screen.t.damage[Page::Gps.index()].add(face::whole());
+                screen.changed = true;
+            }
+        }
         if screen.sound_shown != shared::playing() {
             screen.sound_shown = shared::playing();
             screen.t.damage[Page::Sounds.index()].add(face::whole());
@@ -2537,6 +2580,7 @@ async fn main_loop(
                 apollo.set_move_reminder(settings.move_reminder.then_some(settings.move_time));
                 apollo.set_heart_monitor(settings.heart_monitor.mode());
                 apollo.set_compass(shared::compass());
+                apollo.set_gps(shared::gps());
                 if apollo.take_move_reminder() {
                     // The Apollo only says so: the vibration is ours, and
                     // so is leaving the wearer alone in the quiet hours

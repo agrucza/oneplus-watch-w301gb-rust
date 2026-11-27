@@ -956,8 +956,8 @@ state: "lowered" (kind 41, value 2) is always reported, "raised" (value 1)
 only while its algorithm 13 is on, which the raise-to-wake setting (kind
 121: on, daily window, start state off) switches. The firmware now sends
 that setting and shows the display on "raised"; on "lowered" it blanks
-the display only if a raise had shown it (the stock app's own condition
-is a setting not read yet).
+a lit display however it was lit, while the setting is on (until
+2026-11-27 only if a raise had shown it).
 
 Open:
 1. The other two ways the stock app can switch the capacitive sensor:
@@ -1398,16 +1398,91 @@ files were added.
 
 ### 3.9 GPS (items 12, 23) - M
 
-Known: the Apollo owns the AG3335 for positions (`AG3335_Init`,
-`AG3335_nmea_decode` in its image). The STM32 side handles assistance data
-("EPO" update services) and can reflash the chip (`ag3335_bootloader.bin`,
-`DA.bin`, `gnss_demo.bin`).
+The receiver is an Airoha AG3335, and only the Apollo talks to it
+(UART 0 at 460800 baud, its pad 17 the chip's power); the STM32 has no
+pin on it. Read 2026-11-26 in the Apollo's image 0704 and the stock app
+B.70 (notes and listings outside the repository):
 
-Steps:
-1. Find the Apollo message that switches GPS on; decode the position kind.
-2. EPO assistance data: how the stock app feeds it. Without it a fix takes
-   minutes.
-3. Firmware update path: leave alone.
+- **Switch:** kind 120 with sensor 4, on or off, and a gap of 1000
+  (stock: 0x08070518 on, 0x08070B30 off). The Apollo counts a user,
+  powers the chip, sets it up with a row of `$PAIR` commands and then
+  says kind 60 with field 1 = 1. Off: `$PAIR511`, 200 ms, UART and
+  power off. The sub-commands in field 4 are the factory's and are
+  never sent from here: cold starts that drop what the chip has learnt
+  (5, 8), test modes (4, 7), the chip's own on and off behind the
+  Apollo's back (11, 12), the raw power pin (14), log modes (1, 2, 9,
+  10), an unknown command at the next off (15).
+- **After kind 60** the stock app sends kind 133 with no fields: the
+  Apollo gives the chip the time of day from its own clock
+  (`$PAIR590`). With field 1 = 1 and a place (2 longitude, 3 latitude
+  as doubles, 4 height as a float) it gives a place to start from
+  (`$PAIR600`). Field 1 = 2 sends `$PAIR472`, taken to erase the stored
+  orbit data: never sent.
+- **Report:** kind 46, about one a second, with or without a position:
+  1 time of the position (seconds since 1970), 2 longitude and 3
+  latitude in degrees (doubles), 4 satellites used, 5 in view, 6 their
+  numbers and 7 their signals (40 bytes each), 10 the time to the first
+  position in ms, 12 the quality (0 none), 13 the numbers of those
+  used, 14 speed in km/h (double). Height, heading and the accuracy
+  figures are not in it; the Apollo has them and does not pass them on.
+- **Orbit data (EPO):** comes from the phone app into `2:agps/`, good
+  for 15 days (6 hours for the short kind), pushed to the chip through
+  the Apollo with kind 134. There is none on this watch, so a first
+  position is a cold start: minutes under open sky. Kind 53 is the
+  chip's wish for it.
+- **Never sent:** kind 101 (starts the Apollo's download of new
+  firmware into the chip, with a format of its flash), kind 134 outside
+  a real transfer of orbit data (its bytes go raw to the chip).
+
+Built 2026-11-26: a "GPS" app in the launcher. The receiver is on from
+the opening of its page until the page is left, through a dark display
+too, for 15 minutes at most (the display stays lit there for 15 minutes
+without a touch); when the Apollo says the chip is up, the time of day
+is given. The page shows starting, searching or position, the
+satellites in view and used, the twelve strongest signals as bars, and
+with a position latitude, longitude, speed and how long the first one
+took. The log has a line every five seconds with the satellites and
+their signals, and on purpose not the position.
+
+Measured 2026-11-27, outdoors on the wrist, with the receiver still
+tied to a lit display: the switch is acknowledged, kind 60 comes about
+0.9 s later, kind 133 is acknowledged, reports of 150 to 154 bytes come
+whole about once a second. The chip asks for aiding (kind 53) at once
+(time, place) and for orbit data of four systems about every minute.
+Satellites show after 10 to 15 s, 10 to 16 in view after two to three
+minutes, signals mostly 20 to 35 dB-Hz, a few up to 42. No position:
+the two tries ran 3.5 and 4.25 minutes, the first ended by the wrist
+going down (which switched the receiver off and began the search
+anew). A third try the same day, same image, 241 s on the page
+without a break: position after 211 s (the report's own field 10 says
+213,488 ms), 5 to 8 satellites used of 13 to 15 in view, the strongest
+at 35 to 40 dB-Hz then; the report grows from 154 to 171 bytes with a
+position. So fields 4, 10 and 12 are read rightly, and a first
+position without orbit data takes about three and a half minutes
+under open sky.
+
+Measured 2026-11-27 with the receiver no longer tied to a lit display,
+37 minutes after that position: a position 19.6 s after switching on
+(field 10: 19,594 ms), so the chip keeps what it learnt while switched
+off. Field 12 is absent without a position and 1 with one; the first
+report with a position still says 0 satellites used, then 5 to 6.
+Field 1 is the time in UTC: in the second report, 6 s after switching
+on, it equals the watch's own clock to the second (so it is the time
+that was given), and from the next report on it runs 5 to 6 s ahead of
+the watch's clock, before any position. Whether the watch's clock is
+that much behind or the chip counts leap seconds wrongly without
+orbit data is not known. The very first report after switching on
+carries a meaningless value there, and one report in 140 s was short
+(160 bytes) with a wrong time, so a clock set from it needs a check
+against neighbours. Measured the same day at a desk: the page opened with the display lit
+by the button, the wrist lowered (display dark at once), 15 s dark,
+wrist raised: the reports went on through the dark, the page's count
+of seconds had run on (23 s), and leaving the page switched the
+receiver off. The switching off after 15 minutes has not been seen.
+
+Left: a place to start from (the last position, kept), orbit data
+(needs the phone side or another source), the receiver running without
+its page (for a workout), setting the clock from it.
 
 ### 3.10 eMMC (item 1) - done; card power-down belongs to low power
 
